@@ -1,0 +1,87 @@
+schema = 1
+
+[game]
+id = "minecraft"
+name = "Minecraft"
+description = """
+Loader mods (.jar) for Fabric, Forge, NeoForge and Quilt, on both the client and
+a dedicated server.
+Known limit: v1 does not resolve mod dependencies or match loader/game versions.
+It installs the release you asked for. Pin versions in your profile when a mod
+is version-sensitive, and read the mod's own requirements."""
+maintainers = ["bundled"]
+
+# Mod configs are rewritten by the game and differ per playthrough, so the
+# profile owns them rather than the mod.
+[state]
+paths = ["config"]
+
+[paths]
+mods = "mods"
+config = "config"
+resourcepacks = "resourcepacks"
+shaderpacks = "shaderpacks"
+root = "."
+
+[assets]
+prefer = ["*.jar"]
+accept = ["*.zip"]
+reject = [
+  "*-sources.jar", "*-dev.jar", "*-dev-*.jar", "*-javadoc.jar", "*-slim.jar",
+  "*-api.jar", "*-shadow.jar", "*.asc", "*.sig", "*.txt", "*.json", "*.pom",
+]
+# A .jar is a zip that must be installed unopened, which is exactly why unpacking
+# is declared rather than sniffed from the file's magic bytes.
+unpack = ["*.zip"]
+
+[[install]]
+match = "**/*.jar"
+into = "mods"
+flatten = true
+
+[[install]]
+match = "**/config/**"
+into = "config"
+strip = "config/"
+mutable = true
+
+# Client-only by construction: a dedicated server has no renderer.
+[[install]]
+match = "**/shaderpacks/**"
+into = "shaderpacks"
+strip = "shaderpacks/"
+flatten = true
+targets = ["client"]
+
+[[install]]
+match = "**/resourcepacks/**"
+into = "resourcepacks"
+strip = "resourcepacks/"
+flatten = true
+targets = ["client"]
+
+[[targets]]
+id = "client"
+name = "Minecraft (client)"
+kind = "client"
+markers = ["launcher_profiles.json", "versions", "options.txt"]
+asset_reject = ["*-server.jar", "*-server-*.jar"]
+candidates = [
+  "${APPDATA}/.minecraft",
+  "${HOME}/.minecraft",
+  "${HOME}/Library/Application Support/minecraft",
+  "${HOME}/.var/app/com.mojang.Minecraft/.minecraft",
+]
+
+# Prism, MultiMC and modded launchers keep one instance per pack, so point the
+# profile at the instance directory directly:
+#   [roots]
+#   client = "C:/PrismLauncher/instances/MyPack/.minecraft"
+
+[[targets]]
+id = "server"
+name = "Minecraft (dedicated server)"
+kind = "server"
+markers = ["server.properties", "eula.txt"]
+asset_reject = ["*-client.jar", "*-client-*.jar"]
+candidates = []

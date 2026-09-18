@@ -1,0 +1,79 @@
+schema = 1
+
+[game]
+id = "wow"
+name = "World of Warcraft"
+description = """
+Addons are folders of Lua under Interface/AddOns. Because the shipped artifact
+is the source, every addon installed here reaches the `readable` rung — you can
+open any file and read exactly what will run.
+WoW has no player-hosted dedicated server, so the targets here are game flavors
+rather than client/server."""
+maintainers = ["bundled"]
+
+[paths]
+addons = "Interface/AddOns"
+# Saved variables. Present so a pack can reference it; nothing installs here.
+wtf = "WTF"
+
+[assets]
+# The BigWigs packager, which is the de-facto standard release pipeline for WoW
+# addons, emits `<Name>-<version>-<flavor>.zip` and an unsuffixed zip for retail.
+prefer = ["*-{flavor}.zip", "*-{flavor}-*.zip", "*_{flavor}.zip"]
+accept = ["*.zip"]
+reject = ["*nolib*", "*sources*", "*-src*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+# Every top-level directory in the zip is one addon folder, copied wholesale.
+# The `*/**` (rather than `**`) keeps stray root-level READMEs out of AddOns.
+[[install]]
+match = "*/**"
+into = "addons"
+
+[[targets]]
+id = "retail"
+name = "Retail"
+kind = "client"
+flavor = "mainline"
+markers = ["Wow.exe", "World of Warcraft.app", "WowT.exe"]
+processes = ["Wow.exe", "WowT.exe"]
+# Refuse the other flavors' builds. Every flavor has to reject the others, which
+# is why this lives on the target rather than in the pack-wide reject list.
+asset_reject = [
+  "*-classic*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",
+  "*-cata*", "*-mop*", "*-mists*", "*-vanilla*",
+]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_retail_",
+  "${ProgramFiles}/World of Warcraft/_retail_",
+  "${HOME}/Games/world-of-warcraft/drive_c/Program Files (x86)/World of Warcraft/_retail_",
+]
+
+[[targets]]
+id = "classic_era"
+name = "Classic Era"
+kind = "client"
+flavor = "classic"
+markers = ["WowClassic.exe"]
+processes = ["WowClassic.exe"]
+asset_reject = ["*-mainline*", "*-bcc*", "*-wrath*", "*-cata*", "*-mop*", "*-mists*"]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_classic_era_",
+  "${ProgramFiles}/World of Warcraft/_classic_era_",
+]
+
+# Progression Classic moves between expansions. When it rolls over, change
+# `flavor` here and add the retired expansion to the other targets' asset_reject
+# lists — no rebuild required, this file is the whole configuration.
+[[targets]]
+id = "classic"
+name = "Classic (progression)"
+kind = "client"
+flavor = "mists"
+markers = ["WowClassic.exe"]
+processes = ["WowClassic.exe"]
+asset_reject = ["*-mainline*", "*-vanilla*"]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_classic_",
+  "${ProgramFiles}/World of Warcraft/_classic_",
+]

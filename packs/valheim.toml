@@ -1,0 +1,103 @@
+schema = 1
+
+[game]
+id = "valheim"
+name = "Valheim"
+description = """
+BepInEx plugins. The dedicated server takes the same plugins as the client, so
+both are targets here and a single profile can cover them at once.
+Plugins ship as compiled .dll, so most Valheim mods sit on the `claimed` rung of
+the trust ladder unless the author publishes build attestations."""
+maintainers = ["bundled"]
+
+# BepInEx rewrites every plugin's .cfg on startup and the user edits them, so
+# they belong to the profile rather than to the mod. ValheimPlus is the obvious
+# case: two profiles want two different valheim_plus.cfg files.
+[state]
+paths = ["config"]
+
+[paths]
+plugins = "BepInEx/plugins"
+patchers = "BepInEx/patchers"
+config = "BepInEx/config"
+core = "BepInEx/core"
+root = "."
+
+[assets]
+prefer = ["*.zip"]
+accept = ["*.dll"]
+reject = ["*sources*", "*symbols*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+# Rules are tried in order; the first match wins. The nested-path rules come
+# first so a mod that ships a full BepInEx tree lands correctly, and the bare
+# .dll rule catches the flat zips that most authors actually publish.
+
+[[install]]
+match = "**/bepinex/patchers/**"
+into = "patchers"
+strip = "patchers/"
+
+[[install]]
+match = "**/bepinex/plugins/**"
+into = "plugins"
+strip = "plugins/"
+
+# Anything under a config directory, whatever it is called. BepInEx's own
+# convention is .cfg, but mods ship .json, .yml, .ini and whole subfolders, so
+# this matches the directory rather than an extension.
+[[install]]
+match = "**/bepinex/config/**"
+into = "config"
+strip = "config/"
+mutable = true
+
+[[install]]
+match = "**/*.dll"
+into = "plugins"
+flatten = true
+
+# Loose config files sitting at the archive root. Deliberately a short list of
+# extensions rather than "anything not a .dll": Thunderstore packages carry
+# manifest.json, icon.png and README.md, and none of those belong in a game.
+[[install]]
+match = "*.{cfg,ini,yml,yaml,toml}"
+into = "config"
+flatten = true
+mutable = true
+
+# Assets a plugin loads at runtime, kept beside it.
+[[install]]
+match = "**/*.assetbundle"
+into = "plugins"
+flatten = true
+
+[[targets]]
+id = "client"
+name = "Valheim"
+kind = "client"
+markers = ["valheim.exe", "valheim.x86_64"]
+processes = ["valheim.exe", "valheim.x86_64"]
+candidates = [
+  "${ProgramFiles(x86)}/Steam/steamapps/common/Valheim",
+  "${HOME}/.steam/steam/steamapps/common/Valheim",
+]
+
+[targets.steam]
+app_id = 892970
+dir = "Valheim"
+
+[[targets]]
+id = "server"
+name = "Valheim Dedicated Server"
+kind = "server"
+markers = ["valheim_server.exe", "valheim_server.x86_64"]
+processes = ["valheim_server.exe", "valheim_server.x86_64"]
+candidates = [
+  "${ProgramFiles(x86)}/Steam/steamapps/common/Valheim dedicated server",
+  "${HOME}/.steam/steam/steamapps/common/Valheim dedicated server",
+]
+
+[targets.steam]
+app_id = 896660
+dir = "Valheim dedicated server"
