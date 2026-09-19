@@ -17,8 +17,10 @@ use crate::store::StoredFile;
 pub enum TrustLevel {
     /// No public source or no license — refused by default.
     Blocked,
-    /// Public repo, compiled artifact, no provenance. You are trusting the author.
-    Claimed,
+    /// A compiled file. The source is public, but nothing proves the file you
+    /// are about to run was built from it.
+    #[serde(alias = "claimed")]
+    Unchecked,
     /// The artifact is source. You can read exactly what will run.
     Readable,
     /// Build provenance ties this exact artifact to a commit in this repo.
@@ -30,17 +32,44 @@ impl TrustLevel {
         match self {
             TrustLevel::Verified => "verified",
             TrustLevel::Readable => "readable",
-            TrustLevel::Claimed => "claimed",
+            TrustLevel::Unchecked => "unchecked",
             TrustLevel::Blocked => "blocked",
         }
     }
 
+    /// One plain sentence. This is what people actually read, so it says what
+    /// it means for them rather than naming a mechanism.
     pub fn explain(self) -> &'static str {
         match self {
-            TrustLevel::Verified => "build provenance proves this artifact was built from this repo",
-            TrustLevel::Readable => "ships as source you can read",
-            TrustLevel::Claimed => "compiled artifact; public repo but no proof the binary matches it",
-            TrustLevel::Blocked => "no detected open-source license",
+            TrustLevel::Verified => {
+                "Safe to check: GitHub proves this exact file was built from the \
+                 public source code, by the project's own build."
+            }
+            TrustLevel::Readable => {
+                "You can read it: this mod ships as source code, so every file it \
+                 installs can be opened and read before you run it."
+            }
+            TrustLevel::Unchecked => {
+                "You are trusting the author: this mod installs a compiled file. \
+                 The source code is public, but nothing proves the file matches \
+                 it — the author built it on their own machine and uploaded it."
+            }
+            TrustLevel::Blocked => {
+                "Nothing to check: this mod installs a compiled file, publishes no \
+                 source code anywhere, and declares no licence. Refused unless you \
+                 allow it in Settings."
+            }
+        }
+    }
+
+    /// Badge text. Two words that stand on their own, because most people will
+    /// never hover for the long version.
+    pub fn short(self) -> &'static str {
+        match self {
+            TrustLevel::Verified => "verified build",
+            TrustLevel::Readable => "readable source",
+            TrustLevel::Unchecked => "unverified binary",
+            TrustLevel::Blocked => "no source at all",
         }
     }
 }
@@ -76,7 +105,7 @@ impl Default for TrustPolicy {
             // Plenty of legitimate addons are unlicensed by neglect rather than
             // by intent, so this warns by default instead of blocking.
             require_license: false,
-            minimum: TrustLevel::Claimed,
+            minimum: TrustLevel::Unchecked,
         }
     }
 }
@@ -117,8 +146,9 @@ pub fn assess(
             notes.push("repository is archived; it will not receive fixes".to_string());
         }
     }
-    if license.is_none() {
-        notes.push("no detected license — source is visible but the terms are not".to_string());
+    let source_url = repo.and_then(|r| r.source_url.clone());
+    if license.is_none() && source_url.is_some() {
+        notes.push("no declared licence — the code is public but the terms are not".to_string());
     }
 
     let level = if attested {
@@ -127,17 +157,25 @@ pub fn assess(
         // Nothing here can run code you cannot read. Textures and fonts do not
         // change that.
         TrustLevel::Readable
-    } else if executable_files > 0 && license.is_none() {
+    } else if executable_files > 0 && source_url.is_none() && license.is_none() {
+        // A compiled file with no code published anywhere and no licence. There
+        // is nothing to check it against, and nothing honest to say about it.
+        notes.push(
+            "no public source code is linked, so there is no way to check what this does"
+                .to_string(),
+        );
         TrustLevel::Blocked
     } else if executable_files > 0 {
-        notes.push(format!(
-            "{executable_files} compiled file(s) you cannot audit; \
-             ask the author to enable build attestations"
-        ));
-        TrustLevel::Claimed
+        let mut note = format!("{executable_files} compiled file(s) you cannot audit");
+        match &source_url {
+            Some(url) => note.push_str(&format!("; source published at {url}")),
+            None => note.push_str("; no source link, only a licence"),
+        }
+        notes.push(note);
+        TrustLevel::Unchecked
     } else {
         // No source, no executables — an archive of pure data.
-        TrustLevel::Claimed
+        TrustLevel::Unchecked
     };
 
     TrustReport {
@@ -184,6 +222,10 @@ mod tests {
             paths,
             assets: Default::default(),
             state: Default::default(),
+            versions: Default::default(),
+            loaders: Vec::new(),
+            search: Default::default(),
+            running: Default::default(),
             install: vec![],
             readable_extensions: vec!["lua".into(), "toc".into()],
             executable_extensions: vec!["dll".into(), "jar".into()],
@@ -230,14 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn licensed_binary_is_merely_claimed() {
+    fn licensed_binary_is_unchecked() {
         let files = vec![file("plugins/Mod.dll")];
         let repo = RepoInfo {
             license: Some("MIT".into()),
             ..Default::default()
         };
         let report = assess(&test_pack(), &files, Some(&repo), false);
-        assert_eq!(report.level, TrustLevel::Claimed);
+        assert_eq!(report.level, TrustLevel::Unchecked);
     }
 
     #[test]
@@ -253,7 +295,7 @@ mod tests {
         let report = assess(&test_pack(), &files, None, false);
         let strict = TrustPolicy {
             require_license: true,
-            minimum: TrustLevel::Claimed,
+            minimum: TrustLevel::Unchecked,
         };
         assert!(!strict.permits(&report));
         assert!(TrustPolicy::default().permits(&report));

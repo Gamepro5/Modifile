@@ -85,6 +85,25 @@ impl Paths {
         self.home.join("token")
     }
 
+    /// Marker file: the user has opted into fetching CurseForge files whose
+    /// authors disabled third-party downloads. Its presence is the whole
+    /// setting, so it is trivially inspectable and trivially undone.
+    pub fn curseforge_direct_file(&self) -> PathBuf {
+        self.home.join("curseforge-direct")
+    }
+
+    /// Marker file: install mods that publish no source code at all. A setting,
+    /// so it survives a restart like every other one.
+    pub fn allow_no_source_file(&self) -> PathBuf {
+        self.home.join("allow-no-source")
+    }
+
+    /// The user's own CurseForge API key. Kept separate because it is issued
+    /// to them personally and must not travel with the app.
+    pub fn curseforge_key_file(&self) -> PathBuf {
+        self.home.join("curseforge-key")
+    }
+
     pub fn http_cache(&self) -> PathBuf {
         self.cache.join("http")
     }

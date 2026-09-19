@@ -6,9 +6,14 @@ name = "Valheim"
 description = """
 BepInEx plugins. The dedicated server takes the same plugins as the client, so
 both are targets here and a single profile can cover them at once.
-Plugins ship as compiled .dll, so most Valheim mods sit on the `claimed` rung of
-the trust ladder unless the author publishes build attestations."""
+Plugins ship as compiled .dll, so most Valheim mods read as `unverified binary`
+unless the author publishes build attestations."""
 maintainers = ["bundled"]
+
+# Valheim mods mostly live on Thunderstore, which has no adapter yet. The ones
+# installable today publish GitHub releases, so that is what gets searched.
+[search]
+github_topics = ["valheim-mod", "valheim"]
 
 # BepInEx rewrites every plugin's .cfg on startup and the user edits them, so
 # they belong to the profile rather than to the mod. ValheimPlus is the obvious

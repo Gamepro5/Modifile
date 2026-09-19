@@ -117,9 +117,22 @@ impl Http {
     /// `Ok(None)` means the server said 404 — a missing release is a normal
     /// answer, not a failure.
     pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<Option<T>> {
+        self.get_json_with(url, &[]).await
+    }
+
+    /// As `get_json`, with extra headers — CurseForge authenticates with its
+    /// own `x-api-key` rather than a bearer token.
+    pub async fn get_json_with<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Option<T>> {
         let cached = self.read_cache(url);
 
         let mut req = self.request(url);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
         if let Some(entry) = &cached {
             if let Some(etag) = &entry.etag {
                 req = req.header("If-None-Match", etag.clone());

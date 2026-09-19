@@ -39,6 +39,17 @@ enum Command {
     Auth {
         /// Omit to read from stdin so the token stays out of your shell history.
         token: Option<String>,
+        /// Save a CurseForge API key instead. You obtain this yourself from
+        /// Overwolf; it cannot be shipped with an open-source app.
+        #[arg(long)]
+        curseforge: bool,
+        /// Fetch CurseForge files whose authors disabled third-party downloads.
+        ///
+        /// The bytes are the same ones your browser would get, but the API
+        /// withholds the URL deliberately and your key's terms cover this — if
+        /// it is noticed, the key you obtained is what gets revoked. Your call.
+        #[arg(long)]
+        curseforge_direct: Option<bool>,
     },
     /// Create a profile.
     New {
@@ -51,7 +62,7 @@ enum Command {
     },
     /// List profiles.
     Profiles,
-    /// Show a profile, its lock, and its deployment state.
+    /// Show a profile's mods, versions and whether it is active.
     Show { profile: String },
     /// Add a mod, e.g. `modifile add wow-main WeakAuras/WeakAuras2`.
     Add {
@@ -68,6 +79,19 @@ enum Command {
         #[arg(long)]
         prerelease: bool,
     },
+    /// Add a mod from a file you downloaded yourself.
+    ///
+    /// For mods no API will hand over — a CurseForge project whose author
+    /// disabled third-party downloads, a private beta, your own build. Once
+    /// imported it is managed like any other mod; only updates stay manual.
+    AddFile {
+        profile: String,
+        file: PathBuf,
+        /// Attach it to a known project, e.g. `curseforge:12345`, so the list
+        /// shows what it actually is.
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Remove a mod from a profile.
     Rm { profile: String, id: String },
     /// Point a target at a game directory autodetection missed.
@@ -76,11 +100,13 @@ enum Command {
         target: String,
         path: PathBuf,
     },
-    /// Resolve the profile against GitHub and fetch anything missing.
-    Sync { profile: String },
-    /// Link the profile's mods into the game. Then launch the game however you
-    /// like — nothing needs to stay running.
-    Deploy {
+    /// Check GitHub for new versions and download anything missing.
+    #[command(alias = "sync")]
+    Update { profile: String },
+    /// Put this profile's mods into the game. Modifile is not a launcher —
+    /// afterwards you start the game however you normally do.
+    #[command(alias = "deploy")]
+    Activate {
         profile: String,
         /// Only this target.
         #[arg(long)]
@@ -96,13 +122,61 @@ enum Command {
         #[arg(long)]
         confirm_stopped: bool,
     },
-    /// Remove a deployment, leaving a clean game directory.
-    Undeploy {
+    /// Take a profile's mods back out, leaving the game vanilla.
+    #[command(alias = "undeploy")]
+    Deactivate {
         game: String,
         target: String,
         /// Confirm a remote server is stopped.
         #[arg(long)]
         confirm_stopped: bool,
+        /// Also delete installed files that have changed since — a build you
+        /// dropped in by hand, or a file a game update overwrote.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install or check this profile's mod loader (Fabric, Quilt, …).
+    Loader {
+        profile: String,
+        /// Install it rather than only reporting what is there.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Rename a profile, keeping its mods, lock and configs.
+    Rename { from: String, to: String },
+    /// Set which game version and mod loader a profile is for.
+    Set {
+        profile: String,
+        /// e.g. fabric, forge, neoforge, quilt.
+        #[arg(long)]
+        loader: Option<String>,
+        /// e.g. 1.20.1.
+        #[arg(long)]
+        game_version: Option<String>,
+    },
+    /// Write a profile to a file you can send to a friend.
+    Export {
+        profile: String,
+        /// Defaults to <profile>.modifile.json in the current directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Leave your config files out of the bundle.
+        #[arg(long)]
+        no_configs: bool,
+        /// A line describing the setup, shown on import.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Create a profile from a file someone sent you.
+    Import {
+        file: PathBuf,
+        /// Name it something other than the exporter's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Take the newest release of each mod instead of the exact versions
+        /// the exporter was running.
+        #[arg(long)]
+        latest: bool,
     },
     /// Check a deployment is still intact — this is how you find out a game
     /// patch clobbered your mods.
@@ -111,6 +185,31 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Show which game packs are current, and refresh them.
+    Packs {
+        /// Replace packs even when they cannot be proven untouched. The old
+        /// copy is saved alongside as `<name>.toml.bak`.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Find a mod by name, and where its source code lives.
+    ///
+    /// Searches Modrinth, which is keyless and publishes each project's source
+    /// repository — the practical way to find the GitHub for a mod you only
+    /// know from a CurseForge page.
+    Search {
+        /// Words to look for.
+        query: Vec<String>,
+        /// Narrow to a profile's game version and loader.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show what is downloaded and which profiles still want it.
+    Storage {
+        /// Delete everything nothing references.
+        #[arg(long)]
+        clean: bool,
     },
     /// Delete store entries no profile references.
     Gc,
@@ -176,11 +275,29 @@ fn run() -> Result<()> {
     for (path, error) in &engine.pack_errors {
         eprintln!("warning: ignoring pack {}: {error}", path.display());
     }
+    // A pack that is silently out of date makes fixes look like they did not
+    // ship, so say so once rather than letting the user chase a ghost.
+    let stale: Vec<String> = modifile_core::pack_status(&paths)
+        .into_iter()
+        .filter(|(_, s)| *s == modifile_core::PackState::Edited)
+        .map(|(n, _)| n)
+        .collect();
+    if !stale.is_empty() {
+        eprintln!(
+            "note: {} is out of date and was kept in case you edited it. \
+             Run `modifile packs --refresh` to update. Fixes in those packs are not active.",
+            stale.join(", ")
+        );
+    }
 
     match cli.command {
         Command::Init => cmd_init(&paths),
         Command::Games => cmd_games(&engine),
-        Command::Auth { token } => cmd_auth(&paths, token),
+        Command::Auth {
+            token,
+            curseforge,
+            curseforge_direct,
+        } => cmd_auth(&paths, token, curseforge, curseforge_direct),
         Command::New {
             name,
             game,
@@ -195,14 +312,65 @@ fn run() -> Result<()> {
             pin,
             prerelease,
         } => cmd_add(&engine, &profile, &id, targets, pin, prerelease),
+        Command::AddFile { profile, file, id } => {
+            cmd_add_file(&engine, &profile, &file, id.as_deref())
+        }
         Command::Rm { profile, id } => cmd_rm(&engine, &profile, &id),
         Command::Root {
             profile,
             target,
             path,
         } => cmd_root(&engine, &profile, &target, path),
-        Command::Sync { profile } => runtime.block_on(cmd_sync(&engine, &profile)),
-        Command::Deploy {
+        Command::Update { profile } => runtime.block_on(cmd_sync(&engine, &profile)),
+        Command::Set {
+            profile,
+            loader,
+            game_version,
+        } => {
+            let mut loaded = load_profile(&engine, &profile)?;
+            let pack = engine.pack_for(&loaded)?;
+            if let Some(loader) = &loader {
+                let allowed = &pack.pack.versions.loaders;
+                if !allowed.is_empty()
+                    && !allowed.iter().any(|l| l.eq_ignore_ascii_case(loader))
+                {
+                    return Err(modifile_core::Error::other(format!(
+                        "`{loader}` is not a loader for {} — options: {}",
+                        pack.pack.game.name,
+                        allowed.join(", ")
+                    )));
+                }
+                loaded.loader = Some(loader.to_ascii_lowercase());
+            }
+            if let Some(v) = &game_version {
+                loaded.game_version = Some(v.clone());
+            }
+            loaded.save(&engine.paths.profile_file(&profile))?;
+            println!(
+                "`{profile}` is now for {} {}",
+                loaded.game_version.as_deref().unwrap_or("any version"),
+                loaded.loader.as_deref().unwrap_or("")
+            );
+            Ok(())
+        }
+        Command::Loader { profile, install } => {
+            runtime.block_on(cmd_loader(&engine, &profile, install))
+        }
+        Command::Rename { from, to } => {
+            let name = engine.rename_profile(&from, &to)?;
+            println!("`{from}` is now `{name}`.");
+            Ok(())
+        }
+        Command::Export {
+            profile,
+            out,
+            no_configs,
+            note,
+        } => cmd_export(&engine, &profile, out, !no_configs, note),
+        Command::Import { file, name, latest } => {
+            cmd_import(&engine, &file, name.as_deref(), !latest)
+        }
+        Command::Activate {
             profile,
             target,
             dry_run,
@@ -218,23 +386,87 @@ fn run() -> Result<()> {
                 assume_stopped: confirm_stopped,
             },
         ),
-        Command::Undeploy {
+        Command::Deactivate {
             game,
             target,
             confirm_stopped,
+            force,
         } => cmd_undeploy(
             &engine,
             &game,
             &target,
             DeployOptions {
-                force: false,
+                force,
                 assume_stopped: confirm_stopped,
             },
         ),
         Command::Verify { profile } => cmd_verify(&engine, &profile),
         Command::Config { action } => cmd_config(&engine, action),
+        Command::Packs { refresh } => cmd_packs(&paths, refresh),
+        Command::Search { query, profile } => {
+            runtime.block_on(cmd_search(&engine, &query.join(" "), profile.as_deref()))
+        }
+        Command::Storage { clean } => cmd_storage(&engine, clean),
         Command::Gc => cmd_gc(&engine),
     }
+}
+
+fn cmd_export(
+    engine: &Engine,
+    name: &str,
+    out: Option<PathBuf>,
+    include_configs: bool,
+    note: String,
+) -> Result<()> {
+    let profile = load_profile(engine, name)?;
+    let pack = engine.pack_for(&profile)?;
+    let bundle = engine.export_profile(pack, &profile, include_configs, note)?;
+
+    let path = out.unwrap_or_else(|| PathBuf::from(format!("{name}.modifile.json")));
+    bundle.save(&path)?;
+
+    println!(
+        "Wrote {} — {} mod(s), {} config file(s).",
+        path.display(),
+        bundle.mod_count(),
+        bundle.config_count()
+    );
+    println!("Send that file to anyone; they run `modifile import <file>`.");
+    Ok(())
+}
+
+fn cmd_import(
+    engine: &Engine,
+    file: &std::path::Path,
+    name: Option<&str>,
+    pin_versions: bool,
+) -> Result<()> {
+    let bundle = modifile_core::share::Bundle::load(file)?;
+    let game = engine
+        .pack(&bundle.game)
+        .map(|p| p.pack.game.name.clone())
+        .unwrap_or_else(|| bundle.game.clone());
+
+    println!("{} — {game}", bundle.name);
+    if !bundle.description.is_empty() {
+        println!("  {}", bundle.description);
+    }
+    println!(
+        "  {} mod(s), {} config file(s){}",
+        bundle.mod_count(),
+        bundle.config_count(),
+        if pin_versions {
+            ", pinned to the exporter's versions"
+        } else {
+            ", taking the newest versions"
+        }
+    );
+
+    let created = engine.import_profile(&bundle, name, pin_versions)?;
+    println!();
+    println!("Created `{created}`.");
+    println!("Next: modifile update {created} && modifile activate {created}");
+    Ok(())
 }
 
 fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
@@ -282,7 +514,7 @@ fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
                 total += engine.reset_configs(pack, &loaded.name, &t, root.as_deref())?;
             }
             println!(
-                "Discarded {total} saved config file(s). Run `modifile deploy {profile}` to \
+                "Discarded {total} saved config file(s). Run `modifile activate {profile}` to \
                  restore the mods' defaults."
             );
         }
@@ -320,6 +552,10 @@ fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+
+fn display(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
 fn load_token(paths: &Paths) -> Option<String> {
     for var in ["MODIFILE_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] {
@@ -363,11 +599,41 @@ fn cmd_init(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_auth(paths: &Paths, token: Option<String>) -> Result<()> {
+fn cmd_auth(
+    paths: &Paths,
+    token: Option<String>,
+    curseforge: bool,
+    curseforge_direct: Option<bool>,
+) -> Result<()> {
+    // A setting, not a credential: handle it and stop.
+    if let Some(on) = curseforge_direct {
+        let marker = paths.curseforge_direct_file();
+        if on {
+            modifile_core::paths::write_atomic(&marker, b"on")?;
+            println!("Direct CurseForge downloads: ON.");
+            println!(
+                "Files whose authors disabled third-party downloads will now be fetched \
+                 from the CDN. If Overwolf notices, the key you obtained is what gets \
+                 revoked — and that also costs you search and update checks."
+            );
+        } else {
+            std::fs::remove_file(&marker).ok();
+            println!("Direct CurseForge downloads: OFF. Blocked mods will be reported, not fetched.");
+        }
+        return Ok(());
+    }
+
     let token = match token {
         Some(t) => t,
         None => {
-            eprintln!("Paste a GitHub token (it is only used for read-only API calls):");
+            if curseforge {
+                eprintln!(
+                    "Paste your CurseForge API key (get one at \
+                     https://console.curseforge.com/ — it is issued to you personally):"
+                );
+            } else {
+                eprintln!("Paste a GitHub token (it is only used for read-only API calls):");
+            }
             let mut buf = String::new();
             std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)?;
             buf
@@ -375,10 +641,20 @@ fn cmd_auth(paths: &Paths, token: Option<String>) -> Result<()> {
     };
     let token = token.trim();
     if token.is_empty() {
-        return Err(modifile_core::Error::other("no token given"));
+        return Err(modifile_core::Error::other("nothing given"));
     }
-    modifile_core::paths::write_atomic(&paths.home.join("token"), token.as_bytes())?;
-    println!("Token saved. API budget is now 5000 requests/hour and revalidations are free.");
+
+    if curseforge {
+        modifile_core::paths::write_atomic(
+            &paths.curseforge_key_file(),
+            token.as_bytes(),
+        )?;
+        println!("CurseForge key saved. Mods whose authors disabled third-party downloads");
+        println!("will still be unavailable — that is their setting, not a key problem.");
+    } else {
+        modifile_core::paths::write_atomic(&paths.token_file(), token.as_bytes())?;
+        println!("Token saved. API budget is now 5000 requests/hour and revalidations are free.");
+    }
     Ok(())
 }
 
@@ -475,7 +751,7 @@ fn cmd_show(engine: &Engine, name: &str) -> Result<()> {
         let manifest = engine.manifest(pack.id(), &target.id)?;
         let state = match (&root, &manifest) {
             (None, _) => "no game directory".to_string(),
-            (Some(_), None) => "not deployed".to_string(),
+            (Some(_), None) => "not active".to_string(),
             (Some(_), Some(m)) => format!(
                 "{} file(s) from `{}` via {}",
                 m.files.len(),
@@ -542,7 +818,92 @@ fn cmd_add(
         return Ok(());
     }
     profile.save(&engine.paths.profile_file(name))?;
-    println!("Added {id} to `{name}`. Run `modifile sync {name}` to resolve it.");
+    println!("Added {id} to `{name}`. Run `modifile update {name}` to resolve it.");
+    Ok(())
+}
+
+async fn cmd_loader(engine: &Engine, name: &str, install: bool) -> Result<()> {
+    use modifile_core::loader::LoaderState;
+
+    let profile = load_profile(engine, name)?;
+    let pack = engine.pack_for(&profile)?;
+
+    for (target, root) in engine.targets(pack, &profile) {
+        let Some(root) = root else { continue };
+        let Some((def, state)) = engine.loader_state(pack, &profile, &root) else {
+            println!("{}: no mod loader set for this profile.", target.name);
+            continue;
+        };
+
+        match &state {
+            LoaderState::Installed { version } => {
+                println!("{}: {} {version} installed.", target.name, def.name)
+            }
+            LoaderState::WrongVersion { version } => println!(
+                "{}: {} {version} is installed, but this profile is for {}.",
+                target.name,
+                def.name,
+                profile.game_version.as_deref().unwrap_or("?")
+            ),
+            LoaderState::NotInstalled => {
+                println!("{}: {} is not installed.", target.name, def.name)
+            }
+            LoaderState::Manual { page } => println!(
+                "{}: {} has to be installed with its own installer — {page}",
+                target.name, def.name
+            ),
+        }
+
+        if install && !matches!(state, LoaderState::Installed { .. }) {
+            match engine.install_loader(pack, &profile, &root).await {
+                Ok(version) => {
+                    println!("  installed {} {version}", def.name);
+                    println!("  it now appears in the Minecraft launcher's version list");
+                }
+                Err(e) => println!("  {e}"),
+            }
+        }
+    }
+
+    if !install {
+        println!();
+        println!("Add --install to install or update it.");
+    }
+    Ok(())
+}
+
+fn cmd_add_file(
+    engine: &Engine,
+    name: &str,
+    file: &std::path::Path,
+    id: Option<&str>,
+) -> Result<()> {
+    let mut profile = load_profile(engine, name)?;
+    let pack = engine.pack_for(&profile)?;
+    let id = id.map(|s| s.parse::<ModId>()).transpose()?;
+
+    let entry = engine.import_file(pack, &mut profile, file, id)?;
+    profile.save(&engine.paths.profile_file(name))?;
+
+    // Write it straight into the lock: there is nothing to resolve later.
+    let lock_path = engine.paths.lock_file(name);
+    let mut lock = Lock::load(&lock_path)?;
+    lock.mods.retain(|m| m.id != entry.id);
+    lock.mods.push(entry.clone());
+    lock.save(&lock_path)?;
+
+    println!(
+        "Added {} from {} ({}, {}).",
+        entry.id,
+        display(file),
+        format_bytes(entry.size),
+        entry.trust.level.short()
+    );
+    for note in &entry.trust.notes {
+        println!("  note: {note}");
+    }
+    println!("Run `modifile activate {name}` to install it.");
+    println!("It will not update on its own — re-run this with a newer file.");
     Ok(())
 }
 
@@ -553,7 +914,7 @@ fn cmd_rm(engine: &Engine, name: &str, id: &str) -> Result<()> {
         return Err(modifile_core::Error::NotFound(format!("{id} in `{name}`")));
     }
     profile.save(&engine.paths.profile_file(name))?;
-    println!("Removed {id}. Run `modifile deploy {name}` to take it out of the game.");
+    println!("Removed {id}. Run `modifile activate {name}` to take it out of the game.");
     Ok(())
 }
 
@@ -602,13 +963,22 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
             println!("  fetching {id}: {asset} ({})", format_bytes(size))
         }
         Event::Cached { id, version } => println!("  cached   {id} {version}"),
+        Event::UpdateAvailable {
+            id,
+            have,
+            latest,
+            page,
+        } => {
+            println!("  UPDATE   {id}: you have {have}, {latest} is out");
+            println!("           {page}");
+        }
         Event::Installed { id, version, trust } => {
             println!("  ready    {id} {version} [{}]", trust.level.label())
         }
         Event::Failed { id, error } => eprintln!("  FAILED   {id}: {error}"),
     });
 
-    println!("Syncing `{name}`...");
+    println!("Checking `{name}` for updates...");
     let (lock, failures) = engine
         .sync(pack, &profile, &previous, Some(reporter))
         .await?;
@@ -620,17 +990,51 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
             println!("note: {}: {note}", entry.id);
         }
     }
+    // Updating leaves the previous version behind under its own hash. Nothing
+    // points at it, so clear it now rather than quietly hoarding every build
+    // this profile has ever had.
+    match engine.gc() {
+        Ok((entries, bytes)) if entries > 0 => {
+            println!(
+                "Removed {entries} superseded download(s), freeing {}.",
+                format_bytes(bytes)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("note: could not tidy old downloads: {e}"),
+    }
+
+    // "No build for your version yet" is a waiting state, not a failure. The
+    // mod stays in the profile and is skipped until one appears.
+    let waiting: Vec<_> = failures.iter().filter(|f| f.waiting).collect();
+    let broken: Vec<_> = failures.iter().filter(|f| !f.waiting).collect();
+
     println!(
-        "{} mod(s) locked, {} failed.",
+        "{} mod(s) ready{}{}.",
         lock.mods.len(),
-        failures.len()
+        if waiting.is_empty() {
+            String::new()
+        } else {
+            format!(", {} waiting for an update", waiting.len())
+        },
+        if broken.is_empty() {
+            String::new()
+        } else {
+            format!(", {} failed", broken.len())
+        }
     );
-    if !failures.is_empty() {
-        for (id, error) in &failures {
-            eprintln!("  {id}: {error}");
+
+    if !waiting.is_empty() {
+        println!();
+        println!("Not built for your version yet — kept in the profile, skipped on activate:");
+        for issue in &waiting {
+            println!("  {}", issue.id);
         }
     }
-    println!("Next: modifile deploy {name}");
+    for issue in &broken {
+        eprintln!("  {}: {}", issue.id, issue.message);
+    }
+    println!("Next: modifile activate {name}");
     Ok(())
 }
 
@@ -646,7 +1050,7 @@ fn cmd_deploy(
     let lock = Lock::load(&engine.paths.lock_file(name))?;
     if lock.mods.is_empty() && !profile.mods.is_empty() {
         return Err(modifile_core::Error::other(format!(
-            "`{name}` has no lockfile — run `modifile sync {name}` first"
+            "`{name}` has no lockfile — run `modifile update {name}` first"
         )));
     }
 
@@ -681,14 +1085,23 @@ fn cmd_deploy(
         if report.removed > 0 {
             println!("  {} file(s) from the previous profile removed", report.removed);
         }
+        if report.adopted > 0 {
+            println!(
+                "  {} settings file(s) already in the game folder now belong to `{}`",
+                report.adopted, profile.name
+            );
+        }
         if report.captured > 0 {
             println!(
-                "  {} config file(s) saved into the previous profile",
+                "  {} settings file(s) saved into the profile that was active before",
                 report.captured
             );
         }
-        if report.restored > 0 {
-            println!("  {} config file(s) restored from this profile", report.restored);
+        if report.restored > 0 && report.adopted == 0 {
+            println!(
+                "  {} settings file(s) restored from this profile",
+                report.restored
+            );
         }
         if report.seeded > 0 {
             println!("  {} default config file(s) created", report.seeded);
@@ -738,8 +1151,22 @@ fn cmd_undeploy(
 ) -> Result<()> {
     let report = engine.undeploy(game, target, options)?;
     println!("{} file(s) removed.", report.removed);
-    for (path, reason) in &report.skipped {
-        eprintln!("  left {}: {reason}", path.display());
+
+    if !report.skipped.is_empty() {
+        println!();
+        println!(
+            "{} file(s) were LEFT IN THE GAME because they no longer match what was \
+             installed — something replaced them since:",
+            report.skipped.len()
+        );
+        for (path, _) in &report.skipped {
+            println!("  {}", display(path));
+        }
+        println!();
+        println!(
+            "The game is not fully vanilla. Delete them yourself, or run \
+             `modifile deactivate {game} {target} --force` to remove them."
+        );
     }
     Ok(())
 }
@@ -748,29 +1175,222 @@ fn cmd_verify(engine: &Engine, name: &str) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
     let mut clean = true;
+    let mut disturbed = false;
 
-    for (target, _) in engine.targets(pack, &profile) {
-        let Some(manifest) = engine.manifest(pack.id(), &target.id)? else {
-            continue;
-        };
-        let report = modifile_core::deploy::verify(&manifest);
+    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    for (target, root) in engine.targets(pack, &profile) {
+        let Some(root) = root else { continue };
+        let scan = engine.scan(pack, &profile, &lock, &target, &root)?;
+
         println!(
-            "{} [{}]: {} ok, {} missing, {} modified",
+            "{} [{}]: {} intact, {} changed, {} missing, {} not installed by Modifile",
             target.name,
             target.kind.label(),
-            report.ok,
-            report.missing.len(),
-            report.modified.len()
+            scan.intact,
+            scan.modified.len(),
+            scan.missing.len(),
+            scan.foreign.len()
         );
-        for path in report.missing.iter().chain(report.modified.iter()) {
-            println!("  {}", path.display());
+
+        for entry in &scan.modified {
+            println!("  changed   {}", display(&entry.rel));
         }
-        clean &= report.is_clean();
+        for entry in &scan.missing {
+            println!("  missing   {}", display(&entry.rel));
+        }
+        for entry in &scan.foreign {
+            println!(
+                "  {}  {}",
+                if entry.conflicts { "BLOCKING" } else { "foreign " },
+                display(&entry.rel)
+            );
+        }
+
+        let blocking = scan.blocking().count();
+        if blocking > 0 {
+            println!();
+            println!(
+                "  {blocking} file(s) marked BLOCKING sit exactly where this profile's mods go. \
+                 Activating will skip those mods and leave your files in place. Run \
+                 `modifile activate {name} --force` to replace them."
+            );
+        }
+        clean &= scan.is_clean();
+        disturbed |= !scan.modified.is_empty() || !scan.missing.is_empty();
     }
 
-    if !clean {
+    if clean {
         println!();
-        println!("A game update most likely overwrote these. Re-run `modifile deploy {name}`.");
+        println!("Everything in the game folder is exactly what this profile installed.");
+    } else if disturbed {
+        // Only say this when files *we placed* went wrong — a hand-installed
+        // mod is not a game update clobbering anything.
+        println!();
+        println!(
+            "Files Modifile installed have changed or gone. A game update is the usual cause; \
+             re-run `modifile activate {name}` to put them back."
+        );
+    }
+    Ok(())
+}
+
+fn cmd_packs(paths: &Paths, refresh: bool) -> Result<()> {
+    use modifile_core::PackState;
+
+    if refresh {
+        let report = modifile_core::install_bundled_packs_with(paths, true)?;
+        for (name, backup) in &report.replaced {
+            println!("refreshed {name}  (your copy saved as {})", display(backup));
+        }
+        for name in report.updated.iter().chain(report.written.iter()) {
+            println!("refreshed {name}");
+        }
+        if report.replaced.is_empty() && report.updated.is_empty() && report.written.is_empty() {
+            println!("Every pack was already current.");
+        }
+        return Ok(());
+    }
+
+    let status = modifile_core::pack_status(paths);
+    let stale: Vec<&String> = status
+        .iter()
+        .filter(|(_, s)| *s != PackState::Current)
+        .map(|(n, _)| n)
+        .collect();
+
+    for (name, state) in &status {
+        let label = match state {
+            PackState::Current => "current",
+            PackState::Missing => "not installed",
+            PackState::Outdated => "out of date (updates automatically)",
+            PackState::Edited => "OUT OF DATE — kept because it may be your edit",
+        };
+        println!("{name:<24} {label}");
+    }
+
+    if !stale.is_empty() {
+        println!();
+        println!(
+            "Some packs are not the ones this build ships, so fixes in them are not \
+             reaching you. Run `modifile packs --refresh` to replace them; your current \
+             copies are saved as .bak files."
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_search(engine: &Engine, query: &str, profile: Option<&str>) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(modifile_core::Error::other("give me something to search for"));
+    }
+
+    // Which game to search for is the profile's, or the only pack there is.
+    let (pack, filter) = match profile {
+        Some(name) => {
+            let loaded = load_profile(engine, name)?;
+            let pack = engine.pack_for(&loaded)?;
+            (
+                pack,
+                modifile_core::source::modrinth::VersionFilter {
+                    game_version: loaded.game_version.clone(),
+                    loader: loaded.loader.clone(),
+                },
+            )
+        }
+        None if engine.packs.len() == 1 => (
+            &engine.packs[0],
+            modifile_core::source::modrinth::VersionFilter::default(),
+        ),
+        None => {
+            return Err(modifile_core::Error::other(
+                "say which game to search: --profile <name>",
+            ))
+        }
+    };
+
+    println!("Searching {} for \"{query}\"…\n", pack.pack.game.name);
+    let hits = engine.search(pack, query, &filter, true).await?;
+    if hits.is_empty() {
+        println!("Nothing found.");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        let blocked = hit.installable == Some(false);
+        println!(
+            "{}{}",
+            hit.label(),
+            if blocked { "   [not downloadable]" } else { "" }
+        );
+        if !hit.description.is_empty() {
+            let short: String = hit.description.chars().take(96).collect();
+            println!("    {short}");
+        }
+        let mut facts = vec![hit.id.to_string(), hit.popularity()];
+        if let Some(license) = &hit.license {
+            facts.push(license.clone());
+        }
+        if let Some(src) = &hit.source_url {
+            facts.push(src.clone());
+        }
+        println!("    {}", facts.join("  ·  "));
+        println!();
+    }
+
+    println!(
+        "Add one with: modifile add <profile> <id>\n\
+         `[not downloadable]` means the project publishes nothing this can install — on \
+         CurseForge that is the author switching off third-party downloads, so it has to \
+         be fetched by hand."
+    );
+    Ok(())
+}
+
+fn cmd_storage(engine: &Engine, clean: bool) -> Result<()> {
+    let report = engine.storage()?;
+    if report.items.is_empty() {
+        println!("Nothing downloaded yet.");
+        return Ok(());
+    }
+
+    println!(
+        "{} download(s), {} total\n",
+        report.items.len(),
+        format_bytes(report.total_bytes())
+    );
+
+    for item in &report.items {
+        let state = if item.is_orphan() {
+            "UNUSED".to_string()
+        } else if item.only_inactive() {
+            "kept for switched-off profiles".to_string()
+        } else {
+            "in use".to_string()
+        };
+        println!("{:>10}  {:<34} {state}", format_bytes(item.size), item.name());
+        for used in &item.used_by {
+            println!(
+                "            in `{}`{}",
+                used.profile,
+                if used.active { " (active)" } else { "" }
+            );
+        }
+    }
+
+    let orphan_bytes = report.orphan_bytes();
+    let orphans = report.orphans().count();
+    println!();
+    if orphans == 0 {
+        println!("Nothing to clean up — every download is wanted by some profile.");
+    } else if clean {
+        let (removed, freed) = engine.gc()?;
+        println!("Removed {removed} unused download(s), freeing {}.", format_bytes(freed));
+    } else {
+        println!(
+            "{orphans} download(s) totalling {} are not referenced by any profile. \
+             Run `modifile storage --clean` to remove them.",
+            format_bytes(orphan_bytes)
+        );
     }
     Ok(())
 }

@@ -32,7 +32,7 @@ fn every_bundled_pack_loads() {
 #[test]
 fn wow_retail_refuses_classic_builds() {
     let wow = pack("wow.toml");
-    let retail = wow.target("retail").unwrap();
+    let retail = wow.target("client").unwrap();
     let assets = names(&["WeakAuras-5.20.1.zip", "WeakAuras-5.20.1-classic.zip"]);
 
     let chosen = wow.select_asset(&assets, retail).expect("retail asset");
@@ -41,18 +41,18 @@ fn wow_retail_refuses_classic_builds() {
 
 #[test]
 fn wow_classic_era_prefers_its_own_flavor() {
-    let wow = pack("wow.toml");
-    let classic = wow.target("classic_era").unwrap();
+    let era = pack("wow-classic-era.toml");
+    let classic = era.target("client").unwrap();
     let assets = names(&["WeakAuras-5.20.1.zip", "WeakAuras-5.20.1-classic.zip"]);
 
-    let chosen = wow.select_asset(&assets, classic).expect("classic asset");
+    let chosen = era.select_asset(&assets, classic).expect("classic asset");
     assert_eq!(assets[chosen], "WeakAuras-5.20.1-classic.zip");
 }
 
 #[test]
 fn wow_rejects_nolib_and_source_archives() {
     let wow = pack("wow.toml");
-    let retail = wow.target("retail").unwrap();
+    let retail = wow.target("client").unwrap();
     let assets = names(&["Details-1.0-nolib.zip", "Details-1.0.zip"]);
 
     let chosen = wow.select_asset(&assets, retail).unwrap();
@@ -67,10 +67,10 @@ fn wow_rejects_nolib_and_source_archives() {
 #[test]
 fn wow_addon_folders_land_under_interface_addons() {
     let wow = pack("wow.toml");
-    let retail = wow.target("retail").unwrap();
+    let retail = wow.target("client").unwrap();
 
     let rule = wow
-        .rule_for("WeakAuras/Core.lua", "retail")
+        .rule_for("WeakAuras/Core.lua", "client")
         .expect("addon file matches a rule");
     let dest = wow
         .destination_for("WeakAuras/Core.lua", retail, rule)
@@ -86,7 +86,45 @@ fn wow_addon_folders_land_under_interface_addons() {
 #[test]
 fn wow_ignores_root_level_readmes() {
     let wow = pack("wow.toml");
-    assert!(wow.rule_for("README.md", "retail").is_none());
+    assert!(wow.rule_for("README.md", "client").is_none());
+}
+
+#[test]
+fn wow_flavors_are_separate_games() {
+    // Retail, Classic Era and progression Classic target different APIs, and an
+    // addon built for one will not run on another. Modelling them as targets of
+    // one game let a single profile install the same addon list into all three.
+    let ids: Vec<&str> = ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"]
+        .iter()
+        .map(|n| {
+            let p = pack(n);
+            Box::leak(p.pack.game.id.clone().into_boxed_str()) as &str
+        })
+        .collect();
+    assert_eq!(ids, vec!["wow", "wow-classic-era", "wow-classic"]);
+
+    for name in ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"] {
+        let p = pack(name);
+        assert_eq!(
+            p.pack.targets.len(),
+            1,
+            "{name} should be one game with one client, not several flavors"
+        );
+    }
+}
+
+#[test]
+fn wow_allows_changes_while_the_game_runs() {
+    // Addons are Lua read at load time, so blocking mid-session is nuisance
+    // rather than safety. Valheim is the opposite: its plugins are mapped DLLs.
+    for name in ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"] {
+        assert!(
+            pack(name).pack.running.allow_changes,
+            "{name} should allow mod changes while running"
+        );
+    }
+    assert!(!pack("valheim.toml").pack.running.allow_changes);
+    assert!(!pack("minecraft.toml").pack.running.allow_changes);
 }
 
 #[test]

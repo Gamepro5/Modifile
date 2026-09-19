@@ -28,6 +28,13 @@ pub struct Profile {
     /// Explicit game roots per target id, for installs autodetection misses.
     #[serde(default)]
     pub roots: BTreeMap<String, PathBuf>,
+    /// For games where a mod is built against one game version, e.g. `1.20.1`.
+    /// Sources that publish per-version builds use this to pick the right one.
+    #[serde(default)]
+    pub game_version: Option<String>,
+    /// For games with competing mod loaders, e.g. `fabric`, `forge`, `neoforge`.
+    #[serde(default)]
+    pub loader: Option<String>,
     #[serde(default)]
     pub mods: Vec<ModEntry>,
 }
@@ -47,6 +54,10 @@ pub struct ModEntry {
     /// Consider prereleases when resolving.
     #[serde(default)]
     pub prerelease: bool,
+    /// Supplied as a file rather than fetched. Update checks skip it and keep
+    /// its existing lock entry, because there is no API to ask.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 impl ModEntry {
@@ -57,6 +68,7 @@ impl ModEntry {
             targets: None,
             pin: None,
             prerelease: false,
+            manual: false,
         }
     }
 
@@ -77,6 +89,8 @@ impl Profile {
             game: game.into(),
             targets: Vec::new(),
             roots: BTreeMap::new(),
+            game_version: None,
+            loader: None,
             mods: Vec::new(),
         }
     }
@@ -143,6 +157,11 @@ pub struct LockEntry {
     pub size: u64,
     #[serde(default)]
     pub published_at: String,
+    /// For a manually supplied mod: the newest version its source was
+    /// advertising when we last looked. Comparing against this is how a mod
+    /// nobody can download for you still gets update notifications.
+    #[serde(default)]
+    pub upstream: Option<String>,
     pub trust: TrustReport,
 }
 

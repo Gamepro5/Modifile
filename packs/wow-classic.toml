@@ -1,0 +1,55 @@
+schema = 1
+
+[game]
+id = "wow-classic"
+name = "WoW Classic (progression)"
+description = """
+Progression Classic — the realms that advance through expansions. Separate from
+Retail and Classic Era because its addons target that expansion's API.
+When it rolls over to the next expansion, change `flavor` below and add the
+retired one to the other packs' asset_reject lists. That is a text edit, not a
+new version of Modifile."""
+maintainers = ["bundled"]
+
+# Addons are plain Lua read at load time — nothing holds the files open, and
+# /reload picks up changes. So unlike a BepInEx game, mods can be installed
+# while WoW is running.
+[running]
+allow_changes = true
+note = "WoW is running. Type /reload in game to pick up the change."
+
+[search]
+github_topics = ["wow-addon", "wowaddon", "world-of-warcraft", "classic-wow"]
+github_terms = ["wow", "classic", "addon"]
+
+# CurseForge addresses projects by number; this is how a slug from a URL
+# gets resolved to one.
+curseforge_game_id = 1
+
+[paths]
+addons = "Interface/AddOns"
+wtf = "WTF"
+
+[assets]
+prefer = ["*-{flavor}.zip", "*-{flavor}-*.zip", "*_{flavor}.zip"]
+accept = ["*.zip"]
+reject = ["*nolib*", "*sources*", "*-src*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+[[install]]
+match = "*/**"
+into = "addons"
+
+[[targets]]
+id = "client"
+name = "Classic"
+kind = "client"
+# The expansion currently live on progression realms.
+flavor = "mists"
+markers = ["WowClassic.exe"]
+processes = ["WowClassic.exe"]
+asset_reject = ["*-mainline*", "*-vanilla*"]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_classic_",
+  "${ProgramFiles}/World of Warcraft/_classic_",
+]

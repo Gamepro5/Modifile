@@ -30,8 +30,17 @@ terminal.
 
 1. **＋ New profile** — pick the game, name the profile.
 2. **Add** a mod by pasting a GitHub repo (`WeakAuras/WeakAuras2`, or the URL).
-3. **1 · Sync** downloads them. **2 · Deploy** installs them.
+3. **Check for updates** downloads them. **Activate** puts them in the game.
 4. Launch the game however you normally do.
+
+**Modifile is not a launcher.** Activating a profile puts files in your game
+folder and then Modifile is done — you start the game from Steam, a shortcut,
+or wherever you normally do, and nothing needs to be running.
+
+Profiles are grouped by game in the sidebar, and the active one in each game is
+marked with a green dot. **Deactivate** takes its mods back out so the game runs
+vanilla again; nothing is lost, your settings are saved into the profile and you
+can activate it again whenever.
 
 If your game folder wasn't found automatically, press **Choose folder…** on that
 target. The choice is remembered for every profile of that game. **Games &
@@ -45,9 +54,20 @@ modifile init                             # write the bundled packs
 modifile games                            # what was found on this machine
 modifile new wow-main --game wow --target retail
 modifile add wow-main WeakAuras/WeakAuras2
-modifile sync wow-main                    # resolve + fetch
-modifile deploy wow-main                  # link into the game
+modifile update wow-main                  # check GitHub, download
+modifile activate wow-main                # put the mods in the game
+modifile deactivate wow retail            # take them out again — vanilla
 ```
+
+A mod can be restricted to one side of the game, which matters for a dedicated
+server:
+
+```sh
+modifile add vh-server Grantapher/ValheimPlus --target server
+```
+
+In the GUI each mod row has a **client + server / client only / server only**
+control, shown for games that actually have a dedicated server.
 
 Then launch the game however you normally do.
 
@@ -59,11 +79,15 @@ token you get 5000/hour and revalidations become free.
 
 | command | what it does |
 |---|---|
-| `modifile show <profile>` | mods, versions, trust, deployment state |
+| `modifile show <profile>` | mods, versions, trust, active state |
+| `modifile rename <old> <new>` | rename a profile, keeping mods, downloads and settings |
+| `modifile export <profile>` | write a shareable `.modifile.json` |
+| `modifile import <file>` | create a profile from one someone sent you |
 | `modifile root <profile> <target> <path>` | point a target at a directory autodetection missed |
 | `modifile verify <profile>` | check the deployment is intact — finds files a game patch clobbered |
 | `modifile undeploy <game> <target>` | remove everything, leaving a clean game directory |
-| `modifile gc` | delete store entries no profile references |
+| `modifile storage` | what is downloaded and which profiles still want it |
+| `modifile storage --clean` | delete downloads nothing references |
 | `modifile config show <profile>` | the config files this profile keeps |
 | `modifile config reset <profile> --yes` | back to the mods' shipped defaults |
 | `modifile config import <profile> --from <other>` | copy another profile's settings |
@@ -171,6 +195,67 @@ second drive is found without configuration.
 `unpack` is declared rather than sniffed on purpose: a Minecraft `.jar` is a zip
 that must be installed **unopened**, and file magic cannot tell you that.
 
+## Downloads are not an archive
+
+Updating a mod does not keep the old version around. The superseded download is
+removed as part of the update, because nothing references it and re-downloading
+is one request.
+
+A download is *not* waste just because its profile is switched off — that is
+what profiles are for — so those are kept and labelled as such:
+
+```
+3 download(s), 1.4 MB total
+
+    1.4 MB  ValheimPlus 0.10.1.2               kept for switched-off profiles
+            in `main`
+   31.5 KB  unused (0ed9d9ec1820)              UNUSED
+```
+
+`modifile storage` shows the list; **Settings → Downloads** in the GUI shows the
+same thing with a Delete button per unused item. A download is only ever called
+unused when *no* profile's lockfile mentions it.
+
+## Sharing a profile
+
+```sh
+modifile export raiding --note "Valheim co-op, tuned configs"
+# -> raiding.modifile.json
+```
+
+One JSON file you can drop in Discord. It holds the mod list, the exact versions
+you are running, and your config files. Your friend runs `modifile import
+raiding.modifile.json` (or **Import a shared profile…** in the GUI) and gets a
+profile pinned to your versions, with your settings already in place.
+
+What a bundle deliberately does *not* contain is the mods themselves, or hashes
+presented as trustworthy. Their copy resolves every mod from GitHub on their own
+machine, verifies each download against GitHub's published digest, and runs the
+trust ladder locally. A bundle from a stranger can waste your time; it cannot
+hand you a binary nobody else can see.
+
+Importing never overwrites an existing profile — a second import of the same
+file becomes `raiding-2`. Pass `--latest` to take the newest release of each mod
+instead of the exporter's pinned versions, and `--no-configs` when exporting to
+leave your settings out.
+
+## Mods that were already there
+
+Modifile never deletes a file it did not place. If you modded by hand before, or
+another manager left something behind, **Refresh** in the GUI (or
+`modifile verify <profile>`) reports every file in your mod folders as one of:
+
+- **intact** — placed by Modifile, unchanged
+- **changed** — placed by Modifile, then edited or overwritten by a game update
+- **missing** — placed by Modifile, now gone
+- **foreign** — Modifile did not put it there
+
+A foreign file that sits exactly where one of your profile's mods goes is marked
+**BLOCKING**, because activating will skip that mod rather than overwrite your
+file — so the mod silently would not install. Either delete the old file, or use
+**Replace them and activate** / `modifile activate <profile> --force` to let
+Modifile take it over.
+
 ## Config files belong to the profile
 
 A mod's `.dll` is immutable content and is hard-linked out of the shared store.
@@ -179,9 +264,11 @@ and two profiles want different values. Hard-linking one would write your edit
 straight back into the shared store and leak it into every other profile using
 that mod.
 
-So directories listed under `[state]` are profile-owned. Switching profiles
-captures the outgoing profile's configs into its own keeping, then restores the
-incoming profile's. A raiding profile and a hardcore profile can run the same
+So directories listed under `[state]` are profile-owned. The **first** time you
+activate a profile, settings already sitting in the game folder are adopted into
+it — you do not lose the ValheimPlus config you spent an evening tuning. After
+that, switching profiles captures the outgoing profile's configs into its own
+keeping and restores the incoming profile's. A raiding profile and a hardcore profile can run the same
 ValheimPlus build with completely different `valheim_plus.cfg` files, and
 neither ever touches the other.
 
@@ -254,18 +341,68 @@ A public repo is not the same as auditable code. WoW addons ship Lua, so the
 artifact *is* the source. Valheim plugins and Minecraft mods ship compiled
 binaries, and nothing about a public repo proves the binary came from it.
 
-| rung | meaning |
+| badge | meaning |
 |---|---|
-| **verified** | GitHub build provenance ties this exact artifact to a commit in this repo |
-| **readable** | the artifact is source — you can read what will run |
-| **claimed** | compiled artifact, public repo, no proof the binary matches it |
-| **blocked** | compiled artifact with no detected open-source license |
+| **verified build** | GitHub proves this exact file was built from the public source |
+| **readable source** | the mod ships as source — every file can be opened and read |
+| **unverified binary** | a compiled file; the source is public but nothing proves the file matches it |
+| **no licence** | a compiled file with no open-source licence to check against — refused |
 
 Textures, fonts and sounds are opaque but inert, and do not demote a mod. Only
 files that can *execute* code you cannot read do.
 
 Every artifact's SHA-256 is pinned in the profile's lockfile, so a release asset
 quietly re-uploaded under the same tag is detected.
+
+## Where mods come from
+
+| source | key needed | notes |
+|---|---|---|
+| **GitHub** | no | release assets; build attestations checkable |
+| **GitLab** | no | gitlab.com and self-hosted |
+| **Gitea / Forgejo** | no | Codeberg and self-hosted |
+| **Modrinth** | no | publishes each project's source repository |
+| **CurseForge** | **yours** | see below |
+
+Paste a URL from any of them, or use a short id:
+
+```sh
+modifile add wow-main WeakAuras/WeakAuras2           # GitHub (the default)
+modifile add mc modrinth:sodium
+modifile add mc https://modrinth.com/mod/lithium
+modifile add x gitlab:group/project
+modifile add x https://codeberg.org/owner/repo
+modifile add x gitea:git.example.com/owner/repo      # self-hosted
+```
+
+### Finding a mod
+
+```sh
+modifile search auction --profile wow-main
+```
+
+Which index is searched is a property of the game, declared in its pack. For
+Minecraft that is Modrinth; **for World of Warcraft it is GitHub**, because
+Modrinth carries no WoW addons and the addons Modifile can install are exactly
+the ones publishing GitHub releases. Results are marked `[no releases]` when
+nothing installable is published, and each one shows where its source lives — so
+search also answers "what is this mod's repository?".
+
+### CurseForge
+
+Supported, but on CurseForge's terms rather than ours:
+
+- **You supply the key.** Overwolf issues them after a human review and forbids
+  sharing, so an open-source binary cannot carry one. `modifile auth
+  --curseforge <key>`, or Settings in the GUI.
+- **Some mods cannot be fetched at all.** Authors can switch off third-party
+  distribution; the API then returns no download URL. No key changes that.
+- **Nothing to audit.** CurseForge publishes no licence or source through its
+  API, so its mods usually land on the bottom rung and are refused unless you
+  tick *"Allow mods with no public source code"*.
+
+For most mods, searching Modrinth or GitHub finds the same thing without any of
+that.
 
 ## What it deliberately does not do
 

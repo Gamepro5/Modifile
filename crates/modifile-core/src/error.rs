@@ -26,6 +26,12 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The mod exists and is fine — it just has no build for what this profile
+    /// runs yet. Normal after a Minecraft update, and not a failure: the mod
+    /// stays in the profile and is skipped until a compatible build appears.
+    #[error("{id} has no build for {wanted} yet")]
+    NoBuildFor { id: String, wanted: String },
+
     /// GitHub's unauthenticated budget is 60/hour and even 304s spend it, so
     /// this is a routine condition rather than an exceptional one.
     #[error("GitHub rate limit exhausted ({remaining} left, resets at {reset}); set a token with `modifile auth` to raise the ceiling to 5000/hour")]

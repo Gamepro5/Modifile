@@ -17,6 +17,10 @@ use crate::paths::write_atomic;
 use crate::profile::{Lock, Profile};
 use crate::store::Store;
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkMode {
@@ -99,6 +103,11 @@ pub struct Manifest {
     pub root: PathBuf,
     pub mode: Option<LinkMode>,
     pub deployed_ms: u64,
+    /// False once the profile has been deactivated. The record survives
+    /// deactivation only to remember files we could not remove — the profile is
+    /// no longer installed, so it must not count as active.
+    #[serde(default = "yes")]
+    pub active: bool,
     pub files: Vec<ManifestFile>,
     /// Directories we created, deepest first, so cleanup can unwind them.
     #[serde(default)]
@@ -143,6 +152,9 @@ pub struct DeployReport {
     pub restored: usize,
     /// Profile state files captured out of it before switching away.
     pub captured: usize,
+    /// Settings that were already in the game folder and now belong to this
+    /// profile. Only happens on a profile's first activation.
+    pub adopted: usize,
     /// Destination paths we refused to touch, with the reason.
     pub skipped: Vec<(PathBuf, String)>,
     pub removed: usize,
@@ -336,7 +348,7 @@ pub fn apply(
     let mut report = DeployReport::default();
 
     if let Some(previous) = previous {
-        report.removed = revert(previous, &mut report)?;
+        report.removed = revert(previous, &mut report, force)?;
     }
 
     let mode = probe_mode(store_root, &plan.root);
@@ -422,6 +434,7 @@ pub fn apply(
             root: plan.root.clone(),
             mode: Some(mode),
             deployed_ms: crate::paths::now_millis(),
+            active: true,
             files,
             created_dirs,
         },
@@ -429,19 +442,23 @@ pub fn apply(
     ))
 }
 
-/// Take a deployment back out. Files that no longer match what we recorded are
-/// left alone and reported — if a game patch replaced one, it is the game's now.
-pub fn revert(manifest: &Manifest, report: &mut DeployReport) -> Result<usize> {
+/// Take a deployment back out.
+///
+/// A file that no longer matches what we recorded is left alone and reported:
+/// a game patch may have replaced it, or the user may have dropped their own
+/// build over the top, and deleting either would be destroying something we did
+/// not create. `force` overrides that, for when the user says so explicitly.
+pub fn revert(manifest: &Manifest, report: &mut DeployReport, force: bool) -> Result<usize> {
     let mut removed = 0;
     for record in &manifest.files {
         let path = manifest.root.join(&record.rel);
         if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
             continue;
         }
-        if !still_ours(&path, record) {
+        if !still_ours(&path, record) && !force {
             report.skipped.push((
                 record.rel.clone(),
-                "changed since we deployed it; left in place".to_string(),
+                "changed since it was installed, so it was left in place".to_string(),
             ));
             continue;
         }
@@ -459,6 +476,144 @@ pub fn revert(manifest: &Manifest, report: &mut DeployReport) -> Result<usize> {
     }
 
     Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Scanning the game folder
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ScanEntry {
+    /// Path relative to the game root.
+    pub rel: PathBuf,
+    pub size: u64,
+    /// A mod in this profile wants to install to this exact path.
+    pub conflicts: bool,
+    /// Which mod put it here, when we know.
+    pub mod_id: Option<String>,
+}
+
+/// What is actually sitting in a game's mod folders right now.
+#[derive(Debug, Clone, Default)]
+pub struct FolderScan {
+    pub target: String,
+    pub root: PathBuf,
+    /// Files we placed that are still exactly as we left them.
+    pub intact: usize,
+    /// Files we placed that have since changed — a game patch, or a hand edit.
+    pub modified: Vec<ScanEntry>,
+    /// Files we placed that are gone.
+    pub missing: Vec<ScanEntry>,
+    /// Files in a mod folder that Modifile did not put there. Usually mods
+    /// installed by hand before, or left behind by another manager.
+    pub foreign: Vec<ScanEntry>,
+}
+
+impl FolderScan {
+    pub fn is_clean(&self) -> bool {
+        self.modified.is_empty() && self.missing.is_empty() && self.foreign.is_empty()
+    }
+
+    /// Foreign files that would stop a mod installing, because something we
+    /// want to place is already sitting at that path.
+    pub fn blocking(&self) -> impl Iterator<Item = &ScanEntry> {
+        self.foreign.iter().filter(|e| e.conflicts)
+    }
+}
+
+/// Inspect a game's mod folders and say what is ours, what changed, and what
+/// arrived from somewhere else.
+///
+/// `planned` is the set of destinations the current profile wants to occupy,
+/// used to tell a harmless leftover apart from one that will actively block an
+/// install.
+pub fn scan(
+    pack: &CompiledPack,
+    target: &Target,
+    root: &Path,
+    manifest: Option<&Manifest>,
+    planned: &BTreeSet<PathBuf>,
+) -> FolderScan {
+    let mut result = FolderScan {
+        target: target.id.clone(),
+        root: root.to_path_buf(),
+        ..Default::default()
+    };
+
+    // Everything we believe we placed, by relative path.
+    let ours: BTreeMap<PathBuf, &ManifestFile> = manifest
+        .map(|m| m.files.iter().map(|f| (f.rel.clone(), f)).collect())
+        .unwrap_or_default();
+
+    let mut seen_on_disk: BTreeSet<PathBuf> = BTreeSet::new();
+
+    for (dir, is_state) in pack.managed_dirs(target, root) {
+        let mut files = Vec::new();
+        collect_files(&dir, &dir, &mut files);
+
+        for (abs, rel_to_dir, size) in files {
+            let Ok(rel) = abs.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.to_path_buf();
+            seen_on_disk.insert(rel.clone());
+            let _ = rel_to_dir;
+
+            match ours.get(&rel) {
+                Some(record) => {
+                    if still_ours(&abs, record) {
+                        result.intact += 1;
+                    } else {
+                        result.modified.push(ScanEntry {
+                            rel,
+                            size,
+                            conflicts: false,
+                            mod_id: Some(record.mod_id.clone()),
+                        });
+                    }
+                }
+                // Config directories belong to the profile, so an unfamiliar
+                // file there is expected, not something to raise.
+                None if is_state => {}
+                None => result.foreign.push(ScanEntry {
+                    conflicts: planned.contains(&rel),
+                    rel,
+                    size,
+                    mod_id: None,
+                }),
+            }
+        }
+    }
+
+    for (rel, record) in &ours {
+        if !seen_on_disk.contains(rel) && !root.join(rel).exists() {
+            result.missing.push(ScanEntry {
+                rel: rel.clone(),
+                size: record.size,
+                conflicts: false,
+                mod_id: Some(record.mod_id.clone()),
+            });
+        }
+    }
+
+    result
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(m) if m.is_dir() => collect_files(root, &path, out),
+            Ok(m) if m.is_file() || m.is_symlink() => {
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                out.push((path, rel, m.len()));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Check a deployment is still intact. This is how you find out that last
@@ -491,6 +646,199 @@ mod tests {
         let previous = claims.insert(PathBuf::from("a.dll"), "second");
         assert_eq!(previous, Some("first"));
         assert_eq!(claims[&PathBuf::from("a.dll")], "second");
+    }
+
+    /// A minimal Valheim-shaped pack: plugins are managed, config is state.
+    fn scan_pack() -> CompiledPack {
+        use crate::pack::{GameMeta, InstallRule, Pack, StateRules, TargetKind};
+        let mut paths = BTreeMap::new();
+        paths.insert("plugins".to_string(), "BepInEx/plugins".to_string());
+        paths.insert("config".to_string(), "BepInEx/config".to_string());
+
+        CompiledPack::new(Pack {
+            schema: 1,
+            game: GameMeta {
+                id: "scantest".into(),
+                name: "Scan Test".into(),
+                description: String::new(),
+                maintainers: vec![],
+            },
+            targets: vec![Target {
+                id: "client".into(),
+                name: "Client".into(),
+                kind: TargetKind::Client,
+                flavor: None,
+                asset_reject: vec![],
+                processes: vec![],
+                markers: vec!["game.exe".into()],
+                paths: BTreeMap::new(),
+                steam: None,
+                candidates: vec![],
+            }],
+            paths,
+            assets: Default::default(),
+            state: StateRules {
+                paths: vec!["config".into()],
+            },
+            versions: Default::default(),
+            loaders: Vec::new(),
+            search: Default::default(),
+            running: Default::default(),
+            install: vec![
+                InstallRule {
+                    pattern: "**/*.dll".into(),
+                    into: "plugins".into(),
+                    strip: None,
+                    flatten: true,
+                    targets: None,
+                    mutable: false,
+                },
+                InstallRule {
+                    pattern: "**/*.cfg".into(),
+                    into: "config".into(),
+                    strip: None,
+                    flatten: true,
+                    targets: None,
+                    mutable: true,
+                },
+            ],
+            readable_extensions: vec!["lua".into()],
+            executable_extensions: vec!["dll".into()],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn scan_tells_our_files_from_everyone_elses() {
+        let root = std::env::temp_dir().join(format!("modifile-scan-{}", crate::paths::now_millis()));
+        let plugins = root.join("BepInEx/plugins");
+        let config = root.join("BepInEx/config");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+
+        // One we placed and left alone, one we placed and then something
+        // changed, one we placed that vanished, one we never placed, and a
+        // config file (profile-owned, so not "foreign").
+        std::fs::write(plugins.join("Ours.dll"), b"ours").unwrap();
+        std::fs::write(plugins.join("Edited.dll"), b"original").unwrap();
+        std::fs::write(plugins.join("HandInstalled.dll"), b"someone else").unwrap();
+        std::fs::write(config.join("whatever.cfg"), b"settings").unwrap();
+
+        let record = |rel: &str, size: u64| ManifestFile {
+            rel: PathBuf::from("BepInEx/plugins").join(rel),
+            store_sha: "0".into(),
+            size,
+            mtime_ms: mtime_ms(&plugins.join(rel)),
+            mod_id: "github:test/mod".into(),
+        };
+        let manifest = Manifest {
+            game: "scantest".into(),
+            target: "client".into(),
+            profile: "main".into(),
+            root: root.clone(),
+            mode: Some(LinkMode::Hardlink),
+            deployed_ms: 0,
+            active: true,
+            files: vec![
+                record("Ours.dll", 4),
+                record("Edited.dll", 8),
+                record("Vanished.dll", 10),
+            ],
+            created_dirs: vec![],
+        };
+
+        // Now make Edited.dll differ from what the manifest remembers.
+        std::fs::write(plugins.join("Edited.dll"), b"tampered with").unwrap();
+
+        let pack = scan_pack();
+        let target = pack.target("client").unwrap();
+        let mut planned = BTreeSet::new();
+        planned.insert(PathBuf::from("BepInEx/plugins").join("HandInstalled.dll"));
+
+        let scan = scan(&pack, target, &root, Some(&manifest), &planned);
+
+        assert_eq!(scan.intact, 1, "Ours.dll should be intact");
+        assert_eq!(scan.modified.len(), 1, "Edited.dll should be modified");
+        assert_eq!(scan.missing.len(), 1, "Vanished.dll should be missing");
+        assert_eq!(
+            scan.foreign.len(),
+            1,
+            "only HandInstalled.dll is foreign; the config file is profile-owned"
+        );
+        assert_eq!(
+            scan.blocking().count(),
+            1,
+            "the hand-installed file sits where a mod wants to go"
+        );
+        assert!(!scan.is_clean());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn revert_leaves_a_replaced_file_but_reports_it() {
+        // The real case: the mod's author rebuilds their DLL and drops it over
+        // the installed one. Deactivating must not silently delete their build,
+        // and must not silently pretend it removed it either.
+        let root = std::env::temp_dir().join(format!("modifile-revert-{}", crate::paths::now_millis()));
+        let plugins = root.join("BepInEx/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+
+        let ours = plugins.join("Ours.dll");
+        let theirs = plugins.join("Replaced.dll");
+        std::fs::write(&ours, b"installed by modifile").unwrap();
+        std::fs::write(&theirs, b"installed by modifile").unwrap();
+
+        let record = |name: &str, path: &std::path::Path| ManifestFile {
+            rel: PathBuf::from("BepInEx/plugins").join(name),
+            store_sha: "0".into(),
+            size: std::fs::metadata(path).unwrap().len(),
+            mtime_ms: mtime_ms(path),
+            mod_id: "github:test/mod".into(),
+        };
+        let manifest = Manifest {
+            game: "t".into(),
+            target: "client".into(),
+            profile: "main".into(),
+            root: root.clone(),
+            mode: Some(LinkMode::Copy),
+            deployed_ms: 0,
+            active: true,
+            files: vec![record("Ours.dll", &ours), record("Replaced.dll", &theirs)],
+            created_dirs: vec![],
+        };
+
+        // The author drops in their own build.
+        std::fs::write(&theirs, b"my own freshly compiled build, different size").unwrap();
+
+        let mut report = DeployReport::default();
+        let removed = revert(&manifest, &mut report, false).unwrap();
+
+        assert_eq!(removed, 1, "only the untouched file is removed");
+        assert!(!ours.exists());
+        assert!(theirs.exists(), "the author's own build must survive");
+        assert_eq!(report.skipped.len(), 1, "and it must be reported, not silent");
+
+        // Now they say "delete it anyway".
+        let mut forced = DeployReport::default();
+        revert(&manifest, &mut forced, true).unwrap();
+        assert!(!theirs.exists(), "force removes it");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_of_an_untouched_folder_is_clean() {
+        let root = std::env::temp_dir().join(format!("modifile-clean-{}", crate::paths::now_millis()));
+        std::fs::create_dir_all(root.join("BepInEx/plugins")).unwrap();
+
+        let pack = scan_pack();
+        let target = pack.target("client").unwrap();
+        let scan = scan(&pack, target, &root, None, &BTreeSet::new());
+
+        assert!(scan.is_clean());
+        assert_eq!(scan.intact, 0);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

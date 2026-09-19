@@ -3,7 +3,8 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::hash::normalize_digest;
 use crate::http::Http;
-use crate::source::{Asset, ModId, Release, RepoInfo};
+use crate::source::modrinth::urlencode;
+use crate::source::{Asset, ModId, Release, RepoInfo, SearchHit};
 
 const API: &str = "https://api.github.com";
 
@@ -66,6 +67,34 @@ struct WireLicense {
 }
 
 #[derive(Debug, Deserialize)]
+struct WireSearch {
+    #[serde(default)]
+    items: Vec<WireSearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireSearchItem {
+    name: String,
+    #[serde(default)]
+    full_name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    stargazers_count: u64,
+    #[serde(default)]
+    owner: Option<WireOwner>,
+    #[serde(default)]
+    license: Option<WireLicense>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct WireAttestations {
     #[serde(default)]
     attestations: Vec<serde_json::Value>,
@@ -107,10 +136,118 @@ impl GitHub {
                         download_url: a.browser_download_url,
                         size: a.size,
                         digest: a.digest.map(|d| normalize_digest(&d)),
+                        sha512: None,
                     })
                     .collect(),
             })
             .collect())
+    }
+
+    /// Find repositories by name.
+    ///
+    /// For games with no usable third-party index — World of Warcraft being the
+    /// case in point — GitHub is the index, and it has the advantage of only
+    /// showing things Modifile can actually install.
+    pub async fn search_repos(
+        &self,
+        query: &str,
+        topics: &[String],
+        terms: &[String],
+    ) -> Result<Vec<SearchHit>> {
+        // GitHub ANDs repeated qualifiers, so `topic:a topic:b` means "has both"
+        // and finds almost nothing. One query per topic, merged, is the only way
+        // to express "any of these".
+        let base = query.trim();
+        let mut queries: Vec<String> = topics
+            .iter()
+            .map(|topic| format!("{base} topic:{topic} archived:false"))
+            .collect();
+        if queries.is_empty() {
+            let extra = terms.join(" ");
+            queries.push(format!("{base} {extra} archived:false"));
+        }
+
+        let mut seen: Vec<SearchHit> = Vec::new();
+        for q in queries {
+            let url = format!(
+                "{API}/search/repositories?q={}&sort=stars&order=desc&per_page=15",
+                urlencode(&q)
+            );
+            let wire: WireSearch = self
+                .http
+                .get_json(&url)
+                .await
+                .unwrap_or(None)
+                .unwrap_or(WireSearch { items: Vec::new() });
+
+            for item in wire.items {
+                let id = ModId::github(
+                    item.owner.map(|o| o.login).unwrap_or_default(),
+                    item.name,
+                );
+                if seen.iter().any(|h| h.id == id) {
+                    continue;
+                }
+                seen.push(SearchHit {
+                    id,
+                    title: item.full_name,
+                    description: item.description.unwrap_or_default(),
+                    stars: item.stargazers_count,
+                    license: item
+                        .license
+                        .and_then(|l| l.spdx_id)
+                        .filter(|s| s != "NOASSERTION"),
+                    source_url: Some(item.html_url),
+                    installable: None,
+                });
+            }
+        }
+
+        // Topic searches miss repositories whose authors never set topics, so
+        // fall back to plain words when the tagged results are thin.
+        if seen.len() < 5 && !terms.is_empty() {
+            let q = format!("{base} {} archived:false", terms.join(" "));
+            let url = format!(
+                "{API}/search/repositories?q={}&sort=stars&order=desc&per_page=15",
+                urlencode(&q)
+            );
+            if let Ok(Some(wire)) = self.http.get_json::<WireSearch>(&url).await {
+                for item in wire.items {
+                    let id = ModId::github(
+                        item.owner.map(|o| o.login).unwrap_or_default(),
+                        item.name,
+                    );
+                    if seen.iter().any(|h| h.id == id) {
+                        continue;
+                    }
+                    seen.push(SearchHit {
+                        id,
+                        title: item.full_name,
+                        description: item.description.unwrap_or_default(),
+                        stars: item.stargazers_count,
+                        license: item
+                            .license
+                            .and_then(|l| l.spdx_id)
+                            .filter(|s| s != "NOASSERTION"),
+                        source_url: Some(item.html_url),
+                        installable: None,
+                    });
+                }
+            }
+        }
+
+        seen.sort_by(|a, b| b.stars.cmp(&a.stars));
+        seen.truncate(20);
+        Ok(seen)
+    }
+
+    /// Whether a repository publishes release assets at all — the difference
+    /// between "found it" and "can install it".
+    pub async fn has_releases(&self, id: &ModId) -> bool {
+        self.releases(id)
+            .await
+            .map(|r| r.iter().any(|rel| !rel.assets.is_empty()))
+            .unwrap_or(false)
     }
 
     pub async fn repo(&self, id: &ModId) -> Result<Option<RepoInfo>> {
@@ -128,6 +265,8 @@ impl GitHub {
                 .filter(|s| !s.is_empty() && s != "NOASSERTION"),
             archived: wire.archived,
             stars: wire.stargazers_count,
+            // The repository is the source, so it is its own source_url.
+            source_url: Some(id.web_url()),
         }))
     }
 

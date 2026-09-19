@@ -29,6 +29,25 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// SHA-512, lowercase hex. Modrinth publishes this instead of SHA-256, so it
+/// is what we check their downloads against.
+pub fn sha512_file(path: &Path) -> Result<String> {
+    use sha2::Sha512;
+
+    let file = std::fs::File::open(path).ctx(format!("hashing {}", path.display()))?;
+    let mut reader = std::io::BufReader::with_capacity(128 * 1024, file);
+    let mut hasher = Sha512::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// GitHub reports asset digests as `sha256:abc...`; lockfiles store the bare
 /// hex. Accept either spelling.
 pub fn normalize_digest(raw: &str) -> String {

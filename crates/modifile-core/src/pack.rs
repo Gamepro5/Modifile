@@ -32,6 +32,15 @@ pub struct Pack {
     pub install: Vec<InstallRule>,
     #[serde(default)]
     pub state: StateRules,
+    #[serde(default)]
+    pub versions: VersionRules,
+    /// Mod loaders this game can use, installable from here.
+    #[serde(default)]
+    pub loaders: Vec<LoaderDef>,
+    #[serde(default)]
+    pub search: SearchRules,
+    #[serde(default)]
+    pub running: RunningRules,
     /// Extensions treated as human-readable source. Used to decide whether a
     /// mod is auditable or merely claimed to be open source.
     #[serde(default = "default_readable")]
@@ -189,6 +198,112 @@ pub struct StateRules {
     /// Logical path names from `[paths]`.
     #[serde(default)]
     pub paths: Vec<String>,
+}
+
+/// Whether mods can be changed while the game is running.
+///
+/// Refusing is the safe default and the right one for most games: a BepInEx
+/// plugin is a DLL mapped into the running process, and the game rewrites its
+/// configs on exit, overwriting whatever was just captured.
+///
+/// World of Warcraft is the counter-example. Addons are plain Lua read at load
+/// time, nothing holds the files open, and `/reload` picks up changes — so
+/// blocking there is pure nuisance. Which behaviour applies is a property of
+/// the game, so the game's pack says.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RunningRules {
+    /// True when installing and removing mods is safe mid-session.
+    #[serde(default)]
+    pub allow_changes: bool,
+    /// Shown after a change was made while the game was open.
+    #[serde(default)]
+    pub note: String,
+}
+
+/// How to find mods for this game by name.
+///
+/// There is no single index that covers every game. Modrinth is excellent for
+/// Minecraft and has nothing at all for World of Warcraft; WoW addons live on
+/// CurseForge, but the ones that can actually be installed from here are the
+/// ones that publish GitHub releases — so for WoW, GitHub *is* the right index.
+/// Which to use is therefore a property of the game, and lives in the pack.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SearchRules {
+    /// Search Modrinth. Correct for Minecraft; useless elsewhere.
+    #[serde(default)]
+    pub modrinth: bool,
+    /// Search GitHub repositories carrying any of these topics.
+    #[serde(default)]
+    pub github_topics: Vec<String>,
+    /// Extra words added to every GitHub query, to cut down false positives.
+    #[serde(default)]
+    pub github_terms: Vec<String>,
+    /// CurseForge's numeric id for this game — 1 for World of Warcraft, 432 for
+    /// Minecraft. Needed because CurseForge addresses projects by number, so a
+    /// slug copied out of a URL has to be looked up against a specific game.
+    #[serde(default)]
+    pub curseforge_game_id: Option<u32>,
+}
+
+impl SearchRules {
+    pub fn is_empty(&self) -> bool {
+        !self.modrinth && self.github_topics.is_empty() && self.github_terms.is_empty()
+    }
+}
+
+/// How one mod loader is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoaderKind {
+    /// Fabric and Quilt: a metadata service returns a finished version profile,
+    /// so installing is writing one JSON file. No installer, no Java.
+    #[default]
+    FabricMeta,
+    /// Forge and NeoForge: their installer patches the game and has to actually
+    /// run, so Modifile points at it rather than pretending to do it.
+    Installer,
+}
+
+/// A mod loader this game can use.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LoaderDef {
+    /// Matches the value a profile stores in `loader`.
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: LoaderKind,
+    /// Metadata service base URL, for `fabric-meta` loaders.
+    #[serde(default)]
+    pub meta: String,
+    /// Prefix of the `versions/` folder it creates, e.g. `fabric`.
+    #[serde(default)]
+    pub prefix: String,
+    /// Where to send the user when we cannot install it ourselves.
+    #[serde(default)]
+    pub page: String,
+}
+
+/// Games where a mod is built against a specific game version and mod loader.
+///
+/// Minecraft is the case that forces this: Sodium for NeoForge and Lithium for
+/// Fabric are both "the newest release", and installing one of each produces a
+/// game that does not start. When a pack lists loaders, a profile must pick one
+/// before anything can be resolved.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VersionRules {
+    /// e.g. `["fabric", "forge", "neoforge", "quilt"]`. Empty means the game
+    /// has no such concept and nothing is asked of the user.
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    /// Whether a game version (`1.20.1`) is also required.
+    #[serde(default)]
+    pub needs_game_version: bool,
+}
+
+impl VersionRules {
+    pub fn applies(&self) -> bool {
+        !self.loaders.is_empty() || self.needs_game_version
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -433,6 +548,37 @@ impl CompiledPack {
             }
         }
         None
+    }
+
+    /// One loader definition by id.
+    pub fn loader(&self, id: &str) -> Option<&LoaderDef> {
+        self.pack.loaders.iter().find(|l| l.id.eq_ignore_ascii_case(id))
+    }
+
+    /// Directories this pack installs into, resolved against a game root.
+    ///
+    /// The bool says the directory holds profile-owned state (configs), where a
+    /// file we did not place is normal rather than suspicious.
+    pub fn managed_dirs(&self, target: &Target, root: &Path) -> Vec<(PathBuf, bool)> {
+        let mut seen: Vec<String> = Vec::new();
+        for rule in &self.pack.install {
+            let applies = rule
+                .targets
+                .as_ref()
+                .map(|ids| ids.iter().any(|id| id == &target.id))
+                .unwrap_or(true);
+            if applies && !seen.contains(&rule.into) {
+                seen.push(rule.into.clone());
+            }
+        }
+        seen.into_iter()
+            .filter_map(|name| {
+                let is_state = self.pack.state.paths.contains(&name);
+                // "." would mean scanning the whole game install.
+                let rel = self.paths_for(target).get(&name)?.clone();
+                (rel != ".").then(|| (root.join(rel), is_state))
+            })
+            .collect()
     }
 
     /// Directories holding profile-owned state, resolved against a game root.

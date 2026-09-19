@@ -12,6 +12,8 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x6e, 0xa8, 0xfe);
 /// Fill for primary buttons — readable against light text, unlike ACCENT.
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(0x2f, 0x4a, 0x78);
 pub const GOOD: Color32 = Color32::from_rgb(0x69, 0xc7, 0x8e);
+/// Card background for the "this profile is active" banner.
+pub const GOOD_DIM: Color32 = Color32::from_rgb(0x1e, 0x33, 0x28);
 pub const WARN: Color32 = Color32::from_rgb(0xe0, 0xb1, 0x4f);
 pub const BAD: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x6c);
 
@@ -19,7 +21,7 @@ pub fn trust_color(level: TrustLevel) -> Color32 {
     match level {
         TrustLevel::Verified => GOOD,
         TrustLevel::Readable => ACCENT,
-        TrustLevel::Claimed => WARN,
+        TrustLevel::Unchecked => WARN,
         TrustLevel::Blocked => BAD,
     }
 }

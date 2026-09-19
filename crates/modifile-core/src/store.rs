@@ -109,6 +109,48 @@ impl Store {
         Ok(out)
     }
 
+    /// Every stored entry with its size on disk.
+    pub fn entries(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        let Ok(shards) = std::fs::read_dir(&self.root) else {
+            return Ok(out);
+        };
+        for shard in shards.flatten() {
+            if !shard.path().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path())?.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.contains(".incoming.") {
+                    continue;
+                }
+                out.push((name, dir_size(&entry.path())));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bytes one entry occupies, or 0 if it is not stored.
+    pub fn size_of(&self, sha256: &str) -> u64 {
+        let path = self.entry_path(sha256);
+        if path.is_dir() {
+            dir_size(&path)
+        } else {
+            0
+        }
+    }
+
+    /// Remove one entry by hash.
+    pub fn remove(&self, sha256: &str) -> Result<u64> {
+        let path = self.entry_path(sha256);
+        if !path.is_dir() {
+            return Ok(0);
+        }
+        let size = dir_size(&path);
+        std::fs::remove_dir_all(&path).ctx(format!("removing store entry {sha256}"))?;
+        Ok(size)
+    }
+
     /// Delete entries no lockfile references. Returns (entries, bytes) freed.
     pub fn gc(&self, keep: &std::collections::HashSet<String>) -> Result<(usize, u64)> {
         let mut entries = 0;

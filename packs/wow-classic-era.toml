@@ -1,0 +1,56 @@
+schema = 1
+
+[game]
+id = "wow-classic-era"
+name = "WoW Classic Era"
+description = """
+Classic Era (the permanent vanilla realms), a separate game from Retail and from
+progression Classic. Its addons target the vanilla API and will not run on the
+others, which is why this is its own game rather than a flavor of one."""
+maintainers = ["bundled"]
+
+# Addons are plain Lua read at load time — nothing holds the files open, and
+# /reload picks up changes. So unlike a BepInEx game, mods can be installed
+# while WoW is running.
+[running]
+allow_changes = true
+note = "WoW is running. Type /reload in game to pick up the change."
+
+[search]
+github_topics = ["wow-addon", "wowaddon", "world-of-warcraft", "classic-wow"]
+github_terms = ["wow", "classic", "addon"]
+
+# CurseForge addresses projects by number; this is how a slug from a URL
+# gets resolved to one.
+curseforge_game_id = 1
+
+[paths]
+addons = "Interface/AddOns"
+wtf = "WTF"
+
+[assets]
+prefer = ["*-{flavor}.zip", "*-{flavor}-*.zip", "*_{flavor}.zip", "*-vanilla.zip"]
+accept = ["*.zip"]
+reject = ["*nolib*", "*sources*", "*-src*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+[[install]]
+match = "*/**"
+into = "addons"
+
+[[targets]]
+id = "client"
+name = "Classic Era"
+kind = "client"
+flavor = "classic"
+markers = ["WowClassic.exe"]
+processes = ["WowClassic.exe"]
+# Everything that is not vanilla.
+asset_reject = [
+  "*-mainline*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",
+  "*-cata*", "*-mop*", "*-mists*",
+]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_classic_era_",
+  "${ProgramFiles}/World of Warcraft/_classic_era_",
+]

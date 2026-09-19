@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use crate::deploy::{self, DeployReport, Manifest, Plan};
-use crate::error::{Error, Result};
+use crate::error::{Context, Error, Result};
 use crate::hash::normalize_digest;
 use crate::http::Http;
 use crate::pack::{load_dir, CompiledPack, Target};
@@ -37,6 +37,17 @@ pub struct DeployOptions {
     pub assume_stopped: bool,
 }
 
+/// A mod that did not end up in the lock, and why.
+#[derive(Debug, Clone)]
+pub struct SyncIssue {
+    pub id: ModId,
+    pub message: String,
+    /// True when the mod is fine and simply has no build for this profile's
+    /// game version or loader yet. It stays in the profile, is skipped on
+    /// activation, and picks itself up once a compatible build appears.
+    pub waiting: bool,
+}
+
 /// Where imported configs come from.
 #[derive(Debug, Clone)]
 pub enum ConfigSource {
@@ -55,6 +66,14 @@ pub enum Event {
     Resolved { id: ModId, version: String },
     Downloading { id: ModId, asset: String, size: u64 },
     Cached { id: ModId, version: String },
+    /// A manually supplied mod whose source now advertises something newer.
+    /// Nothing can fetch it for you, but you can be told.
+    UpdateAvailable {
+        id: ModId,
+        have: String,
+        latest: String,
+        page: String,
+    },
     Installed { id: ModId, version: String, trust: TrustReport },
     Failed { id: ModId, error: String },
 }
@@ -69,6 +88,11 @@ pub struct Engine {
     pub paths: Paths,
     pub store: Store,
     pub github: GitHub,
+    pub modrinth: crate::source::modrinth::Modrinth,
+    /// GitLab, Gitea and Forgejo, including self-hosted instances.
+    pub forge: crate::source::forge::Forge,
+    /// Present only when the user has supplied their own CurseForge key.
+    pub curseforge: Option<crate::source::curseforge::CurseForge>,
     pub packs: Vec<CompiledPack>,
     pub pack_errors: Vec<(PathBuf, Error)>,
     pub policy: TrustPolicy,
@@ -88,10 +112,27 @@ impl Engine {
     pub fn open(paths: Paths, token: Option<String>) -> Result<Self> {
         paths.ensure()?;
         let http = Http::new(paths.http_cache(), token)?;
+        // Modrinth and CurseForge take no bearer token, so they get their own
+        // client without GitHub's Authorization header attached.
+        let plain = Http::new(paths.http_cache(), None)?;
+        let curseforge_key = std::fs::read_to_string(paths.curseforge_key_file())
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("CURSEFORGE_API_KEY").ok())
+            .filter(|k| !k.trim().is_empty());
+
+        // Opt-in, stored as a plain marker file so it is obvious and revocable.
+        let cf_direct = paths.curseforge_direct_file().exists();
+
         let (packs, pack_errors) = load_dir(&paths.packs);
         let roots = crate::roots::GlobalRoots::load(&paths.roots_file()).unwrap_or_default();
         Ok(Self {
             store: Store::new(paths.store.clone()),
+            modrinth: crate::source::modrinth::Modrinth::new(plain.clone()),
+            forge: crate::source::forge::Forge::new(plain.clone()),
+            curseforge: curseforge_key
+                .map(|key| crate::source::curseforge::CurseForge::new(plain, key, cf_direct)),
             github: GitHub::new(http),
             packs,
             pack_errors,
@@ -154,6 +195,58 @@ impl Engine {
         self.roots.save(&self.paths.roots_file())
     }
 
+    /// Save the user's own CurseForge API key.
+    ///
+    /// Theirs, not ours: Overwolf issues keys after a human review and forbids
+    /// sharing them, so one cannot be shipped inside the binary.
+    pub fn set_curseforge_key(&mut self, key: &str) -> Result<()> {
+        let key = key.trim();
+        let path = self.paths.curseforge_key_file();
+        if key.is_empty() {
+            std::fs::remove_file(&path).ok();
+            self.curseforge = None;
+            return Ok(());
+        }
+        crate::paths::write_atomic(&path, key.as_bytes())?;
+        let http = Http::new(self.paths.http_cache(), None)?;
+        self.curseforge = Some(crate::source::curseforge::CurseForge::new(
+            http,
+            key.to_string(),
+            self.paths.curseforge_direct_file().exists(),
+        ));
+        Ok(())
+    }
+
+    pub fn has_curseforge_key(&self) -> bool {
+        self.curseforge.is_some()
+    }
+
+    /// Whether blocked CurseForge files are fetched from the CDN.
+    pub fn curseforge_direct(&self) -> bool {
+        self.paths.curseforge_direct_file().exists()
+    }
+
+    /// Turn that on or off. Stored as a marker file so the setting is obvious
+    /// on disk and trivially undone.
+    pub fn set_curseforge_direct(&mut self, on: bool) -> Result<()> {
+        let marker = self.paths.curseforge_direct_file();
+        if on {
+            crate::paths::write_atomic(&marker, b"on")?;
+        } else {
+            std::fs::remove_file(&marker).ok();
+        }
+        // Rebuild the client so the change takes effect without a restart.
+        if let Some(key) = std::fs::read_to_string(self.paths.curseforge_key_file())
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+        {
+            let http = Http::new(self.paths.http_cache(), None)?;
+            self.curseforge = Some(crate::source::curseforge::CurseForge::new(http, key, on));
+        }
+        Ok(())
+    }
+
     /// Save a GitHub token and rebuild the HTTP client that uses it.
     pub fn set_token(&mut self, token: &str) -> Result<()> {
         let token = token.trim();
@@ -186,10 +279,68 @@ impl Engine {
         profile: &Profile,
         previous: &Lock,
         report: Option<Reporter>,
-    ) -> Result<(Lock, Vec<(ModId, String)>)> {
+    ) -> Result<(Lock, Vec<SyncIssue>)> {
         let report = report.unwrap_or_else(silent);
-        let enabled: Vec<_> = profile.mods.iter().filter(|m| m.enabled).collect();
-        let mut failures = Vec::new();
+        let mut failures: Vec<SyncIssue> = Vec::new();
+
+        // Manually supplied mods have no API to ask. Their lock entry is
+        // carried straight through, so an update check neither loses them nor
+        // reports them as failures.
+        let mut carried: Vec<LockEntry> = Vec::new();
+        for entry in profile.mods.iter().filter(|m| m.enabled && m.manual) {
+            match previous.get(&entry.id) {
+                Some(locked) if self.store.contains(&locked.sha256) => {
+                    let mut locked = locked.clone();
+
+                    // Nothing can download it, but the source will still say
+                    // what the newest version is — so you do not need their app
+                    // running just to learn there is an update.
+                    if entry.id.kind == crate::source::SourceKind::CurseForge {
+                        if let Some(cf) = &self.curseforge {
+                            if let Ok(Some(latest)) = cf
+                                .latest_version(
+                                    &entry.id,
+                                    pack.pack.search.curseforge_game_id,
+                                    profile.game_version.as_deref(),
+                                )
+                                .await
+                            {
+                                if locked.upstream.as_deref() != Some(latest.as_str()) {
+                                    if locked.upstream.is_some() {
+                                        report(Event::UpdateAvailable {
+                                            id: entry.id.clone(),
+                                            have: locked.upstream.clone().unwrap_or_default(),
+                                            latest: latest.clone(),
+                                            page: entry.id.web_url(),
+                                        });
+                                    }
+                                    locked.upstream = Some(latest);
+                                }
+                            }
+                        }
+                    }
+
+                    report(Event::Cached {
+                        id: entry.id.clone(),
+                        version: locked.version.clone(),
+                    });
+                    carried.push(locked);
+                }
+                _ => failures.push(SyncIssue {
+                    id: entry.id.clone(),
+                    message: "was added from a file, and that file is no longer in the \
+                              store — supply it again with `modifile add-file`"
+                        .to_string(),
+                    waiting: false,
+                }),
+            }
+        }
+
+        let enabled: Vec<_> = profile
+            .mods
+            .iter()
+            .filter(|m| m.enabled && !m.manual)
+            .collect();
 
         // --- resolve, concurrently -----------------------------------------
         // Asset choice is per target: a profile covering retail and Classic
@@ -202,13 +353,45 @@ impl Engine {
             .cloned()
             .collect();
 
-        let resolutions: Vec<std::result::Result<Resolution, (ModId, String)>> =
+        // Sources that publish one build per game version and loader need to
+        // know which the profile is for; GitHub ignores it.
+        let filter = crate::source::modrinth::VersionFilter {
+            game_version: profile.game_version.clone(),
+            loader: profile.loader.clone(),
+        };
+
+        // Refuse rather than guess. Picking "the newest" per mod without this
+        // happily mixes a NeoForge build of one mod with a Fabric build of
+        // another, producing a game that will not start.
+        let rules = &pack.pack.versions;
+        if !rules.loaders.is_empty() && profile.loader.is_none() {
+            return Err(Error::other(format!(
+                "`{}` needs a mod loader before anything can be resolved. {} mods are \
+                 published as a separate build per loader, and mixing them gives you a \
+                 game that will not start. Set one with `modifile set {} --loader <name>`; \
+                 options: {}.",
+                profile.name,
+                pack.pack.game.name,
+                profile.name,
+                rules.loaders.join(", ")
+            )));
+        }
+        if rules.needs_game_version && profile.game_version.is_none() {
+            return Err(Error::other(format!(
+                "`{}` needs a game version (for example 1.20.1) before mods can be resolved. \
+                 Set one with `modifile set {} --game-version <version>`.",
+                profile.name, profile.name
+            )));
+        }
+
+        let resolutions: Vec<std::result::Result<Resolution, SyncIssue>> =
             futures::stream::iter(enabled.iter().map(|entry| {
                 let report = report.clone();
                 let targets = targets.clone();
+                let filter = filter.clone();
                 async move {
                     report(Event::Resolving(entry.id.clone()));
-                    match self.resolve_one(pack, &entry.id, entry.pin.as_deref(), entry.prerelease, &targets).await {
+                    match self.resolve_one(pack, &entry.id, entry.pin.as_deref(), entry.prerelease, &targets, &filter).await {
                         Ok(res) => {
                             report(Event::Resolved {
                                 id: res.id.clone(),
@@ -217,11 +400,18 @@ impl Engine {
                             Ok(res)
                         }
                         Err(e) => {
-                            report(Event::Failed {
+                            let waiting = matches!(e, Error::NoBuildFor { .. });
+                            if !waiting {
+                                report(Event::Failed {
+                                    id: entry.id.clone(),
+                                    error: e.to_string(),
+                                });
+                            }
+                            Err(SyncIssue {
                                 id: entry.id.clone(),
-                                error: e.to_string(),
-                            });
-                            Err((entry.id.clone(), e.to_string()))
+                                message: e.to_string(),
+                                waiting,
+                            })
                         }
                     }
                 }
@@ -239,7 +429,7 @@ impl Engine {
         }
 
         // --- fetch what we do not already have ------------------------------
-        let fetched: Vec<std::result::Result<LockEntry, (ModId, String)>> =
+        let fetched: Vec<std::result::Result<LockEntry, SyncIssue>> =
             futures::stream::iter(resolved.into_iter().map(|res| {
                 let report = report.clone();
                 let previous_entry = previous.get(&res.id).cloned();
@@ -252,7 +442,11 @@ impl Engine {
                                 id: id.clone(),
                                 error: e.to_string(),
                             });
-                            Err((id, e.to_string()))
+                            Err(SyncIssue {
+                                id,
+                                message: e.to_string(),
+                                waiting: false,
+                            })
                         }
                     }
                 }
@@ -261,7 +455,7 @@ impl Engine {
             .collect()
             .await;
 
-        let mut mods = Vec::new();
+        let mut mods = carried;
         for outcome in fetched {
             match outcome {
                 Ok(entry) => mods.push(entry),
@@ -288,6 +482,48 @@ impl Engine {
         ))
     }
 
+    /// Fetch a mod's releases and project info from whichever source owns it.
+    async fn fetch(
+        &self,
+        id: &ModId,
+        filter: &crate::source::modrinth::VersionFilter,
+        cf_game: Option<u32>,
+    ) -> Result<(Vec<Release>, Option<RepoInfo>)> {
+        match id.kind {
+            crate::source::SourceKind::GitHub => Ok((
+                self.github.releases(id).await?,
+                self.github.repo(id).await.unwrap_or(None),
+            )),
+            crate::source::SourceKind::GitLab | crate::source::SourceKind::Gitea => Ok((
+                self.forge.releases(id).await?,
+                self.forge.repo(id).await.unwrap_or(None),
+            )),
+            // Nothing to fetch: the user gave us the bytes. Its lock entry is
+            // carried over untouched by `sync`, so this is unreachable in
+            // practice and exists only to keep the match honest.
+            crate::source::SourceKind::Local => Err(Error::other(format!(
+                "{id} was added from a file, so there is nothing to check for updates. \
+                 Supply a newer file with `modifile add-file` to update it."
+            ))),
+            crate::source::SourceKind::Modrinth => Ok((
+                self.modrinth.releases(id, filter).await?,
+                self.modrinth.project(id).await.unwrap_or(None),
+            )),
+            crate::source::SourceKind::CurseForge => {
+                let Some(cf) = &self.curseforge else {
+                    return Err(Error::other(format!(
+                        "{id} is on CurseForge, which needs an API key you obtain yourself. \
+                         Add one in Settings, or with `modifile auth --curseforge <key>`."
+                    )));
+                };
+                Ok((
+                    cf.releases(id, filter.game_version.as_deref(), cf_game).await?,
+                    cf.project(id, cf_game).await.unwrap_or(None),
+                ))
+            }
+        }
+    }
+
     async fn resolve_one(
         &self,
         pack: &CompiledPack,
@@ -295,12 +531,27 @@ impl Engine {
         pin: Option<&str>,
         allow_prerelease: bool,
         targets: &[Target],
+        filter: &crate::source::modrinth::VersionFilter,
     ) -> Result<Resolution> {
-        let releases = self.github.releases(id).await?;
+        let (releases, repo) = self
+            .fetch(id, filter, pack.pack.search.curseforge_game_id)
+            .await?;
         if releases.is_empty() {
-            return Err(Error::NotFound(format!(
-                "{id} has no GitHub releases — this loader installs release assets, not source checkouts"
-            )));
+            // "Nothing built for your version yet" is a waiting state, not a
+            // broken mod, and the two must not look the same.
+            if !filter.is_empty() {
+                return Err(Error::NoBuildFor {
+                    id: id.to_string(),
+                    wanted: filter.describe(),
+                });
+            }
+            return Err(Error::NotFound(match id.kind {
+                crate::source::SourceKind::GitHub => format!(
+                    "{id} has no GitHub releases — Modifile installs release assets, not \
+                     source checkouts"
+                ),
+                _ => format!("{id} has no downloadable releases"),
+            }));
         }
 
         // Walk back through releases until one carries an asset we can use.
@@ -316,12 +567,18 @@ impl Engine {
                         id: id.clone(),
                         release: release.clone(),
                         asset: release.assets[idx].clone(),
-                        repo: self.github.repo(id).await.unwrap_or(None),
+                        repo: repo.clone(),
                     });
                 }
             }
         }
 
+        if !filter.is_empty() && pin.is_none() {
+            return Err(Error::NoBuildFor {
+                id: id.to_string(),
+                wanted: filter.describe(),
+            });
+        }
         Err(Error::NotFound(match pin {
             Some(p) => format!("{id} has no usable asset on pinned release {p}"),
             None => format!(
@@ -385,7 +642,8 @@ impl Engine {
             .download_to(&res.asset.download_url, &tmp)
             .await?;
 
-        // If GitHub published a digest, the bytes must match it.
+        // Whatever digest the source published, the bytes must match it.
+        // GitHub gives SHA-256; Modrinth gives SHA-512.
         if let Some(expected) = &upstream_digest {
             if expected != &sha256 {
                 let _ = std::fs::remove_file(&tmp);
@@ -393,6 +651,17 @@ impl Engine {
                     name: res.asset.name.clone(),
                     expected: expected.clone(),
                     actual: sha256,
+                });
+            }
+        }
+        if let Some(expected) = res.asset.sha512.as_deref() {
+            let actual = crate::hash::sha512_file(&tmp)?;
+            if !expected.eq_ignore_ascii_case(&actual) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Integrity {
+                    name: res.asset.name.clone(),
+                    expected: expected.to_string(),
+                    actual,
                 });
             }
         }
@@ -439,6 +708,7 @@ impl Engine {
             sha256,
             size,
             published_at: res.release.published_at.clone(),
+            upstream: None,
             trust,
         })
     }
@@ -462,6 +732,32 @@ impl Engine {
         Manifest::load(&self.paths.manifest_file(game, target))
     }
 
+    /// Look at what is actually in a game's mod folders right now: ours,
+    /// changed since we placed it, or put there by something else.
+    pub fn scan(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        lock: &Lock,
+        target: &Target,
+        root: &std::path::Path,
+    ) -> Result<deploy::FolderScan> {
+        // What this profile would occupy, so a harmless leftover can be told
+        // apart from one that will block an install.
+        let planned = self
+            .plan(pack, profile, lock, target, root)
+            .map(|plan| plan.files.into_iter().map(|f| f.rel).collect())
+            .unwrap_or_default();
+        let manifest = self.manifest(pack.id(), &target.id)?;
+        Ok(deploy::scan(
+            pack,
+            target,
+            root,
+            manifest.as_ref(),
+            &planned,
+        ))
+    }
+
     /// Is this game running? Cheap enough to call from a UI, and the single
     /// source of truth for the running-game guard.
     pub fn running(
@@ -477,10 +773,16 @@ impl Engine {
     /// game is a hard stop. Remotely we can see nothing, so the only honest
     /// options are to refuse or to let the user assert it — never to assume.
     fn require_closed(
+        pack: &CompiledPack,
         target: &Target,
         root: &std::path::Path,
         options: DeployOptions,
     ) -> Result<()> {
+        // Some games can be modded mid-session. WoW addons are Lua read at load
+        // time, so blocking there would be nuisance rather than safety.
+        if pack.pack.running.allow_changes {
+            return Ok(());
+        }
         if crate::paths::is_network_path(root) {
             return if options.assume_stopped {
                 Ok(())
@@ -513,7 +815,7 @@ impl Engine {
         profile_name: &str,
         options: DeployOptions,
     ) -> Result<DeployReport> {
-        Self::require_closed(target, &plan.root, options)?;
+        Self::require_closed(pack, target, &plan.root, options)?;
         let previous = self.manifest(&plan.game, &plan.target)?;
         let state_dirs = pack.state_dirs(target, &plan.root);
 
@@ -534,11 +836,22 @@ impl Engine {
         }
 
         // 2. The incoming profile gets its own back.
+        //
+        // First activation is a special case: the game folder may already be
+        // full of settings from before Modifile existed, and the profile has
+        // nothing saved. Those files are adopted rather than ignored —
+        // otherwise a profile looks like it has no configs while the game is
+        // plainly full of them.
         let mut restored = 0;
+        let mut adopted = 0;
         for (name, live) in &state_dirs {
             let saved =
                 state::profile_state_dir(&self.paths.profiles, profile_name, &plan.target)
                     .join(name);
+
+            if !switching && state::list_files(&saved).is_empty() {
+                adopted += state::capture(live, &saved)?.files;
+            }
             restored += state::restore(&saved, live)?.files;
         }
 
@@ -551,6 +864,7 @@ impl Engine {
         )?;
         report.captured = captured;
         report.restored = restored;
+        report.adopted = adopted;
 
         manifest.save(&self.paths.manifest_file(&plan.game, &plan.target))?;
         Ok(report)
@@ -574,7 +888,7 @@ impl Engine {
 
         if let Some(pack) = self.pack(game) {
             if let Some(target_def) = pack.target(target) {
-                Self::require_closed(target_def, &manifest.root, options)?;
+                Self::require_closed(pack, target_def, &manifest.root, options)?;
                 for (name, live) in pack.state_dirs(target_def, &manifest.root) {
                     let saved = state::profile_state_dir(
                         &self.paths.profiles,
@@ -588,8 +902,22 @@ impl Engine {
             }
         }
 
-        report.removed = deploy::revert(&manifest, &mut report)?;
-        std::fs::remove_file(&path).ok();
+        report.removed = deploy::revert(&manifest, &mut report, options.force)?;
+
+        // Keep the record when something was left behind, so the file is still
+        // known to have been ours and a later deactivate can finish the job.
+        // Dropping it would strand the file as "foreign" forever.
+        if report.skipped.is_empty() {
+            std::fs::remove_file(&path).ok();
+        } else {
+            let remaining: Vec<PathBuf> =
+                report.skipped.iter().map(|(rel, _)| rel.clone()).collect();
+            let mut pruned = manifest.clone();
+            pruned.files.retain(|f| remaining.contains(&f.rel));
+            // Not active any more — it just remembers what is still lying around.
+            pruned.active = false;
+            pruned.save(&path)?;
+        }
         Ok(report)
     }
 
@@ -665,7 +993,7 @@ impl Engine {
             // we cannot — the game is running, or it is on another machine —
             // the profile's copy is still reset and the next deploy applies it.
             if deployed_here
-                && Self::require_closed(target, root, DeployOptions::default()).is_ok()
+                && Self::require_closed(pack, target, root, DeployOptions::default()).is_ok()
             {
                 for (_, live) in pack.state_dirs(target, root) {
                     state::clear(&live)?;
@@ -714,7 +1042,7 @@ impl Engine {
                 .unwrap_or(false),
         ) {
             if !matches!(source, ConfigSource::Game)
-                && Self::require_closed(target, root, DeployOptions::default()).is_ok()
+                && Self::require_closed(pack, target, root, DeployOptions::default()).is_ok()
             {
                 for (name, live) in pack.state_dirs(target, root) {
                     let saved =
@@ -727,21 +1055,369 @@ impl Engine {
         Ok(copied)
     }
 
-    /// Store entries no profile references any more.
-    pub fn gc(&self) -> Result<(usize, u64)> {
-        let mut keep: HashSet<String> = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&self.paths.profiles) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    if let Ok(lock) = Lock::load(&path) {
-                        keep.extend(lock.store_keys());
+    // -----------------------------------------------------------------------
+    // Sharing
+    // -----------------------------------------------------------------------
+
+    /// Package a profile into one shareable file.
+    pub fn export_profile(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        include_configs: bool,
+        description: String,
+    ) -> Result<crate::share::Bundle> {
+        let lock = Lock::load(&self.paths.lock_file(&profile.name))?;
+
+        let mut configs = std::collections::BTreeMap::new();
+        if include_configs {
+            for target in &pack.pack.targets {
+                let mut files = std::collections::BTreeMap::new();
+                for (name, dir) in self.config_dirs(pack, &profile.name, target) {
+                    for rel in state::list_files(&dir) {
+                        let display = PathBuf::from(&name)
+                            .join(&rel)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        files.insert(
+                            display,
+                            crate::share::ConfigFile::read(&dir.join(&rel))?,
+                        );
+                    }
+                }
+                if !files.is_empty() {
+                    configs.insert(target.id.clone(), files);
+                }
+            }
+        }
+
+        Ok(crate::share::Bundle::build(profile, &lock, configs, description))
+    }
+
+    /// Create a profile from a shared bundle. Returns the name actually used.
+    pub fn import_profile(
+        &self,
+        bundle: &crate::share::Bundle,
+        name: Option<&str>,
+        pin_versions: bool,
+    ) -> Result<String> {
+        if self.pack(&bundle.game).is_none() {
+            return Err(Error::NotFound(format!(
+                "game pack `{}` — this profile is for a game you do not have a pack for",
+                bundle.game
+            )));
+        }
+
+        // Never clobber an existing profile just because a friend's was named
+        // the same thing.
+        let wanted = name.unwrap_or(&bundle.name);
+        let mut chosen = sanitize_name(wanted);
+        let mut n = 2;
+        while self.paths.profile_file(&chosen).exists() {
+            chosen = format!("{}-{n}", sanitize_name(wanted));
+            n += 1;
+        }
+
+        let profile = bundle.to_profile(&chosen, pin_versions);
+        profile.save(&self.paths.profile_file(&chosen))?;
+        bundle.write_configs(&self.paths.profiles, &chosen)?;
+        Ok(chosen)
+    }
+
+    /// Rename a profile and everything that hangs off its name.
+    pub fn rename_profile(&self, from: &str, to: &str) -> Result<String> {
+        let to = sanitize_name(to);
+        if to.is_empty() {
+            return Err(Error::other("a profile needs a name"));
+        }
+        if to == from {
+            return Ok(to);
+        }
+        if self.paths.profile_file(&to).exists() {
+            return Err(Error::other(format!("`{to}` already exists")));
+        }
+
+        let mut profile = Profile::load(&self.paths.profile_file(from))?;
+        profile.name = to.clone();
+        profile.save(&self.paths.profile_file(&to))?;
+        std::fs::remove_file(self.paths.profile_file(from)).ok();
+
+        // The lock and the saved configs are keyed by name too.
+        let old_lock = self.paths.lock_file(from);
+        if old_lock.exists() {
+            std::fs::rename(&old_lock, self.paths.lock_file(&to)).ok();
+        }
+        let old_state = self.paths.profiles.join(format!("{from}.state"));
+        if old_state.exists() {
+            std::fs::rename(&old_state, self.paths.profiles.join(format!("{to}.state"))).ok();
+        }
+
+        // And any deployment that says it belongs to the old name, so the
+        // "active" marker survives the rename.
+        if let Ok(games) = std::fs::read_dir(&self.paths.state) {
+            for game in games.flatten() {
+                let Ok(entries) = std::fs::read_dir(game.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Ok(Some(mut manifest)) = Manifest::load(&path) {
+                        if manifest.profile == from {
+                            manifest.profile = to.clone();
+                            let _ = manifest.save(&path);
+                        }
                     }
                 }
             }
         }
+        Ok(to)
+    }
+
+    /// Which profile currently occupies each target of a game.
+    pub fn active_profiles(&self, game: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(self.paths.state.join(game)) {
+            for entry in entries.flatten() {
+                if let Ok(Some(manifest)) = Manifest::load(&entry.path()) {
+                    // A deactivated manifest only remembers leftovers.
+                    if manifest.active && !out.contains(&manifest.profile) {
+                        out.push(manifest.profile);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Take a file the user downloaded themselves and manage it like any other
+    /// mod: stored by content hash, deployed by hard link, swapped with the
+    /// profile, its configs kept.
+    ///
+    /// This is the way in for mods no API will hand over — a CurseForge project
+    /// whose author disabled third-party downloads, a private beta, your own
+    /// local build. It costs one drag instead of a manual copy every time.
+    pub fn import_file(
+        &self,
+        pack: &CompiledPack,
+        profile: &mut Profile,
+        file: &std::path::Path,
+        id: Option<ModId>,
+    ) -> Result<LockEntry> {
+        if !file.is_file() {
+            return Err(Error::NotFound(file.display().to_string()));
+        }
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "mod".to_string());
+
+        // Default identity is the filename without its extension, which is
+        // stable enough to re-import a newer build over the top later.
+        let id = id.unwrap_or_else(|| {
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.clone());
+            ModId::project(crate::source::SourceKind::Local, sanitize_name(&stem))
+        });
+
+        let sha256 = crate::hash::sha256_file(file)?;
+        let size = std::fs::metadata(file)?.len();
+        let unpack = pack.should_unpack(&name);
+        self.store.insert(&sha256, file, &name, unpack)?;
+
+        let files = self.store.files(&sha256)?;
+        // No repository to consult, so the assessment rests entirely on what is
+        // inside the archive.
+        let trust = trust::assess(pack, &files, None, false);
+
+        let entry = LockEntry {
+            id: id.clone(),
+            version: format!("file: {name}"),
+            asset: name,
+            url: String::new(),
+            sha256,
+            size,
+            published_at: String::new(),
+            // Filled in by the first update check, which is what later
+            // notifications compare against.
+            upstream: None,
+            trust,
+        };
+
+        // Mark it manual so update checks leave it alone rather than failing.
+        let mut mod_entry = crate::profile::ModEntry::new(id);
+        mod_entry.manual = true;
+        profile.add(mod_entry);
+        Ok(entry)
+    }
+
+    /// What loader is installed in this game directory right now.
+    pub fn loader_state(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        root: &std::path::Path,
+    ) -> Option<(crate::pack::LoaderDef, crate::loader::LoaderState)> {
+        let def = pack.loader(profile.loader.as_deref()?)?.clone();
+        let state = crate::loader::detect(
+            def.kind,
+            &def.prefix,
+            &def.page,
+            root,
+            profile.game_version.as_deref(),
+        );
+        Some((def, state))
+    }
+
+    /// Install the profile's mod loader into the game.
+    ///
+    /// The step people otherwise do by hand before Modifile is any use: go to
+    /// the loader's site, download an installer, run it, pick a version.
+    pub async fn install_loader(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        root: &std::path::Path,
+    ) -> Result<String> {
+        let Some(loader) = profile.loader.as_deref() else {
+            return Err(Error::other(format!(
+                "`{}` has no mod loader set yet",
+                profile.name
+            )));
+        };
+        let Some(def) = pack.loader(loader) else {
+            return Err(Error::NotFound(format!(
+                "loader `{loader}` in the {} pack",
+                pack.pack.game.name
+            )));
+        };
+        let Some(game_version) = profile.game_version.as_deref() else {
+            return Err(Error::other(
+                "set the game version first — a loader is built for one".to_string(),
+            ));
+        };
+
+        match def.kind {
+            crate::pack::LoaderKind::FabricMeta => {
+                crate::loader::install_meta_loader(
+                    self.modrinth.http(),
+                    &def.meta,
+                    &def.prefix,
+                    &def.name,
+                    root,
+                    game_version,
+                )
+                .await
+            }
+            crate::pack::LoaderKind::Installer => Err(Error::other(format!(
+                "{} has to be installed by its own installer, which patches the game and \
+                 must actually run. Get it from {} — Modifile handles the mods either way.",
+                def.name, def.page
+            ))),
+        }
+    }
+
+    /// Find mods for a game by name, using whichever index that game's pack
+    /// nominates. `check_installable` costs one extra request per hit and says
+    /// whether a GitHub repository actually publishes releases.
+    pub async fn search(
+        &self,
+        pack: &CompiledPack,
+        query: &str,
+        filter: &crate::source::modrinth::VersionFilter,
+        check_installable: bool,
+    ) -> Result<Vec<crate::source::SearchHit>> {
+        let rules = &pack.pack.search;
+        if rules.is_empty() {
+            return Err(Error::other(format!(
+                "the {} pack does not say where to search for mods. Add a [search] section \
+                 to it, or paste a mod's URL directly.",
+                pack.pack.game.name
+            )));
+        }
+
+        let mut hits = Vec::new();
+        if rules.modrinth {
+            hits.extend(self.modrinth.search(query, filter).await.unwrap_or_default());
+        }
+        // CurseForge is where WoW addons actually are, so search it when the
+        // user has a key — even though some results will not be installable.
+        if let (Some(cf), Some(game_id)) = (&self.curseforge, rules.curseforge_game_id) {
+            hits.extend(cf.search(query, game_id).await.unwrap_or_default());
+        }
+        if !rules.github_topics.is_empty() || !rules.github_terms.is_empty() {
+            let mut found = self
+                .github
+                .search_repos(query, &rules.github_topics, &rules.github_terms)
+                .await
+                .unwrap_or_default();
+
+            // "Found it" and "can install it" are different answers, and the
+            // second is the one that matters.
+            if check_installable {
+                for hit in found.iter_mut() {
+                    hit.installable = Some(self.github.has_releases(&hit.id).await);
+                }
+            }
+            hits.extend(found);
+        }
+        Ok(hits)
+    }
+
+    /// What is stored and who still wants it.
+    pub fn storage(&self) -> Result<crate::storage::StorageReport> {
+        let mut active_by_game = std::collections::BTreeMap::new();
+        for pack in &self.packs {
+            active_by_game.insert(pack.id().to_string(), self.active_profiles(pack.id()));
+        }
+        crate::storage::report(&self.paths, &self.store, &active_by_game)
+    }
+
+    /// Delete one stored download by hash.
+    pub fn forget(&self, sha256: &str) -> Result<u64> {
+        self.store.remove(sha256)
+    }
+
+    /// Store entries no profile references any more.
+    ///
+    /// A lockfile we cannot parse aborts the whole thing. Treating it as "no
+    /// references" would delete downloads that are very much still needed, and
+    /// an unreadable file is not evidence of anything.
+    pub fn gc(&self) -> Result<(usize, u64)> {
+        let mut keep: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(&self.paths.profiles)
+            .ctx(format!("reading {}", self.paths.profiles.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".lock.json"))
+                .unwrap_or(false)
+            {
+                keep.extend(Lock::load(&path)?.store_keys());
+            }
+        }
         self.store.gc(&keep)
     }
+}
+
+/// A profile name becomes a filename, so it cannot contain path separators or
+/// anything Windows refuses.
+pub fn sanitize_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim()
+        .to_string()
 }
 
 /// Human-sized bytes. Used by both front ends.

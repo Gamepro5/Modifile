@@ -11,6 +11,56 @@ It installs the release you asked for. Pin versions in your profile when a mod
 is version-sensitive, and read the mod's own requirements."""
 maintainers = ["bundled"]
 
+# Modrinth is the right index for Minecraft: keyless, and it publishes each
+# project's source repository, so searching here also finds the GitHub repo.
+[search]
+modrinth = true
+# CurseForge addresses projects by number; this is how a slug from a URL gets
+# resolved to one, and it lets CurseForge be searched when a key is set.
+curseforge_game_id = 432
+
+# Minecraft mods are built per loader and per game version, and a profile that
+# mixes them produces a game that will not start. Declaring this makes a profile
+# choose before anything is resolved, rather than silently taking whatever
+# happened to be published most recently.
+[versions]
+loaders = ["fabric", "quilt", "neoforge", "forge"]
+needs_game_version = true
+
+# Fabric and Quilt publish a metadata service that returns a finished version
+# profile, so installing them is writing one JSON file into versions/ and adding
+# a launcher entry — exactly what their own installers do, without needing Java
+# or a separate download.
+[[loaders]]
+id = "fabric"
+name = "Fabric"
+kind = "fabric-meta"
+meta = "https://meta.fabricmc.net/v2"
+prefix = "fabric"
+page = "https://fabricmc.net/use/installer/"
+
+[[loaders]]
+id = "quilt"
+name = "Quilt"
+kind = "fabric-meta"
+meta = "https://meta.quiltmc.org/v3"
+prefix = "quilt"
+page = "https://quiltmc.org/en/install/"
+
+# Forge and NeoForge patch the game, so their installer has to actually run.
+# Modifile says so and links to it rather than pretending.
+[[loaders]]
+id = "neoforge"
+name = "NeoForge"
+kind = "installer"
+page = "https://neoforged.net/"
+
+[[loaders]]
+id = "forge"
+name = "Forge"
+kind = "installer"
+page = "https://files.minecraftforge.net/"
+
 # Mod configs are rewritten by the game and differ per playthrough, so the
 # profile owns them rather than the mod.
 [state]
