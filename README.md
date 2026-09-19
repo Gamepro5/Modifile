@@ -256,6 +256,60 @@ file — so the mod silently would not install. Either delete the old file, or u
 **Replace them and activate** / `modifile activate <profile> --force` to let
 Modifile take it over.
 
+## Mod loaders
+
+Most games need something installed *into* the game before it reads mods at
+all — BepInEx for Unity games, Fabric or NeoForge for Minecraft. Install the
+mods without it and everything lands correctly while the game ignores all of
+it, which is the most confusing way for modding to fail. So Modifile installs
+loaders too, and warns at activation when one is missing.
+
+A loader is declared in the game's pack, so adding a game means adding its
+loader as well — no new build of Modifile. Three kinds cover what exists:
+
+```toml
+# 1. `archive` — extract over the game. Most Unity modding.
+[[loaders]]
+id = "bepinex"
+name = "BepInEx"
+kind = "archive"
+source = "github:BepInEx/BepInEx"      # any source Modifile supports
+windows_assets = ["bepinex_win_x64_*.zip"]
+linux_assets   = ["bepinex_linux_x64_*.zip"]
+markers = ["BepInEx/core/BepInEx.dll", "winhttp.dll"]   # already installed?
+into = ""            # subfolder to unpack into; empty means the game root
+targets = ["client", "server"]   # omit for all targets
+
+# 2. `fabric-meta` — a metadata service hands out a finished version profile,
+#    so installing is writing one JSON file. No installer, no Java.
+[[loaders]]
+id = "fabric"
+kind = "fabric-meta"
+meta = "https://meta.fabricmc.net/v2"
+prefix = "fabric"
+
+# 3. `installer` — it patches the game and has to actually run, so Modifile
+#    links to it rather than pretending.
+[[loaders]]
+id = "neoforge"
+kind = "installer"
+page = "https://neoforged.net/"
+```
+
+Games that need no loader — World of Warcraft reads addons natively — simply
+declare none, and the loader UI never appears.
+
+A game with exactly one loader does not make you choose it. Installing covers
+every target the profile uses, so a dedicated server gets its own copy in its
+own directory. Files you have edited, configs especially, survive a reinstall.
+
+**Which build gets installed is decided by the game, not by your computer.** A
+`winhttp.dll` loader is useless to a native Linux build and essential to a
+Windows one running under Proton, so Modifile looks at what is actually in the
+game folder — a `.exe` means the Windows loader even on Linux, a `.x86_64` means
+the Linux loader even when driven from a Windows desktop over a file share.
+Only when the folder says nothing does it fall back to the host.
+
 ## Config files belong to the profile
 
 A mod's `.dll` is immutable content and is hard-linked out of the shared store.

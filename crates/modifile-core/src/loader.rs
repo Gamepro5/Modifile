@@ -125,17 +125,106 @@ pub async fn install_meta_loader(
     Ok(loader)
 }
 
+/// What a game was *built* for, which is not the same as what you are running.
+///
+/// A Windows game under Proton needs the Windows loader — `winhttp.dll` is
+/// useless to a native Linux build and essential to a Proton one. And a Linux
+/// dedicated server needs the Linux loader even when Modifile is driving it
+/// from a Windows desktop over a file share. So the game's own files decide,
+/// never the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamePlatform {
+    Windows,
+    Linux,
+    MacOs,
+}
+
+impl GamePlatform {
+    pub fn label(self) -> &'static str {
+        match self {
+            GamePlatform::Windows => "Windows",
+            GamePlatform::Linux => "Linux",
+            GamePlatform::MacOs => "macOS",
+        }
+    }
+
+    /// The machine we are running on, as a last resort.
+    pub fn host() -> Self {
+        if cfg!(windows) {
+            GamePlatform::Windows
+        } else if cfg!(target_os = "macos") {
+            GamePlatform::MacOs
+        } else {
+            GamePlatform::Linux
+        }
+    }
+}
+
+/// Work out which build of a game is in this directory.
+///
+/// Returns `None` when the directory says nothing useful, so the caller can
+/// fall back rather than guess wrongly.
+pub fn detect_game_platform(root: &Path) -> Option<GamePlatform> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return None;
+    };
+
+    let mut windows = false;
+    let mut linux = false;
+    let mut macos = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".exe") {
+            windows = true;
+        } else if name.ends_with(".x86_64") || name.ends_with(".x86") || name.ends_with(".so") {
+            linux = true;
+        } else if name.ends_with(".app") {
+            macos = true;
+        }
+    }
+
+    // A Windows executable is the strongest signal: a Unity game shipping
+    // `game.exe` needs the Windows loader whether it runs natively or through
+    // Proton. Some installs carry both, and the .exe is what actually launches.
+    match (windows, linux, macos) {
+        (true, _, _) => Some(GamePlatform::Windows),
+        (false, true, _) => Some(GamePlatform::Linux),
+        (false, false, true) => Some(GamePlatform::MacOs),
+        _ => None,
+    }
+}
+
+/// Does this game root already have the loader's files?
+pub fn markers_present(root: &Path, markers: &[String]) -> bool {
+    !markers.is_empty() && markers.iter().any(|m| root.join(m).exists())
+}
+
 /// What is installed right now, without touching the network.
 pub fn detect(
     kind: LoaderKind,
     prefix: &str,
     page: &str,
+    markers: &[String],
+    // Where the loader's files live: the game root for most, a subfolder for a
+    // loader that declares `into`.
+    install_dir: &Path,
     mc_dir: &Path,
     game_version: Option<&str>,
 ) -> LoaderState {
     if kind == LoaderKind::Installer {
         return LoaderState::Manual {
             page: page.to_string(),
+        };
+    }
+    if kind == LoaderKind::Archive {
+        // An archive loader is either laid over the game or it is not; it has
+        // no per-game-version identity to be wrong about.
+        return if markers_present(install_dir, markers) {
+            LoaderState::Installed {
+                version: "installed".to_string(),
+            }
+        } else {
+            LoaderState::NotInstalled
         };
     }
 
@@ -191,7 +280,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("versions/fabric-loader-0.16.5-1.21.1")).unwrap();
 
         assert_eq!(
-            detect(LoaderKind::FabricMeta, "fabric", "", &dir, Some("1.21.1")),
+            detect(LoaderKind::FabricMeta, "fabric", "", &[], &dir, &dir, Some("1.21.1")),
             LoaderState::Installed {
                 version: "0.16.5".into()
             }
@@ -207,7 +296,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("versions/fabric-loader-0.15.0-1.20.1")).unwrap();
 
         assert_eq!(
-            detect(LoaderKind::FabricMeta, "fabric", "", &dir, Some("1.21.1")),
+            detect(LoaderKind::FabricMeta, "fabric", "", &[], &dir, &dir, Some("1.21.1")),
             LoaderState::WrongVersion {
                 version: "0.15.0 for 1.20.1".into()
             }
@@ -216,10 +305,47 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_build_needs_the_windows_loader_even_on_linux() {
+        // Proton. `winhttp.dll` is useless to a native Linux build and
+        // essential to a Windows one, whatever the host happens to be.
+        let dir = temp("proton");
+        std::fs::write(dir.join("valheim.exe"), b"").unwrap();
+        assert_eq!(detect_game_platform(&dir), Some(GamePlatform::Windows));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_linux_server_needs_the_linux_loader_even_from_windows() {
+        // The real case: a Linux dedicated server managed over a file share
+        // from a Windows desktop. Host-based selection would fetch the wrong
+        // build and the server would silently load nothing.
+        let dir = temp("linux-server");
+        std::fs::write(dir.join("valheim_server.x86_64"), b"").unwrap();
+        std::fs::write(dir.join("UnityPlayer.so"), b"").unwrap();
+        assert_eq!(detect_game_platform(&dir), Some(GamePlatform::Linux));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_install_carrying_both_is_treated_as_windows() {
+        // Some directories hold both; the .exe is what actually launches.
+        let dir = temp("both");
+        std::fs::write(dir.join("valheim.exe"), b"").unwrap();
+        std::fs::write(dir.join("valheim.x86_64"), b"").unwrap();
+        assert_eq!(detect_game_platform(&dir), Some(GamePlatform::Windows));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_directory_says_nothing_rather_than_guessing() {
+        assert_eq!(detect_game_platform(Path::new("/no/such/place")), None);
+    }
+
+    #[test]
     fn reports_nothing_when_nothing_is_installed() {
         let dir = temp("none");
         assert_eq!(
-            detect(LoaderKind::FabricMeta, "fabric", "", &dir, Some("1.21.1")),
+            detect(LoaderKind::FabricMeta, "fabric", "", &[], &dir, &dir, Some("1.21.1")),
             LoaderState::NotInstalled
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -233,6 +359,8 @@ mod tests {
                 LoaderKind::Installer,
                 "neoforge",
                 "https://neoforged.net/",
+                &[],
+                &dir,
                 &dir,
                 Some("1.21.1")
             ),

@@ -183,6 +183,40 @@ fn valheim_takes_a_bare_dll_asset_without_unpacking_it() {
 }
 
 #[test]
+fn valheim_can_install_its_mod_loader() {
+    // The failure this prevents: mods install perfectly into BepInEx/plugins,
+    // BepInEx is not there, and the game silently loads none of them. That is
+    // the most confusing possible outcome, so the loader is installable here.
+    let valheim = pack("valheim.toml");
+    let bepinex = valheim
+        .loader("bepinex")
+        .expect("Valheim must be able to install BepInEx");
+
+    assert_eq!(bepinex.kind, modifile_core::pack::LoaderKind::Archive);
+    assert!(!bepinex.source.is_empty(), "needs somewhere to get it from");
+    assert!(
+        !bepinex.markers.is_empty(),
+        "needs a way to tell whether it is already installed"
+    );
+    // One build per operating system, and all three must be covered.
+    assert!(!bepinex.windows_assets.is_empty());
+    assert!(!bepinex.linux_assets.is_empty());
+}
+
+#[test]
+fn minecraft_loaders_split_installable_from_manual() {
+    let mc = pack("minecraft.toml");
+    use modifile_core::pack::LoaderKind;
+
+    // Fabric and Quilt publish a metadata service, so Modifile installs them.
+    assert_eq!(mc.loader("fabric").unwrap().kind, LoaderKind::FabricMeta);
+    assert_eq!(mc.loader("quilt").unwrap().kind, LoaderKind::FabricMeta);
+    // Forge and NeoForge patch the game, so we point at their installer.
+    assert_eq!(mc.loader("neoforge").unwrap().kind, LoaderKind::Installer);
+    assert!(!mc.loader("neoforge").unwrap().page.is_empty());
+}
+
+#[test]
 fn valheim_configs_are_profile_owned() {
     let valheim = pack("valheim.toml");
     assert!(

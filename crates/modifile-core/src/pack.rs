@@ -259,6 +259,11 @@ pub enum LoaderKind {
     /// so installing is writing one JSON file. No installer, no Java.
     #[default]
     FabricMeta,
+    /// BepInEx and friends: an archive extracted over the game root. This is
+    /// most Unity modding — Valheim, Subnautica, Risk of Rain 2 — and without
+    /// it the game never reads the plugins folder at all, so mods install
+    /// perfectly and do nothing.
+    Archive,
     /// Forge and NeoForge: their installer patches the game and has to actually
     /// run, so Modifile points at it rather than pretending to do it.
     Installer,
@@ -281,6 +286,62 @@ pub struct LoaderDef {
     /// Where to send the user when we cannot install it ourselves.
     #[serde(default)]
     pub page: String,
+
+    // --- for `archive` loaders ------------------------------------------
+    /// Where the archive comes from, as a mod id, e.g. `github:BepInEx/BepInEx`.
+    #[serde(default)]
+    pub source: String,
+    /// Asset name patterns per platform — these ship one build per OS.
+    #[serde(default)]
+    pub windows_assets: Vec<String>,
+    #[serde(default)]
+    pub linux_assets: Vec<String>,
+    #[serde(default)]
+    pub macos_assets: Vec<String>,
+    /// Files that exist once it is installed, relative to the game root.
+    #[serde(default)]
+    pub markers: Vec<String>,
+    /// Where the archive unpacks, relative to the game root. Empty means the
+    /// root itself, which is what BepInEx wants; a loader that lives in a
+    /// subfolder names it here.
+    #[serde(default)]
+    pub into: String,
+    /// Targets this loader applies to. Absent means all of them — a dedicated
+    /// server usually needs the same loader as the client.
+    #[serde(default)]
+    pub targets: Option<Vec<String>>,
+}
+
+impl LoaderDef {
+    /// Does this loader apply to the given target?
+    pub fn applies_to(&self, target_id: &str) -> bool {
+        self.targets
+            .as_ref()
+            .map(|ids| ids.iter().any(|id| id == target_id))
+            .unwrap_or(true)
+    }
+
+    /// Where its archive unpacks, given a game root.
+    pub fn install_dir(&self, root: &Path) -> PathBuf {
+        if self.into.is_empty() || self.into == "." {
+            root.to_path_buf()
+        } else {
+            root.join(&self.into)
+        }
+    }
+
+    /// Asset patterns for the platform a game was *built* for.
+    ///
+    /// Not the host: a Windows game under Proton needs the Windows loader, and
+    /// a Linux dedicated server needs the Linux one even when Modifile is
+    /// driving it from Windows over a file share.
+    pub fn assets_for(&self, platform: crate::loader::GamePlatform) -> &[String] {
+        match platform {
+            crate::loader::GamePlatform::Windows => &self.windows_assets,
+            crate::loader::GamePlatform::MacOs => &self.macos_assets,
+            crate::loader::GamePlatform::Linux => &self.linux_assets,
+        }
+    }
 }
 
 /// Games where a mod is built against a specific game version and mod loader.

@@ -268,6 +268,49 @@ fn sanitize_file_name(name: &str) -> String {
     }
 }
 
+/// Extract an archive over a directory, leaving named files alone if they are
+/// already there.
+///
+/// Used to lay a mod loader over a game install: BepInEx's archive carries a
+/// default `BepInEx/config/BepInEx.cfg`, and reinstalling must not throw away
+/// the one the user has been editing.
+pub fn extract_over(archive: &Path, dest: &Path, preserve: &[PathBuf]) -> Result<usize> {
+    let file = std::fs::File::open(archive).ctx(format!("opening {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;
+    let mut written = 0;
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let Some(rel) = safe_relative(entry.name()) else {
+            continue;
+        };
+        let out_path = dest.join(&rel);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        // Anything already present inside a preserved directory stays.
+        if out_path.exists()
+            && preserve
+                .iter()
+                .any(|keep| out_path.starts_with(dest.join(keep)))
+        {
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(&out_path)
+                .ctx(format!("writing {}", out_path.display()))?,
+        );
+        std::io::copy(&mut entry, &mut out)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 fn unpack_zip(archive: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(archive).ctx(format!("opening {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;

@@ -210,6 +210,14 @@ struct App {
         PathBuf,
     )>,
     pending_install_loader: bool,
+    show_loader_install: bool,
+    /// Loader state per target, for the install window.
+    loader_targets: Vec<(
+        modifile_core::pack::Target,
+        PathBuf,
+        modifile_core::pack::LoaderDef,
+        modifile_core::loader::LoaderState,
+    )>,
     /// Install mods that publish no source code at all. Off by default.
     allow_no_source: bool,
     version_input: String,
@@ -288,6 +296,8 @@ impl App {
             refresh_packs: false,
             loader_state: None,
             pending_install_loader: false,
+            show_loader_install: false,
+            loader_targets: Vec::new(),
             allow_no_source: paths_probe.allow_no_source_file().exists(),
             version_input: String::new(),
             search_input: String::new(),
@@ -455,6 +465,13 @@ impl App {
         self.live_config_files = live_configs;
         self.version_input = profile.game_version.clone().unwrap_or_default();
         self.client_ids = client_ids;
+        self.loader_targets = self
+            .engine()
+            .and_then(|engine| {
+                let pack = engine.pack_for(&profile).ok()?;
+                Some(engine.loader_states(pack, &profile))
+            })
+            .unwrap_or_default();
         self.loader_state = self.engine().and_then(|engine| {
             let pack = engine.pack_for(&profile).ok()?;
             let (_, root) = engine
@@ -696,6 +713,7 @@ impl App {
         let lock = self.lock.clone();
         let mut messages = Vec::new();
         let mut deployed = false;
+        let mut needs_loader = false;
 
         for row in &self.targets {
             let Some(root) = &row.root else {
@@ -722,6 +740,15 @@ impl App {
                 }) {
                 Ok((plan, report)) => {
                     deployed = true;
+                    // The quiet failure: everything installs and the game reads
+                    // none of it because the loader is not there.
+                    if let Some(loader) = &plan.missing_loader {
+                        needs_loader = true;
+                        messages.push(format!(
+                            "  {loader} is NOT installed — {} will not load any of these mods.",
+                            row.target.name
+                        ));
+                    }
                     messages.push(format!(
                         "{}: {} file(s) linked ({}), {} removed",
                         row.target.name,
@@ -763,11 +790,17 @@ impl App {
                 Err(e) => messages.push(format!("{}: {e}", row.target.name)),
             }
         }
-        if deployed {
+        if deployed && !needs_loader {
             messages.push("Done. Launch the game normally — nothing needs to stay open.".into());
         }
         for message in messages {
             self.log_line(message);
+        }
+
+        // Open the loader prompt rather than leaving a warning in the log that
+        // explains why the game ignores everything.
+        if needs_loader {
+            self.show_loader_install = true;
         }
 
         // Keep the folder panel honest: if the user was looking at a scan, show
@@ -1638,6 +1671,10 @@ impl eframe::App for App {
             let ctx = ui.ctx().clone();
             self.rename_window(&ctx);
         }
+        if self.show_loader_install {
+            let ctx = ui.ctx().clone();
+            self.loader_window(&ctx);
+        }
     }
 }
 
@@ -2122,7 +2159,10 @@ impl App {
         else {
             return;
         };
-        if !rules.applies() {
+        let has_loader = self.loader_state.is_some();
+        // Valheim declares no game versions or loader choice, but it still has
+        // BepInEx to install — so the panel shows for that alone.
+        if !rules.applies() && !has_loader {
             return;
         }
 
@@ -2132,9 +2172,13 @@ impl App {
         let mut commit_version = false;
 
         ui.label(
-            egui::RichText::new("GAME VERSION")
-                .small()
-                .color(theme::MUTED),
+            egui::RichText::new(if rules.applies() {
+                "GAME VERSION"
+            } else {
+                "MOD LOADER"
+            })
+            .small()
+            .color(theme::MUTED),
         );
         ui.add_space(4.0);
         egui::Frame::NONE
@@ -2143,6 +2187,14 @@ impl App {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if !rules.applies() {
+                        ui.label(
+                            egui::RichText::new(
+                                "This game needs a mod loader before it reads any mods.",
+                            )
+                            .color(theme::MUTED),
+                        );
+                    }
                     if rules.needs_game_version {
                         ui.label("Version");
                         if ui
@@ -2233,7 +2285,7 @@ impl App {
                                         .on_hover_text("Fetch the newest build of the loader")
                                         .clicked()
                                     {
-                                        self.pending_install_loader = true;
+                                        self.show_loader_install = true;
                                     }
                                 }
                                 _ => {
@@ -2246,7 +2298,7 @@ impl App {
                                         )
                                         .clicked()
                                     {
-                                        self.pending_install_loader = true;
+                                        self.show_loader_install = true;
                                     }
                                 }
                             },
@@ -2274,11 +2326,22 @@ impl App {
     /// Runs off the UI thread: it is two network calls plus a file write, but a
     /// slow mirror should not freeze the window.
     fn do_install_loader(&mut self, ctx: &egui::Context) {
-        let (Some(profile), Some((_, _, root))) =
-            (self.profile.clone(), self.loader_state.clone())
-        else {
+        use modifile_core::loader::LoaderState;
+
+        let Some(profile) = self.profile.clone() else {
             return;
         };
+        // Every target that needs it: a dedicated server needs its own copy in
+        // its own directory, and installing only the client is half a job.
+        let roots: Vec<PathBuf> = self
+            .loader_targets
+            .iter()
+            .filter(|(_, _, _, state)| !matches!(state, LoaderState::Manual { .. }))
+            .map(|(_, root, _, _)| root.clone())
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
         let paths = self.paths.clone();
         let log = self.log.clone();
         let tx = self.tx.clone();
@@ -2287,21 +2350,33 @@ impl App {
 
         let handle = self.runtime.handle().clone();
         std::thread::spawn(move || {
-            let result = handle.block_on(async {
-                let engine = Engine::open(paths.clone(), load_token(&paths))?;
-                let pack = engine.pack_for(&profile)?;
-                engine.install_loader(pack, &profile, &root).await
+            let results = handle.block_on(async {
+                let mut out = Vec::new();
+                match Engine::open(paths.clone(), load_token(&paths)) {
+                    Ok(engine) => match engine.pack_for(&profile) {
+                        Ok(pack) => {
+                            for root in &roots {
+                                out.push((
+                                    root.clone(),
+                                    engine.install_loader(pack, &profile, root).await,
+                                ));
+                            }
+                        }
+                        Err(e) => out.push((PathBuf::new(), Err(e))),
+                    },
+                    Err(e) => out.push((PathBuf::new(), Err(e))),
+                }
+                out
             });
             if let Ok(mut log) = log.lock() {
-                match &result {
-                    Ok(version) => {
-                        log.push(format!("Installed mod loader {version}."));
-                        log.push(
-                            "  It now appears in the Minecraft launcher's version list."
-                                .to_string(),
-                        );
+                for (root, result) in &results {
+                    match result {
+                        Ok(version) => log.push(format!(
+                            "Installed mod loader {version} into {}",
+                            display_path(root)
+                        )),
+                        Err(e) => log.push(format!("error: {e}")),
                     }
-                    Err(e) => log.push(format!("error: {e}")),
                 }
             }
             let _ = tx.send(Msg::Done);
@@ -3971,6 +4046,156 @@ impl App {
             self.commit_rename();
         } else if !open {
             self.show_rename = false;
+        }
+    }
+
+    /// The mod loader install prompt.
+    ///
+    /// A window rather than a bare button because installing a loader writes
+    /// into the game itself, may cover more than one target, and for some
+    /// loaders cannot be done at all — all of which is worth saying before
+    /// anything happens.
+    fn loader_window(&mut self, ctx: &egui::Context) {
+        use modifile_core::loader::LoaderState;
+
+        let mut open = self.show_loader_install;
+        let mut install = false;
+        let rows = self.loader_targets.clone();
+
+        egui::Window::new("Mod loader")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                if rows.is_empty() {
+                    ui.label("This game does not use a mod loader.");
+                    return;
+                }
+
+                let name = rows[0].2.name.clone();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{name} is what makes {} load mods at all. Without it, mods install \
+                         correctly and the game ignores every one of them.",
+                        self.profile
+                            .as_ref()
+                            .and_then(|p| self
+                                .engine()
+                                .and_then(|e| e.pack(&p.game))
+                                .map(|pk| pk.pack.game.name.clone()))
+                            .unwrap_or_else(|| "this game".into())
+                    ))
+                    .color(theme::MUTED),
+                );
+                ui.add_space(10.0);
+
+                let mut anything_to_do = false;
+                for (target, root, def, state) in &rows {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(target.kind.label())
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                        ui.label(egui::RichText::new(&target.name).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match state {
+                                LoaderState::Installed { version } => {
+                                    ui.label(
+                                        egui::RichText::new(format!("{version}"))
+                                            .small()
+                                            .color(theme::GOOD),
+                                    );
+                                }
+                                LoaderState::WrongVersion { version } => {
+                                    anything_to_do = true;
+                                    ui.label(
+                                        egui::RichText::new(format!("{version} — wrong version"))
+                                            .small()
+                                            .color(theme::WARN),
+                                    );
+                                }
+                                LoaderState::NotInstalled => {
+                                    anything_to_do = true;
+                                    ui.label(
+                                        egui::RichText::new("not installed")
+                                            .small()
+                                            .color(theme::WARN),
+                                    );
+                                }
+                                LoaderState::Manual { page } => {
+                                    ui.hyperlink_to(
+                                        egui::RichText::new("get the installer").small(),
+                                        page,
+                                    );
+                                }
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(format!("   {}", display_path(&def.install_dir(root))))
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                let manual = rows
+                    .iter()
+                    .all(|(_, _, _, s)| matches!(s, LoaderState::Manual { .. }));
+
+                ui.add_space(8.0);
+                if manual {
+                    ui.label(
+                        egui::RichText::new(
+                            "This loader patches the game, so its own installer has to run. \
+                             Modifile handles the mods either way.",
+                        )
+                        .small()
+                        .color(theme::MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Files already there that you have edited — configs especially — \
+                             are kept.",
+                        )
+                        .small()
+                        .color(theme::MUTED),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if !manual
+                        && ui
+                            .add(
+                                egui::Button::new(if anything_to_do {
+                                    format!("Install {name}")
+                                } else {
+                                    format!("Reinstall {name}")
+                                })
+                                .fill(theme::ACCENT_DIM),
+                            )
+                            .clicked()
+                    {
+                        install = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.show_loader_install = false;
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        if install {
+            self.show_loader_install = false;
+            let ctx = ctx.clone();
+            self.do_install_loader(&ctx);
+        } else if !open {
+            self.show_loader_install = false;
         }
     }
 

@@ -79,6 +79,10 @@ pub struct Plan {
     pub conflicts: Vec<Conflict>,
     /// Mods with nothing to install here — usually a pack missing a rule.
     pub empty_mods: Vec<String>,
+    /// The game needs a mod loader and does not have one. Everything installs
+    /// correctly and the game ignores all of it, which is the single most
+    /// confusing way for this to fail.
+    pub missing_loader: Option<String>,
 }
 
 impl Plan {
@@ -252,6 +256,18 @@ pub fn plan(
         })
         .collect();
 
+    // A Unity game without BepInEx reads none of this. Say so at plan time
+    // rather than letting someone launch a game that ignores every mod.
+    let missing_loader = pack
+        .pack
+        .loaders
+        .iter()
+        .find(|l| {
+            l.kind == crate::pack::LoaderKind::Archive
+                && !crate::loader::markers_present(root, &l.markers)
+        })
+        .map(|l| l.name.clone());
+
     Ok(Plan {
         game: pack.id().to_string(),
         target: target.id.clone(),
@@ -259,6 +275,7 @@ pub fn plan(
         files: claims.into_values().collect(),
         conflicts,
         empty_mods,
+        missing_loader,
     })
 }
 

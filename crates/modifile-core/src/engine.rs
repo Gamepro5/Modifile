@@ -1252,6 +1252,30 @@ impl Engine {
         Ok(entry)
     }
 
+    /// The loader situation for every target this profile covers.
+    ///
+    /// Per target, because a dedicated server needs its own copy installed into
+    /// its own directory — a client with BepInEx tells you nothing about the
+    /// server sitting next to it.
+    pub fn loader_states(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+    ) -> Vec<(Target, PathBuf, crate::pack::LoaderDef, crate::loader::LoaderState)> {
+        let mut out = Vec::new();
+        for (target, root) in self.targets(pack, profile) {
+            let Some(root) = root else { continue };
+            let Some((def, state)) = self.loader_state(pack, profile, &root) else {
+                continue;
+            };
+            if !def.applies_to(&target.id) {
+                continue;
+            }
+            out.push((target, root, def, state));
+        }
+        out
+    }
+
     /// What loader is installed in this game directory right now.
     pub fn loader_state(
         &self,
@@ -1259,11 +1283,19 @@ impl Engine {
         profile: &Profile,
         root: &std::path::Path,
     ) -> Option<(crate::pack::LoaderDef, crate::loader::LoaderState)> {
-        let def = pack.loader(profile.loader.as_deref()?)?.clone();
+        let def = match profile.loader.as_deref() {
+            Some(id) => pack.loader(id)?.clone(),
+            // One loader means there is nothing to choose — Valheim has
+            // BepInEx and only BepInEx.
+            None if pack.pack.loaders.len() == 1 => pack.pack.loaders[0].clone(),
+            None => return None,
+        };
         let state = crate::loader::detect(
             def.kind,
             &def.prefix,
             &def.page,
+            &def.markers,
+            &def.install_dir(root),
             root,
             profile.game_version.as_deref(),
         );
@@ -1280,26 +1312,27 @@ impl Engine {
         profile: &Profile,
         root: &std::path::Path,
     ) -> Result<String> {
-        let Some(loader) = profile.loader.as_deref() else {
-            return Err(Error::other(format!(
-                "`{}` has no mod loader set yet",
-                profile.name
-            )));
-        };
-        let Some(def) = pack.loader(loader) else {
-            return Err(Error::NotFound(format!(
-                "loader `{loader}` in the {} pack",
-                pack.pack.game.name
-            )));
-        };
-        let Some(game_version) = profile.game_version.as_deref() else {
-            return Err(Error::other(
-                "set the game version first — a loader is built for one".to_string(),
-            ));
+        let def = match profile.loader.as_deref() {
+            Some(id) => pack.loader(id).ok_or_else(|| {
+                Error::NotFound(format!("loader `{id}` in the {} pack", pack.pack.game.name))
+            })?,
+            None if pack.pack.loaders.len() == 1 => &pack.pack.loaders[0],
+            None => {
+                return Err(Error::other(format!(
+                    "`{}` has no mod loader set yet",
+                    profile.name
+                )))
+            }
         };
 
         match def.kind {
             crate::pack::LoaderKind::FabricMeta => {
+                let game_version = profile.game_version.as_deref().ok_or_else(|| {
+                    Error::other(
+                        "set the game version first — this loader is built for one"
+                            .to_string(),
+                    )
+                })?;
                 crate::loader::install_meta_loader(
                     self.modrinth.http(),
                     &def.meta,
@@ -1309,6 +1342,93 @@ impl Engine {
                     game_version,
                 )
                 .await
+            }
+            // BepInEx and friends: an archive laid over the game root. This is
+            // what makes a Unity game read its plugins folder at all — without
+            // it, mods install perfectly and the game ignores them.
+            crate::pack::LoaderKind::Archive => {
+                let source: ModId = def.source.parse()?;
+                // The game's own files decide, not ours: a Windows build under
+                // Proton needs the Windows loader, and a Linux server needs the
+                // Linux one even when driven from a Windows desktop.
+                let platform = crate::loader::detect_game_platform(root)
+                    .unwrap_or_else(crate::loader::GamePlatform::host);
+                let patterns = def.assets_for(platform);
+                if patterns.is_empty() {
+                    return Err(Error::other(format!(
+                        "{} publishes no {} build — install it from {}",
+                        def.name,
+                        platform.label(),
+                        def.page
+                    )));
+                }
+
+                let (releases, _) = self
+                    .fetch(
+                        &source,
+                        &crate::source::modrinth::VersionFilter::default(),
+                        pack.pack.search.curseforge_game_id,
+                    )
+                    .await?;
+
+                let matchers: Vec<globset::GlobMatcher> = patterns
+                    .iter()
+                    .filter_map(|p| globset::Glob::new(&p.to_ascii_lowercase()).ok())
+                    .map(|g| g.compile_matcher())
+                    .collect();
+
+                let (release, asset) = releases
+                    .iter()
+                    .filter(|r| !r.prerelease)
+                    .find_map(|r| {
+                        r.assets
+                            .iter()
+                            .find(|a| {
+                                let name = a.name.to_ascii_lowercase();
+                                matchers.iter().any(|m| m.is_match(&name))
+                            })
+                            .map(|a| (r, a))
+                    })
+                    .ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "a {} build of {} in {}",
+                            platform.label(),
+                            def.name,
+                            def.source
+                        ))
+                    })?;
+
+                let tmp = self
+                    .paths
+                    .downloads()
+                    .join(format!("{}-{}.zip", def.id, crate::paths::now_millis()));
+                self.github
+                    .http()
+                    .download_to(&asset.download_url, &tmp)
+                    .await?;
+
+                // Its archive ships default configs; a reinstall must not throw
+                // away the ones the profile has been editing.
+                let preserve: Vec<PathBuf> = pack
+                    .pack
+                    .state
+                    .paths
+                    .iter()
+                    .filter_map(|name| pack.pack.paths.get(name))
+                    .map(PathBuf::from)
+                    .collect();
+
+                let dest = def.install_dir(root);
+                std::fs::create_dir_all(&dest).ok();
+                let written = crate::store::extract_over(&tmp, &dest, &preserve);
+                let _ = std::fs::remove_file(&tmp);
+                let written = written?;
+
+                Ok(format!(
+                    "{} for {} ({written} files)",
+                    release.tag,
+                    platform.label()
+                ))
             }
             crate::pack::LoaderKind::Installer => Err(Error::other(format!(
                 "{} has to be installed by its own installer, which patches the game and \

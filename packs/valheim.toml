@@ -10,6 +10,22 @@ Plugins ship as compiled .dll, so most Valheim mods read as `unverified binary`
 unless the author publishes build attestations."""
 maintainers = ["bundled"]
 
+# Valheim mods are BepInEx plugins, and without BepInEx the game never reads
+# BepInEx/plugins at all — mods install perfectly and do nothing. Installing it
+# is extracting one archive over the game root, so Modifile can do it.
+[[loaders]]
+id = "bepinex"
+name = "BepInEx"
+kind = "archive"
+source = "github:BepInEx/BepInEx"
+page = "https://github.com/BepInEx/BepInEx/releases"
+# One build per operating system, and the dedicated server uses the same one.
+windows_assets = ["bepinex_win_x64_*.zip", "bepinex_x64_*.zip"]
+linux_assets = ["bepinex_linux_x64_*.zip", "bepinex_unix_x64_*.zip"]
+macos_assets = ["bepinex_macos_x64_*.zip", "bepinex_unix_x64_*.zip"]
+# Any one of these means it is already laid over the game.
+markers = ["BepInEx/core/BepInEx.dll", "winhttp.dll", "run_bepinex.sh", "doorstop_config.ini"]
+
 # Valheim mods mostly live on Thunderstore, which has no adapter yet. The ones
 # installable today publish GitHub releases, so that is what gets searched.
 [search]

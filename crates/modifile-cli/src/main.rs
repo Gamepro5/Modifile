@@ -1138,6 +1138,14 @@ fn print_plan(target: &Target, plan: &modifile_core::deploy::Plan) {
             conflict.losers.join(", ")
         );
     }
+    if let Some(loader) = &plan.missing_loader {
+        println!();
+        println!(
+            "  WARNING: {loader} is not installed, so the game will not load any of these 
+             mods. Run `modifile loader <profile> --install` first."
+        );
+        println!();
+    }
     for id in &plan.empty_mods {
         println!("  note: {id} contributed no files for this target");
     }
