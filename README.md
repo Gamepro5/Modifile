@@ -157,12 +157,15 @@ let the runners do it — they build each platform on its own machine, and Linux
 on an older distro than yours:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0          # .github/workflows/release.yml
+git tag v1.0
+git push origin v1.0            # .github/workflows/release.yml
 ```
 
-That builds both platforms, attaches the archives and `SHA256SUMS.txt` to a
-draft release, and leaves the notes for you to edit before publishing.
+That builds both platforms and attaches the archives and `SHA256SUMS.txt` to a
+draft release, leaving the notes for you to edit before publishing. Publishing
+a release from the GitHub web UI works too — the archives are uploaded into it
+when the build finishes. Either way the tag may be written `v1.0` or `1.0`, but
+it has to start with a digit or a `v`.
 
 ## Supported games
 

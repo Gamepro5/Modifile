@@ -5,22 +5,36 @@ name: Release
 # (via rustls) needs a C toolchain and the GUI needs X11/Wayland/GL headers, so
 # a native runner per platform is the cheap, boring way to get a working build.
 #
-# Trigger: push a tag, e.g.
-#     git tag v0.1.0 && git push origin v0.1.0
-# or run this workflow by hand against a tag that already exists.
+# Three ways in, because all three are things a person actually does:
+#   - push a tag:            git tag v1.0 && git push origin v1.0
+#   - publish a release through the GitHub web UI
+#   - Actions -> Release -> Run workflow, against a tag that already exists
+#
+# Tag names are matched both with and without the leading v. A tag that matches
+# neither pattern silently does nothing, which is a miserable way to spend an
+# afternoon.
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*'
+      - '[0-9]*'
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build and publish (e.g. v0.1.0)'
+        description: 'Existing tag to build and publish (e.g. v1.0)'
         required: true
 
 permissions:
   contents: write
+
+# Tagging and then publishing a release from that tag fires twice. Let the
+# second run wait rather than race the first one's asset uploads.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
