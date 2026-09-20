@@ -23,6 +23,16 @@ Two binaries, no runtime dependencies:
 4. **Only auditable mods.** GitHub Releases, public source, and a trust ladder
    that refuses to pretend a compiled binary is readable source.
 
+## Download
+
+Prebuilt archives for Windows and Linux are on the
+[releases page](https://github.com/Gamepro5/modifile/releases). Each one holds
+both binaries and depends on nothing else — unpack it and run. The Linux build
+is made on Ubuntu 22.04, so glibc 2.35 or newer is enough. Verify a download
+against `SHA256SUMS.txt` if you like.
+
+Or build it yourself; see [Building](#building).
+
 ## Quick start (GUI)
 
 Run `modifile-gui`. Everything is doable from the window — you never need the
@@ -124,6 +134,35 @@ optional: every folder chooser also takes a typed path, so the GUI works fully
 without a portal installed.
 
 On a headless server, build with `-p modifile-cli` and skip all of the above.
+
+### Release archives
+
+`build_all.sh` (Linux) and `build_all.ps1` (Windows) build both binaries and
+package them the way the releases are packaged, into `dist/`:
+
+```sh
+./build_all.sh --bootstrap      # installs the toolchain and headers, once
+./build_all.sh                  # dist/modifile-vX.Y.Z-x86_64-linux.tar.gz
+```
+
+```powershell
+.\build_all.ps1                 # Windows natively, Linux through WSL
+.\build_all.ps1 -WindowsOnly    # just the zip
+```
+
+There is nothing to cross-compile with: the Linux build needs a C toolchain for
+`aws-lc-sys` and the windowing headers for the GUI, so `build_all.ps1` hands
+that half to WSL rather than pretending. For an actual release, push a tag and
+let the runners do it — they build each platform on its own machine, and Linux
+on an older distro than yours:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0          # .github/workflows/release.yml
+```
+
+That builds both platforms, attaches the archives and `SHA256SUMS.txt` to a
+draft release, and leaves the notes for you to edit before publishing.
 
 ## Supported games
 

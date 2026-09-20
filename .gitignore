@@ -1,6 +1,9 @@
 # Build artifacts
 /target/
 
+# Release archives from build_all
+/dist/
+
 # Editor / OS noise
 .vscode/
 .idea/

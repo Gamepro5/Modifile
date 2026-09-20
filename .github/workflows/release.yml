@@ -1,0 +1,143 @@
+name: Release
+
+# Builds both binaries natively on each platform and attaches the archives to a
+# GitHub Release. Cross-compiling is deliberately not attempted: aws-lc-sys
+# (via rustls) needs a C toolchain and the GUI needs X11/Wayland/GL headers, so
+# a native runner per platform is the cheap, boring way to get a working build.
+#
+# Trigger: push a tag, e.g.
+#     git tag v0.1.0 && git push origin v0.1.0
+# or run this workflow by hand against a tag that already exists.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not -latest: glibc 2.35 there, so the binaries also
+          # run on Ubuntu 22.04, Debian 12 and anything newer. Building on
+          # 24.04 would hard-require glibc 2.39 for no benefit.
+          - os: ubuntu-22.04
+            target: x86_64-linux
+          - os: windows-latest
+            target: x86_64-windows
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -V && cargo -V
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.tag || github.ref_name }}"
+          name="modifile-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/modifile.exe target/release/modifile-gui.exe "dist/${name}/"
+          else
+            cp target/release/modifile target/release/modifile-gui "dist/${name}/"
+          fi
+          cp README.md "dist/${name}/"
+          [ -f LICENSE ] && cp LICENSE "dist/${name}/" || true
+
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "${name}.zip" "${name}" >/dev/null
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+          rm -rf "${name}"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum modifile-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Always a draft: a release is public the moment it exists, and a bad
+      # binary cannot be unpublished from the people who already have it.
+      # Check the archives, edit the notes, then press Publish.
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "Modifile $TAG" \
+              --generate-notes \
+              --draft
+          fi
