@@ -144,6 +144,31 @@ enum Command {
     },
     /// Rename a profile, keeping its mods, lock and configs.
     Rename { from: String, to: String },
+    /// Delete a profile, its versions and its saved settings.
+    ///
+    /// Downloads are shared by hash with every other profile, so they are left
+    /// alone; `modifile gc` is what clears the ones nothing wants.
+    Delete {
+        profile: String,
+        /// Required, because nothing here can be rebuilt afterwards.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List a mod's releases, and which of them this game can install.
+    ///
+    /// The companion to `--pin`: it is hard to hold a mod at a version whose
+    /// tag you have to guess.
+    Versions { profile: String, id: String },
+    /// Hold a mod at a version, or release it to follow the newest again.
+    Hold {
+        profile: String,
+        id: String,
+        /// The release tag to hold at. Omit with --latest to clear it.
+        version: Option<String>,
+        /// Follow the newest release again.
+        #[arg(long)]
+        latest: bool,
+    },
     /// Set which game version and mod loader a profile is for.
     Set {
         profile: String,
@@ -361,6 +386,16 @@ fn run() -> Result<()> {
             println!("`{from}` is now `{name}`.");
             Ok(())
         }
+        Command::Delete { profile, yes } => cmd_delete(&engine, &profile, yes),
+        Command::Versions { profile, id } => {
+            runtime.block_on(cmd_versions(&engine, &profile, &id))
+        }
+        Command::Hold {
+            profile,
+            id,
+            version,
+            latest,
+        } => cmd_hold(&engine, &profile, &id, version, latest),
         Command::Export {
             profile,
             out,
@@ -456,7 +491,7 @@ fn cmd_import(
         bundle.mod_count(),
         bundle.config_count(),
         if pin_versions {
-            ", pinned to the exporter's versions"
+            ", held at the exporter's versions"
         } else {
             ", taking the newest versions"
         }
@@ -465,6 +500,15 @@ fn cmd_import(
     let created = engine.import_profile(&bundle, name, pin_versions)?;
     println!();
     println!("Created `{created}`.");
+    if pin_versions {
+        // Update checks on this profile will report nothing to do, forever,
+        // and that is correct. Saying so now is cheaper than the alternative.
+        println!(
+            "Every mod is held at the exporter's version, so `update` will not move them —\n\
+             it downloads those versions and names any that newer releases have passed.\n\
+             Release one with `modifile hold {created} <mod> --latest`."
+        );
+    }
     println!("Next: modifile update {created} && modifile activate {created}");
     Ok(())
 }
@@ -776,10 +820,17 @@ fn cmd_show(engine: &Engine, name: &str) -> Result<()> {
         let trust = locked
             .map(|l| l.trust.level.label().to_string())
             .unwrap_or_else(|| "-".to_string());
+        // "held" rather than "pinned", and carrying what it is being held
+        // back from, because a pin whose cost is invisible is one nobody
+        // revisits.
+        let held = locked
+            .and_then(|l| l.upstream.clone())
+            .filter(|_| entry.pin.is_some() && !entry.manual)
+            .map(|latest| format!("held,{latest} out"));
         let flags = [
-            (!entry.enabled).then_some("disabled"),
-            entry.pin.as_ref().map(|_| "pinned"),
-            entry.targets.as_ref().map(|_| "scoped"),
+            (!entry.enabled).then_some("disabled".to_string()),
+            held.or_else(|| entry.pin.as_ref().map(|_| "held".to_string())),
+            entry.targets.as_ref().map(|_| "scoped".to_string()),
         ]
         .into_iter()
         .flatten()
@@ -819,6 +870,103 @@ fn cmd_add(
     }
     profile.save(&engine.paths.profile_file(name))?;
     println!("Added {id} to `{name}`. Run `modifile update {name}` to resolve it.");
+    Ok(())
+}
+
+fn cmd_delete(engine: &Engine, name: &str, yes: bool) -> Result<()> {
+    let profile = load_profile(engine, name)?;
+    if !yes {
+        println!(
+            "This deletes `{name}` ({} mod(s)), the versions it resolved to and the settings \
+             it was keeping. Downloads are shared with your other profiles and are left alone.",
+            profile.mods.len()
+        );
+        println!("Re-run with --yes to go ahead.");
+        return Ok(());
+    }
+    engine.delete_profile(name)?;
+    println!("Deleted `{name}`.");
+    println!("Unused downloads can be cleared with `modifile gc`.");
+    Ok(())
+}
+
+async fn cmd_versions(engine: &Engine, name: &str, id: &str) -> Result<()> {
+    let profile = load_profile(engine, name)?;
+    let id: ModId = id.parse()?;
+    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    let installed = lock.get(&id).map(|l| l.version.clone());
+    let pinned = profile.find(&id).and_then(|e| e.pin.clone());
+
+    let versions = engine.versions(&profile, &id).await?;
+    if versions.is_empty() {
+        println!("{id} has no releases.");
+        return Ok(());
+    }
+
+    for version in &versions {
+        // Marks in the left margin, so the line you want is findable without
+        // reading every word of it.
+        let mark = match (&installed, &pinned) {
+            (Some(v), _) if *v == version.tag => "*",
+            _ => " ",
+        };
+        let held = if pinned.as_deref() == Some(version.tag.as_str()) {
+            " (held here)"
+        } else {
+            ""
+        };
+        let date = version.published_at.split('T').next().unwrap_or_default();
+        match &version.asset {
+            Some(asset) => println!(
+                "{mark} {:<20} {date}  {asset} ({}){}{held}",
+                version.tag,
+                format_bytes(version.size),
+                if version.prerelease { " prerelease" } else { "" }
+            ),
+            None => println!(
+                "{mark} {:<20} {date}  — nothing this game can install",
+                version.tag
+            ),
+        }
+    }
+    println!();
+    println!("* = installed. Hold one with `modifile hold {name} {id} <version>`.");
+    Ok(())
+}
+
+fn cmd_hold(
+    engine: &Engine,
+    name: &str,
+    id: &str,
+    version: Option<String>,
+    latest: bool,
+) -> Result<()> {
+    let mut profile = load_profile(engine, name)?;
+    let id: ModId = id.parse()?;
+    if profile.find(&id).is_none() {
+        return Err(modifile_core::Error::NotFound(format!(
+            "{id} is not in `{name}`"
+        )));
+    }
+    if version.is_none() && !latest {
+        return Err(modifile_core::Error::other(format!(
+            "give a version to hold at, or --latest to follow releases again. \
+             `modifile versions {name} {id}` lists them."
+        )));
+    }
+
+    let pin = if latest { None } else { version };
+    for entry in &mut profile.mods {
+        if entry.id == id {
+            entry.pin = pin.clone();
+        }
+    }
+    profile.save(&engine.paths.profile_file(name))?;
+    match &pin {
+        Some(v) => println!("{id} is held at {v}."),
+        None => println!("{id} will take the newest release."),
+    }
+    println!("Run `modifile update {name}` to fetch it.");
     Ok(())
 }
 
@@ -972,6 +1120,9 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
             println!("  UPDATE   {id}: you have {have}, {latest} is out");
             println!("           {page}");
         }
+        Event::HeldBack { id, have, latest } => {
+            println!("  HELD     {id}: held at {have}, {latest} is out")
+        }
         Event::Installed { id, version, trust } => {
             println!("  ready    {id} {version} [{}]", trust.level.label())
         }
@@ -1030,6 +1181,34 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
         for issue in &waiting {
             println!("  {}", issue.id);
         }
+    }
+
+    // A held mod is not an error and not an update, so it gets its own
+    // paragraph. Folding it into "N mods ready" is how a profile imported at
+    // someone else's versions passes for a current one indefinitely.
+    let held: Vec<_> = lock
+        .mods
+        .iter()
+        .filter(|entry| {
+            entry.upstream.is_some()
+                && profile
+                    .find(&entry.id)
+                    .map(|e| e.pin.is_some() && !e.manual)
+                    .unwrap_or(false)
+        })
+        .collect();
+    if !held.is_empty() {
+        println!();
+        println!("Held at a chosen version — newer releases exist and were not taken:");
+        for entry in &held {
+            println!(
+                "  {} {} -> {} available",
+                entry.id,
+                entry.version,
+                entry.upstream.clone().unwrap_or_default()
+            );
+        }
+        println!("  Take one: modifile hold {name} <mod> --latest, then update again.");
     }
     for issue in &broken {
         eprintln!("  {}: {}", issue.id, issue.message);

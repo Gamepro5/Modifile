@@ -74,6 +74,15 @@ pub enum Event {
         latest: String,
         page: String,
     },
+    /// A pinned mod that a newer release has overtaken. The pin is doing its
+    /// job, so this is not an error — but an update check that stayed silent
+    /// here is the reason someone can sit on a stale version for months
+    /// believing they are current.
+    HeldBack {
+        id: ModId,
+        have: String,
+        latest: String,
+    },
     Installed { id: ModId, version: String, trust: TrustReport },
     Failed { id: ModId, error: String },
 }
@@ -106,6 +115,25 @@ struct Resolution {
     release: Release,
     asset: Asset,
     repo: Option<RepoInfo>,
+    /// The newest release we could have used had the entry not been pinned.
+    /// `None` when that is the one we picked, so `Some` always means "this is
+    /// being held back". Costs no extra request: the release list was already
+    /// fetched to satisfy the pin.
+    newer: Option<String>,
+}
+
+/// One release a mod could be set to, for choosing a version by hand.
+#[derive(Debug, Clone)]
+pub struct VersionOption {
+    pub tag: String,
+    pub name: String,
+    pub published_at: String,
+    pub prerelease: bool,
+    /// The asset this game's pack would install from this release. `None`
+    /// means the release exists but carries nothing usable here — shown, and
+    /// not selectable, because "that version is not installable" is an answer.
+    pub asset: Option<String>,
+    pub size: u64,
 }
 
 impl Engine {
@@ -397,6 +425,16 @@ impl Engine {
                                 id: res.id.clone(),
                                 version: res.release.tag.clone(),
                             });
+                            // Say so out loud. A pin that quietly refuses every
+                            // update looks identical to being up to date, and
+                            // the user is the only one who can tell them apart.
+                            if let Some(newer) = &res.newer {
+                                report(Event::HeldBack {
+                                    id: res.id.clone(),
+                                    have: res.release.tag.clone(),
+                                    latest: newer.clone(),
+                                });
+                            }
                             Ok(res)
                         }
                         Err(e) => {
@@ -554,6 +592,12 @@ impl Engine {
             }));
         }
 
+        // The newest release that would have been chosen with no pin in the
+        // way. Computed first, and always, so a pinned mod can report what it
+        // is holding back from — the alternative is an update check that
+        // cheerfully reports "already newest" about a year-old version.
+        let newest_usable = Self::newest_usable(pack, &releases, allow_prerelease, targets);
+
         // Walk back through releases until one carries an asset we can use.
         // A tag with no build attached is common and should not be fatal.
         for release in releases
@@ -568,6 +612,8 @@ impl Engine {
                         release: release.clone(),
                         asset: release.assets[idx].clone(),
                         repo: repo.clone(),
+                        newer: newest_usable.filter(|tag| *tag != release.tag.as_str())
+                            .map(str::to_string),
                     });
                 }
             }
@@ -585,6 +631,71 @@ impl Engine {
                 "{id} has releases but none carry an asset this game pack accepts"
             ),
         }))
+    }
+
+    /// The tag an unpinned entry would resolve to, or `None` if nothing in the
+    /// list carries an asset this pack can use.
+    fn newest_usable<'a>(
+        pack: &CompiledPack,
+        releases: &'a [Release],
+        allow_prerelease: bool,
+        targets: &[Target],
+    ) -> Option<&'a str> {
+        releases
+            .iter()
+            .filter(|r| allow_prerelease || !r.prerelease)
+            .find(|r| {
+                let names: Vec<String> = r.assets.iter().map(|a| a.name.clone()).collect();
+                targets
+                    .iter()
+                    .any(|target| pack.select_asset(&names, target).is_some())
+            })
+            .map(|r| r.tag.as_str())
+    }
+
+    /// Every release of one mod, annotated with what this profile would
+    /// actually install from it.
+    ///
+    /// This is what lets someone choose a version rather than take whatever
+    /// the newest happens to be — the case the pin flag always supported and
+    /// nothing ever surfaced, leaving people to guess tag names.
+    pub async fn versions(
+        &self,
+        profile: &Profile,
+        id: &ModId,
+    ) -> Result<Vec<VersionOption>> {
+        let pack = self.pack_for(profile)?;
+        let targets: Vec<Target> = self
+            .targets(pack, profile)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+        let filter = crate::source::modrinth::VersionFilter {
+            game_version: profile.game_version.clone(),
+            loader: profile.loader.clone(),
+        };
+
+        let (releases, _) = self
+            .fetch(id, &filter, pack.pack.search.curseforge_game_id)
+            .await?;
+
+        Ok(releases
+            .iter()
+            .map(|release| {
+                let names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
+                let picked = targets
+                    .iter()
+                    .find_map(|target| pack.select_asset(&names, target));
+                VersionOption {
+                    tag: release.tag.clone(),
+                    name: release.name.clone(),
+                    published_at: release.published_at.clone(),
+                    prerelease: release.prerelease,
+                    asset: picked.map(|i| release.assets[i].name.clone()),
+                    size: picked.map(|i| release.assets[i].size).unwrap_or(0),
+                }
+            })
+            .collect())
     }
 
     /// Ensure the artifact is in the store, then assess trust.
@@ -609,7 +720,11 @@ impl Engine {
                     id: res.id.clone(),
                     version: res.release.tag.clone(),
                 });
-                return Ok(prev.clone());
+                // Same bytes as last time, but "what is newest upstream" is
+                // exactly the thing that moves while nothing else does.
+                let mut carried = prev.clone();
+                carried.upstream = res.newer.clone();
+                return Ok(carried);
             }
         }
         if let Some(digest) = &upstream_digest {
@@ -708,7 +823,10 @@ impl Engine {
             sha256,
             size,
             published_at: res.release.published_at.clone(),
-            upstream: None,
+            // Non-null only for a pinned entry something newer has passed, so
+            // the mod list can show "held at X, Y available" without going
+            // back to the network every time the window is drawn.
+            upstream: res.newer.clone(),
             trust,
         })
     }
@@ -1173,6 +1291,51 @@ impl Engine {
         Ok(to)
     }
 
+    /// Delete a profile: its mod list, its lock, and the settings it was
+    /// keeping for you.
+    ///
+    /// Refused while the profile is active, because deleting it then would
+    /// leave its files in the game folder with nothing left that knows they
+    /// are there. Deactivate first — callers with a user in front of them
+    /// should offer to do both, rather than making them find the other button.
+    ///
+    /// The downloads themselves are left alone. They are shared by hash with
+    /// every other profile, so deciding they are garbage is `gc`'s job, not
+    /// this one's.
+    pub fn delete_profile(&self, name: &str) -> Result<()> {
+        let file = self.paths.profile_file(name);
+        if !file.exists() {
+            return Err(Error::NotFound(format!("no profile called `{name}`")));
+        }
+
+        let profile = Profile::load(&file)?;
+        if self.active_profiles(&profile.game).iter().any(|p| p == name) {
+            return Err(Error::other(format!(
+                "`{name}` is active — its mods are in the game folder right now. \
+                 Deactivate it first, so the game goes back to vanilla."
+            )));
+        }
+
+        std::fs::remove_file(&file).ctx(format!("deleting {}", file.display()))?;
+        std::fs::remove_file(self.paths.lock_file(name)).ok();
+        std::fs::remove_dir_all(self.paths.profiles.join(format!("{name}.state"))).ok();
+
+        // A deactivated manifest hangs around to remember leftovers it could
+        // not remove. One naming a profile that no longer exists is noise, so
+        // drop it — unless it still has leftovers to account for.
+        if let Ok(entries) = std::fs::read_dir(self.paths.state.join(&profile.game)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(Some(manifest)) = Manifest::load(&path) {
+                    if manifest.profile == name && !manifest.active && manifest.files.is_empty() {
+                        std::fs::remove_file(&path).ok();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Which profile currently occupies each target of a game.
     pub fn active_profiles(&self, game: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -1558,12 +1721,162 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_bytes;
+    use super::*;
+    use crate::pack::Pack;
+    use crate::source::Asset;
 
     #[test]
     fn scales_units() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    fn wow() -> CompiledPack {
+        let (_, body) = crate::BUNDLED_PACKS
+            .iter()
+            .find(|(n, _)| *n == "wow.toml")
+            .expect("bundled wow pack");
+        CompiledPack::new(toml::from_str::<Pack>(body).expect("parses")).expect("compiles")
+    }
+
+    fn release(tag: &str, assets: &[&str], prerelease: bool) -> Release {
+        Release {
+            tag: tag.to_string(),
+            name: tag.to_string(),
+            published_at: String::new(),
+            prerelease,
+            assets: assets
+                .iter()
+                .map(|name| Asset {
+                    name: name.to_string(),
+                    download_url: String::new(),
+                    size: 1,
+                    digest: None,
+                    sha512: None,
+                })
+                .collect(),
+            web_url: String::new(),
+        }
+    }
+
+    /// The bug this whole thing exists to fix: a pinned entry resolved fine and
+    /// reported nothing, so an update check on an imported profile said
+    /// "already newest" about a version three releases behind.
+    #[test]
+    fn a_pin_knows_what_it_is_holding_back() {
+        let pack = wow();
+        let targets = vec![pack.target("client").expect("client target").clone()];
+        let releases = vec![
+            release("5.20.1", &["WeakAuras-5.20.1.zip"], false),
+            release("5.19.0", &["WeakAuras-5.19.0.zip"], false),
+            release("5.18.0", &["WeakAuras-5.18.0.zip"], false),
+        ];
+
+        let newest = Engine::newest_usable(&pack, &releases, false, &targets);
+        assert_eq!(newest, Some("5.20.1"));
+    }
+
+    /// A release with nothing installable in it must not be reported as the
+    /// newest, or the UI would nag about an update that cannot be taken.
+    #[test]
+    fn newest_usable_skips_releases_with_no_asset_for_this_game() {
+        let pack = wow();
+        let targets = vec![pack.target("client").expect("client target").clone()];
+        let releases = vec![
+            release("6.0.0", &["source-code.tar.gz"], false),
+            release("5.20.1", &["WeakAuras-5.20.1.zip"], false),
+        ];
+
+        assert_eq!(
+            Engine::newest_usable(&pack, &releases, false, &targets),
+            Some("5.20.1")
+        );
+    }
+
+    #[test]
+    fn newest_usable_ignores_prereleases_unless_asked() {
+        let pack = wow();
+        let targets = vec![pack.target("client").expect("client target").clone()];
+        let releases = vec![
+            release("6.0.0-beta", &["WeakAuras-6.0.0-beta.zip"], true),
+            release("5.20.1", &["WeakAuras-5.20.1.zip"], false),
+        ];
+
+        assert_eq!(
+            Engine::newest_usable(&pack, &releases, false, &targets),
+            Some("5.20.1")
+        );
+        assert_eq!(
+            Engine::newest_usable(&pack, &releases, true, &targets),
+            Some("6.0.0-beta")
+        );
+    }
+
+    fn scratch(tag: &str) -> Paths {
+        let dir = std::env::temp_dir().join(format!(
+            "modifile-engine-{tag}-{}",
+            crate::paths::now_millis()
+        ));
+        let paths = Paths::rooted(&dir);
+        paths.ensure().expect("scratch dirs");
+        paths
+    }
+
+    #[test]
+    fn deleting_a_profile_takes_its_lock_and_settings_with_it() {
+        let paths = scratch("delete");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+
+        let profile = Profile::new("raiding", "wow");
+        profile
+            .save(&paths.profile_file("raiding"))
+            .expect("save profile");
+        Lock::default()
+            .save(&paths.lock_file("raiding"))
+            .expect("save lock");
+        let state = paths.profiles.join("raiding.state");
+        std::fs::create_dir_all(state.join("client")).expect("state dir");
+
+        engine.delete_profile("raiding").expect("delete");
+
+        assert!(!paths.profile_file("raiding").exists());
+        assert!(!paths.lock_file("raiding").exists());
+        assert!(!state.exists());
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    /// Deleting an active profile would leave its files in the game folder
+    /// with nothing left that knows they are there.
+    #[test]
+    fn an_active_profile_is_not_deleted_out_from_under_the_game() {
+        let paths = scratch("delete-active");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+
+        let profile = Profile::new("raiding", "wow");
+        profile
+            .save(&paths.profile_file("raiding"))
+            .expect("save profile");
+
+        let manifest_path = paths.manifest_file("wow", "client");
+        std::fs::create_dir_all(manifest_path.parent().expect("parent")).expect("state dir");
+        Manifest {
+            game: "wow".into(),
+            target: "client".into(),
+            profile: "raiding".into(),
+            root: paths.home.join("game"),
+            mode: None,
+            deployed_ms: 0,
+            active: true,
+            files: Vec::new(),
+            created_dirs: Vec::new(),
+        }
+        .save(&manifest_path)
+        .expect("save manifest");
+
+        let err = engine.delete_profile("raiding").unwrap_err().to_string();
+        assert!(err.contains("Deactivate"), "{err}");
+        assert!(paths.profile_file("raiding").exists(), "profile survived");
+        std::fs::remove_dir_all(&paths.home).ok();
     }
 }

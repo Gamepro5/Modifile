@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use modifile_core::deploy::LinkMode;
-use modifile_core::engine::{format_bytes, Event};
+use modifile_core::engine::{format_bytes, Event, VersionOption};
 use modifile_core::pack::Target;
 use modifile_core::profile::ModEntry;
 use modifile_core::{Engine, Lock, ModId, Paths, Profile, TrustLevel};
@@ -47,6 +47,8 @@ enum Msg {
     Synced(Vec<SyncOutcome>),
     /// A search finished.
     Found(Vec<modifile_core::source::SearchHit>),
+    /// One mod's release list arrived, for the version picker.
+    Versions(ModId, Vec<VersionOption>),
     /// Background work finished with nothing to report but its completion.
     /// Distinct from `Synced` so it does not wipe the update panel.
     Done,
@@ -57,6 +59,10 @@ enum OutcomeKind {
     New,
     Updated,
     Unchanged,
+    /// Pinned, and a newer release has gone past it. Not a failure — the pin
+    /// was asked for — but it must never be reported as "already newest",
+    /// which is how someone sits on a stale version thinking they are current.
+    Held,
     /// A manually-added mod whose source has something newer. Nothing can fetch
     /// it for you, so this is a nudge with a link rather than an action.
     NeedsManualUpdate,
@@ -90,6 +96,11 @@ impl SyncOutcome {
             OutcomeKind::Unchanged => {
                 format!("{} (already newest)", self.to.clone().unwrap_or_default())
             }
+            OutcomeKind::Held => format!(
+                "held at {} — {} is out",
+                self.from.clone().unwrap_or_default(),
+                self.to.clone().unwrap_or_default()
+            ),
             OutcomeKind::NeedsManualUpdate => format!(
                 "{} -> {} available",
                 self.from.clone().unwrap_or_default(),
@@ -105,6 +116,7 @@ impl SyncOutcome {
             OutcomeKind::New => theme::ACCENT,
             OutcomeKind::Updated => theme::GOOD,
             OutcomeKind::Unchanged => theme::MUTED,
+            OutcomeKind::Held => theme::WARN,
             OutcomeKind::NeedsManualUpdate => theme::WARN,
             OutcomeKind::Waiting => theme::MUTED,
             OutcomeKind::Failed => theme::BAD,
@@ -126,6 +138,10 @@ struct ModRow {
     trust: Option<TrustLevel>,
     note: String,
     pinned: bool,
+    /// Newest version upstream, when it is not the one we are on. Set for a
+    /// pinned mod that releases have moved past, and for a manually supplied
+    /// one nothing can fetch.
+    held: Option<String>,
     /// `None` means every target of the game. `Some` restricts it — this is how
     /// a mod is marked server-only or client-only.
     targets: Option<Vec<String>>,
@@ -137,6 +153,20 @@ struct ModRow {
     /// Fine, but nothing built for this profile's version yet.
     waiting: bool,
     prerelease: bool,
+}
+
+/// The version picker's state: one mod, and what its source publishes.
+///
+/// Fetched on open rather than kept around, because a release list is exactly
+/// the kind of thing that is stale by the time you look at it.
+struct Picker {
+    id: ModId,
+    /// The version this mod is held at, if any, so the list can mark it.
+    pinned: Option<String>,
+    /// What the profile is actually running right now.
+    current: String,
+    versions: Vec<VersionOption>,
+    loading: bool,
 }
 
 struct TargetRow {
@@ -229,6 +259,12 @@ struct App {
     root_input: String,
     show_rename: bool,
     rename_input: String,
+    show_delete: bool,
+    /// Typed confirmation for deleting a profile. A profile is the only thing
+    /// in here that cannot be rebuilt from the store, so it costs a word.
+    delete_input: String,
+    /// Open version picker: which mod, and what its source offers.
+    picker: Option<Picker>,
     /// Ticked by the user for game folders on another machine, which we cannot
     /// check ourselves. Deliberately not remembered between runs.
     assume_stopped: bool,
@@ -306,6 +342,9 @@ impl App {
             root_dialog: None,
             root_input: String::new(),
             show_rename: false,
+            show_delete: false,
+            delete_input: String::new(),
+            picker: None,
             rename_input: String::new(),
             assume_stopped: false,
             new_profile_name: String::new(),
@@ -522,6 +561,16 @@ impl App {
                 trust: locked.map(|l| l.trust.level),
                 note: locked.map(|l| l.trust.notes.join("; ")).unwrap_or_default(),
                 pinned: entry.pin.is_some(),
+                // A newer release exists and this entry is not taking it. Kept
+                // in the lock by the last check, so it survives a restart
+                // instead of needing another round trip to be re-noticed.
+                //
+                // Only for a pin: a manual mod uses the same field, but the
+                // way out of it is to supply a file, not to clear a pin, and
+                // it gets its own notice with a link for exactly that.
+                held: locked
+                    .and_then(|l| l.upstream.clone())
+                    .filter(|_| entry.pin.is_some() && !entry.manual),
                 prerelease: entry.prerelease,
                 targets: entry.targets.clone(),
             });
@@ -627,6 +676,9 @@ impl App {
                             push(format!("already have {id} {version}"))
                         }
                         Event::Failed { id, error } => push(format!("FAILED {id}: {error}")),
+                        Event::HeldBack { id, have, latest } => {
+                            push(format!("{id}: held at {have}, {latest} is available"))
+                        }
                         _ => {}
                     })
                 };
@@ -642,6 +694,29 @@ impl App {
                     .iter()
                     .map(|now| {
                         let before = previous.get(&now.id).map(|l| l.version.clone());
+                        // A pin that something newer has passed is its own
+                        // outcome. Calling it "unchanged" is true and useless;
+                        // the user wants to know an update exists and is not
+                        // being taken.
+                        // Manual mods use the same field but get their own
+                        // notice, with a link, from the event stream — two
+                        // rows for one mod would just look like a bug.
+                        let pinned = profile
+                            .find(&now.id)
+                            .map(|entry| entry.pin.is_some() && !entry.manual)
+                            .unwrap_or(false);
+                        if let (Some(latest), true) = (&now.upstream, pinned) {
+                            return SyncOutcome {
+                                id: now.id.clone(),
+                                from: Some(now.version.clone()),
+                                to: Some(latest.clone()),
+                                kind: OutcomeKind::Held,
+                                detail: "Held at this version by a pin. Pick a version, or \
+                                         switch it to always take the newest."
+                                    .to_string(),
+                                page: None,
+                            };
+                        }
                         let kind = match &before {
                             None => OutcomeKind::New,
                             Some(v) if v != &now.version => OutcomeKind::Updated,
@@ -1366,6 +1441,124 @@ impl App {
         }
     }
 
+    /// Open the version picker and go fetch that mod's releases.
+    fn open_picker(&mut self, id: &ModId) {
+        let Some(profile) = self.profile.clone() else {
+            return;
+        };
+        let entry = profile.find(id);
+        self.picker = Some(Picker {
+            id: id.clone(),
+            pinned: entry.and_then(|e| e.pin.clone()),
+            current: self
+                .lock
+                .get(id)
+                .map(|l| l.version.clone())
+                .unwrap_or_else(|| "—".into()),
+            versions: Vec::new(),
+            loading: true,
+        });
+
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let id = id.clone();
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let result = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+                engine.versions(&profile, &id).await
+            });
+            match result {
+                Ok(versions) => {
+                    let _ = tx.send(Msg::Versions(id, versions));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e.to_string()));
+                    let _ = tx.send(Msg::Versions(id, Vec::new()));
+                }
+            }
+        });
+    }
+
+    /// Clear every pin in this profile, then go get what that resolves to.
+    ///
+    /// Two steps that are never wanted separately: clearing the pins alone
+    /// changes nothing you can see until the next check, which is precisely
+    /// the confusion this whole feature exists to end.
+    fn unpin_all(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let path = self.paths.profile_file(&name);
+        let Ok(mut profile) = Profile::load(&path) else {
+            return;
+        };
+        let cleared = profile.mods.iter().filter(|m| m.pin.is_some()).count();
+        if cleared == 0 {
+            return;
+        }
+        for entry in &mut profile.mods {
+            entry.pin = None;
+        }
+        if let Err(e) = profile.save(&path) {
+            self.log_line(e.to_string());
+            return;
+        }
+        self.log_line(format!(
+            "{cleared} mod(s) released from their held versions — checking for updates…"
+        ));
+        self.refresh();
+        self.do_sync(ctx);
+    }
+
+    /// Delete the selected profile, taking its mods out of the game first if
+    /// they are in there.
+    fn do_delete_profile(&mut self) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        if self.is_active(&name) {
+            self.log_line(format!("Taking {name} out of the game folder first…"));
+            self.do_undeploy();
+            // Undeploy refuses while the game is running, and leaves the
+            // profile active if it could not finish. Deleting anyway would
+            // strand its files with nothing tracking them.
+            self.refresh();
+            if self.is_active(&name) {
+                self.log_line(
+                    "Could not deactivate it, so nothing was deleted. Close the game and try \
+                     again.",
+                );
+                return;
+            }
+        }
+
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        match engine.delete_profile(&name) {
+            Ok(()) => {
+                self.log_line(format!(
+                    "Deleted `{name}`. Its downloads are still in the store, shared with your \
+                     other profiles; Settings can clean up any that nothing uses."
+                ));
+                self.selected = None;
+                self.profile = None;
+                self.lock = Lock::default();
+                self.rows.clear();
+                self.last_sync.clear();
+                self.show_delete = false;
+                self.delete_input.clear();
+                self.reload_profiles();
+                // Land somewhere real rather than on a blank panel.
+                if let Some(next) = self.profiles.first().map(|p| p.name.clone()) {
+                    self.select(&next);
+                }
+            }
+            Err(e) => self.log_line(e.to_string()),
+        }
+    }
+
     fn commit_rename(&mut self) {
         let (Some(from), to) = (self.selected.clone(), self.rename_input.trim().to_string())
         else {
@@ -1455,12 +1648,27 @@ impl App {
                     bundle.mod_count(),
                     bundle.config_count(),
                     if pin_versions {
-                        "pinned to the sender's versions"
+                        "held at the sender's versions"
                     } else {
                         "taking the newest versions"
                     }
                 ));
-                self.log_line("  Press Check for updates to download them, then Activate.");
+                if pin_versions {
+                    // Said once, plainly, at the only moment it is not yet a
+                    // surprise: this profile will not update itself, and that
+                    // is what was asked for.
+                    self.log_line(
+                        "  Every mod is held at the version the sender was running, so update \
+                         checks will not move them.",
+                    );
+                    self.log_line(
+                        "  Each mod's version menu can change that, or More → Take the newest \
+                         for all held mods.",
+                    );
+                    self.log_line("  Press Download these versions to fetch them, then Activate.");
+                } else {
+                    self.log_line("  Press Check for updates to download them, then Activate.");
+                }
                 self.reload_profiles();
                 self.select(&name);
             }
@@ -1630,6 +1838,16 @@ impl eframe::App for App {
                     self.busy = false;
                     self.refresh();
                 }
+                Msg::Versions(id, versions) => {
+                    // The window may have been closed, or moved to another
+                    // mod, while the request was in flight.
+                    if let Some(picker) = self.picker.as_mut() {
+                        if picker.id == id {
+                            picker.versions = versions;
+                            picker.loading = false;
+                        }
+                    }
+                }
                 Msg::Found(hits) => {
                     self.searching = false;
                     if hits.is_empty() {
@@ -1670,6 +1888,14 @@ impl eframe::App for App {
         if self.show_rename {
             let ctx = ui.ctx().clone();
             self.rename_window(&ctx);
+        }
+        if self.show_delete {
+            let ctx = ui.ctx().clone();
+            self.delete_window(&ctx);
+        }
+        if self.picker.is_some() {
+            let ctx = ui.ctx().clone();
+            self.picker_window(&ctx);
         }
         if self.show_loader_install {
             let ctx = ui.ctx().clone();
@@ -1746,12 +1972,31 @@ impl App {
                             self.do_deploy(false);
                         }
 
+                        // A profile where every mod is pinned cannot be updated
+                        // by pressing this, so it must not say it updates. It
+                        // downloads the versions the profile asks for — which
+                        // is a real and useful thing, just not that thing.
+                        let pinned = self.rows.iter().filter(|r| r.enabled && r.pinned).count();
+                        let enabled_mods = self.rows.iter().filter(|r| r.enabled).count();
+                        let all_pinned = enabled_mods > 0 && pinned == enabled_mods;
+
                         if ui
-                            .add_enabled(ready && has_mods, egui::Button::new("Check for updates"))
-                            .on_hover_text(
-                                "Ask GitHub for the newest version of each mod and download \
-                                 anything missing. Does not touch the game folder.",
+                            .add_enabled(
+                                ready && has_mods,
+                                egui::Button::new(if all_pinned {
+                                    "Download these versions"
+                                } else {
+                                    "Check for updates"
+                                }),
                             )
+                            .on_hover_text(if all_pinned {
+                                "Every mod here is held at a chosen version, so there is nothing \
+                                 to update to. This downloads exactly those versions, and tells \
+                                 you which ones newer releases have passed."
+                            } else {
+                                "Ask each mod's source for its newest version and download \
+                                 anything missing. Does not touch the game folder."
+                            })
                             .on_disabled_hover_text("Add a mod first")
                             .clicked()
                         {
@@ -1779,6 +2024,22 @@ impl App {
                                 self.open_rename();
                                 ui.close();
                             }
+                            // The way out of an "exactly as they had it"
+                            // import, in one press, for someone who does not
+                            // want to visit twenty mods individually.
+                            if pinned > 0
+                                && ui
+                                    .button(format!("Take the newest for all {pinned} held mods"))
+                                    .on_hover_text(
+                                        "Clears the held versions so every mod follows its \
+                                         newest release again, then checks for updates",
+                                    )
+                                    .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                self.unpin_all(&ctx);
+                                ui.close();
+                            }
                             if ui
                                 .button("Export to a file…")
                                 .on_hover_text("Mod list, versions and your settings")
@@ -1802,6 +2063,18 @@ impl App {
                             }
                             if ui.button("Activate, overwriting other files").clicked() {
                                 self.do_deploy(true);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(egui::RichText::new("Delete profile…").color(theme::BAD))
+                                .on_hover_text(
+                                    "Removes this profile, its versions and its saved settings. \
+                                     Your downloads and the other profiles are untouched.",
+                                )
+                                .clicked()
+                            {
+                                self.show_delete = true;
                                 ui.close();
                             }
                         });
@@ -1864,7 +2137,11 @@ impl App {
                 ui.menu_button("Import a shared profile…", |ui| {
                     if ui
                         .button("Exactly as they had it")
-                        .on_hover_text("Pins every mod to the version the sender was running")
+                        .on_hover_text(
+                            "Holds every mod at the version the sender was running. Update \
+                             checks will not move them — the mod list says which ones newer \
+                             releases have passed, and you can take those whenever you like.",
+                        )
                         .clicked()
                     {
                         self.do_import_bundle(true);
@@ -2415,7 +2692,9 @@ impl App {
         let manual = self.count_kind(OutcomeKind::NeedsManualUpdate);
         let waiting = self.count_kind(OutcomeKind::Waiting);
         let unchanged = self.count_kind(OutcomeKind::Unchanged);
+        let held = self.count_kind(OutcomeKind::Held);
         let mut dismiss = false;
+        let mut take_newest = false;
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("LAST UPDATE").small().color(theme::MUTED));
@@ -2442,6 +2721,9 @@ impl App {
                 if unchanged > 0 {
                     parts.push(format!("{unchanged} already newest"));
                 }
+                if held > 0 {
+                    parts.push(format!("{held} held back"));
+                }
                 if waiting > 0 {
                     parts.push(format!("{waiting} waiting for an update"));
                 }
@@ -2458,12 +2740,37 @@ impl App {
                         parts.join(", ")
                     })
                     .strong()
-                    .color(if failed > 0 || manual > 0 {
+                    .color(if failed > 0 || manual > 0 || held > 0 {
                         theme::WARN
                     } else {
                         theme::TEXT
                     }),
                 );
+
+                // The one thing this panel used to get wrong: a profile that
+                // cannot update looked exactly like one with nothing to do.
+                if held > 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{held} mod(s) are held at a chosen version, so newer releases \
+                             were not taken. That is what a shared profile imported \"exactly \
+                             as they had it\" does."
+                        ))
+                        .small()
+                        .color(theme::WARN),
+                    );
+                    if ui
+                        .button("Take the newest for all of them")
+                        .on_hover_text(
+                            "Releases every held mod to follow its newest release, then \
+                             checks for updates",
+                        )
+                        .clicked()
+                    {
+                        take_newest = true;
+                    }
+                }
                 ui.add_space(4.0);
 
                 // Changes first — the unchanged ones are noise here.
@@ -2471,10 +2778,13 @@ impl App {
                 rows.sort_by_key(|o| match o.kind {
                     OutcomeKind::Failed => 0,
                     OutcomeKind::NeedsManualUpdate => 1,
-                    OutcomeKind::Waiting => 2,
-                    OutcomeKind::Updated => 3,
-                    OutcomeKind::New => 4,
-                    OutcomeKind::Unchanged => 5,
+                    // Above the ordinary results: an update that exists and is
+                    // not being taken is the thing most worth seeing here.
+                    OutcomeKind::Held => 2,
+                    OutcomeKind::Waiting => 3,
+                    OutcomeKind::Updated => 4,
+                    OutcomeKind::New => 5,
+                    OutcomeKind::Unchanged => 6,
                 });
 
                 for outcome in rows {
@@ -2520,6 +2830,10 @@ impl App {
             });
         ui.add_space(12.0);
 
+        if take_newest {
+            let ctx = ui.ctx().clone();
+            self.unpin_all(&ctx);
+        }
         if dismiss {
             self.last_sync.clear();
         }
@@ -3214,6 +3528,7 @@ impl App {
         let mut set_side: Option<(ModId, Side)> = None;
         let mut set_pin: Option<(ModId, Option<String>)> = None;
         let mut set_prerelease: Option<(ModId, bool)> = None;
+        let mut open_picker: Option<ModId> = None;
         // Only games that actually have a dedicated server get the control.
         let has_server = !self.server_ids.is_empty();
         let client_ids = self.client_ids.clone();
@@ -3262,15 +3577,44 @@ impl App {
 
                                 // Pin / prerelease, which previously only
                                 // existed as flags on `modifile add`.
+                                // The label carries the whole story: what is
+                                // installed, and whether something newer is
+                                // being refused. "pinned 1.2.3" next to a
+                                // check that reports success is how a stale
+                                // mod passes for a current one.
+                                let behind = row.held.clone();
                                 ui.menu_button(
-                                    egui::RichText::new(if row.pinned {
-                                        format!("pinned {}", row.version)
-                                    } else {
-                                        "latest".to_string()
+                                    egui::RichText::new(match (&behind, row.pinned) {
+                                        (Some(latest), _) => {
+                                            format!("held at {} · {latest} out", row.version)
+                                        }
+                                        (None, true) => format!("held at {}", row.version),
+                                        (None, false) => "latest".to_string(),
                                     })
                                     .small()
-                                    .color(if row.pinned { theme::WARN } else { theme::MUTED }),
+                                    .color(if behind.is_some() {
+                                        theme::WARN
+                                    } else {
+                                        theme::MUTED
+                                    }),
                                     |ui| {
+                                        // The one-press way out, first and
+                                        // named after what it gets you.
+                                        if let Some(latest) = &behind {
+                                            if ui
+                                                .button(
+                                                    egui::RichText::new(format!(
+                                                        "Update to {latest}"
+                                                    ))
+                                                    .color(theme::GOOD),
+                                                )
+                                                .clicked()
+                                            {
+                                                set_pin = Some((row.id.clone(), None));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                        }
                                         if ui
                                             .selectable_label(!row.pinned, "Always take the newest")
                                             .clicked()
@@ -3294,6 +3638,17 @@ impl App {
                                                 Some((row.id.clone(), Some(row.version.clone())));
                                             ui.close();
                                         }
+                                        if ui
+                                            .button("Choose a version…")
+                                            .on_hover_text(
+                                                "Every release this mod has published, and \
+                                                 which of them this game can install",
+                                            )
+                                            .clicked()
+                                        {
+                                            open_picker = Some(row.id.clone());
+                                            ui.close();
+                                        }
                                         ui.separator();
                                         let mut pre = row.prerelease;
                                         if ui.checkbox(&mut pre, "Include prereleases").changed() {
@@ -3303,10 +3658,19 @@ impl App {
                                     },
                                 )
                                 .response
-                                .on_hover_text(if row.pinned {
-                                    "Held at this version; updates will not move it"
-                                } else {
-                                    "Takes the newest release on every update"
+                                .on_hover_text(match (&behind, row.pinned) {
+                                    (Some(latest), _) => format!(
+                                        "Held at {}. {latest} has been released — checking for \
+                                         updates will not take it while this is held.",
+                                        row.version
+                                    ),
+                                    (None, true) => {
+                                        "Held at this version; updates will not move it"
+                                            .to_string()
+                                    }
+                                    (None, false) => {
+                                        "Takes the newest release on every update".to_string()
+                                    }
                                 });
 
                                 // Which side of the game this mod installs on.
@@ -3424,12 +3788,23 @@ impl App {
         if let Some((id, side)) = set_side {
             self.do_set_side(&id, side);
         }
+        if let Some(id) = open_picker {
+            self.open_picker(&id);
+        }
         if let Some((id, pin)) = set_pin {
             self.edit_entry(&id, |entry| entry.pin = pin.clone());
-            self.log_line(match pin {
+            self.log_line(match &pin {
                 Some(v) => format!("{id} held at {v}."),
                 None => format!("{id} will take the newest release."),
             });
+            self.log_line(format!(
+                "  Press {} to fetch it.",
+                if pin.is_some() {
+                    "Download these versions"
+                } else {
+                    "Check for updates"
+                }
+            ));
         }
         if let Some((id, pre)) = set_prerelease {
             self.edit_entry(&id, |entry| entry.prerelease = pre);
@@ -4046,6 +4421,249 @@ impl App {
             self.commit_rename();
         } else if !open {
             self.show_rename = false;
+        }
+    }
+
+    /// Deleting a profile, which is the one destructive thing in here that no
+    /// amount of re-downloading undoes.
+    fn delete_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.selected.clone() else {
+            self.show_delete = false;
+            return;
+        };
+        let active = self.is_active(&name);
+        let running = self.targets.iter().find_map(|t| t.running.clone());
+        let mut open = self.show_delete;
+        let mut confirm = false;
+
+        egui::Window::new("Delete profile")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(format!("Delete `{name}`?"));
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Its mod list, the versions it resolved to and the settings it was \
+                         keeping are gone for good. The downloaded files stay in the store, \
+                         shared with your other profiles.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                if active {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "These mods are in the game folder right now. They will be taken \
+                             out first, so the game goes back to vanilla.",
+                        )
+                        .small()
+                        .color(theme::WARN),
+                    );
+                }
+                if let Some(found) = &running {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "The game is running ({found}). Close it first — mods cannot be \
+                             taken out from under it."
+                        ))
+                        .small()
+                        .color(theme::BAD),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(format!("Type {name} to confirm")).small());
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.delete_input).desired_width(280.0),
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let typed = self.delete_input.trim() == name;
+                    let blocked = active && running.is_some();
+                    if ui
+                        .add_enabled(
+                            typed && !blocked,
+                            egui::Button::new(
+                                egui::RichText::new(if active {
+                                    "Deactivate and delete"
+                                } else {
+                                    "Delete"
+                                })
+                                .color(theme::BAD),
+                            ),
+                        )
+                        .clicked()
+                        || (typed
+                            && !blocked
+                            && field.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_delete = false;
+                        self.delete_input.clear();
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        if confirm {
+            self.do_delete_profile();
+        } else if !open {
+            self.show_delete = false;
+            self.delete_input.clear();
+        }
+    }
+
+    /// Choosing which version of a mod to run.
+    ///
+    /// Shows every release, not only the installable ones: "that version has
+    /// no build this game can use" is an answer, and hiding it leaves someone
+    /// wondering why the version they remember is missing.
+    fn picker_window(&mut self, ctx: &egui::Context) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let id = picker.id.clone();
+        let mut open = true;
+        let mut chosen: Option<Option<String>> = None;
+
+        egui::Window::new(format!("Versions of {}", id.display()))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let picker = self.picker.as_ref().expect("checked above");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("installed: {}", picker.current))
+                            .small()
+                            .color(theme::MUTED),
+                    );
+                    if let Some(pin) = &picker.pinned {
+                        ui.label(
+                            egui::RichText::new(format!("held at {pin}"))
+                                .small()
+                                .color(theme::WARN),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+
+                if ui
+                    .selectable_label(picker.pinned.is_none(), "Always take the newest")
+                    .on_hover_text("Follow this mod's releases instead of holding a version")
+                    .clicked()
+                {
+                    chosen = Some(None);
+                }
+                ui.separator();
+
+                if picker.loading {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(
+                            egui::RichText::new("asking the source…").color(theme::MUTED),
+                        );
+                    });
+                    return;
+                }
+                if picker.versions.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No releases came back for this mod.")
+                            .color(theme::MUTED),
+                    );
+                    return;
+                }
+
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for version in &picker.versions {
+                        let selected = picker.pinned.as_deref() == Some(version.tag.as_str());
+                        ui.horizontal(|ui| {
+                            let usable = version.asset.is_some();
+                            let label = egui::RichText::new(&version.tag).color(if usable {
+                                theme::TEXT
+                            } else {
+                                theme::MUTED
+                            });
+                            if ui
+                                .add_enabled(
+                                    usable,
+                                    egui::Button::selectable(selected, label),
+                                )
+                                .on_hover_text(match &version.asset {
+                                    Some(asset) => format!(
+                                        "{asset} ({})",
+                                        format_bytes(version.size)
+                                    ),
+                                    None => String::new(),
+                                })
+                                .on_disabled_hover_text(
+                                    "This release carries nothing this game's pack can \
+                                     install",
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(Some(version.tag.clone()));
+                            }
+
+                            if version.tag == picker.current {
+                                ui.label(
+                                    egui::RichText::new("installed")
+                                        .small()
+                                        .color(theme::GOOD),
+                                );
+                            }
+                            if version.prerelease {
+                                ui.label(
+                                    egui::RichText::new("prerelease")
+                                        .small()
+                                        .color(theme::WARN),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let date = version
+                                        .published_at
+                                        .split('T')
+                                        .next()
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    ui.label(
+                                        egui::RichText::new(date).small().color(theme::MUTED),
+                                    );
+                                },
+                            );
+                        });
+                    }
+                });
+            });
+
+        if let Some(pin) = chosen {
+            self.edit_entry(&id, |entry| entry.pin = pin.clone());
+            match &pin {
+                Some(tag) => self.log_line(format!(
+                    "{id} set to {tag}. Press Download these versions to fetch it."
+                )),
+                None => self.log_line(format!(
+                    "{id} will take the newest release. Press Check for updates to fetch it."
+                )),
+            }
+            self.picker = None;
+        } else if !open {
+            self.picker = None;
         }
     }
 

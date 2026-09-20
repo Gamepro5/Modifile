@@ -91,6 +91,10 @@ token you get 5000/hour and revalidations become free.
 |---|---|
 | `modifile show <profile>` | mods, versions, trust, active state |
 | `modifile rename <old> <new>` | rename a profile, keeping mods, downloads and settings |
+| `modifile delete <profile> --yes` | delete a profile; downloads and other profiles untouched |
+| `modifile versions <profile> <mod>` | every release of a mod, and which this game can install |
+| `modifile hold <profile> <mod> <version>` | run a specific version instead of the newest |
+| `modifile hold <profile> <mod> --latest` | follow the newest release again |
 | `modifile export <profile>` | write a shareable `.modifile.json` |
 | `modifile import <file>` | create a profile from one someone sent you |
 | `modifile root <profile> <target> <path>` | point a target at a directory autodetection missed |
@@ -278,8 +282,40 @@ hand you a binary nobody else can see.
 
 Importing never overwrites an existing profile — a second import of the same
 file becomes `raiding-2`. Pass `--latest` to take the newest release of each mod
-instead of the exporter's pinned versions, and `--no-configs` when exporting to
-leave your settings out.
+instead of the exporter's versions, and `--no-configs` when exporting to leave
+your settings out.
+
+### Held versions
+
+An import that keeps the sender's versions — **Exactly as they had it**, or
+`import` without `--latest` — holds every mod at the version they were running.
+That is the point of it: a shared setup is one that was known to work together.
+The consequence is that checking for updates will not move those mods, ever, and
+an update check that stays quiet about it is indistinguishable from being up to
+date.
+
+So it does not stay quiet. Every check asks what the newest release is even for
+a held mod, and says which ones have been overtaken:
+
+```
+  HELD     Grantapher/ValheimPlus: held at 0.9.9.15, 0.9.9.21 is out
+```
+
+The GUI marks those mods `held at 0.9.9.15 · 0.9.9.21 out`, and its update button
+reads **Download these versions** rather than *Check for updates* when every mod
+in the profile is held — because that is what pressing it does.
+
+Moving one, or all of them:
+
+```sh
+modifile versions raiding Grantapher/ValheimPlus   # every release, and what installs
+modifile hold raiding Grantapher/ValheimPlus 0.9.9.21
+modifile hold raiding Grantapher/ValheimPlus --latest
+```
+
+In the GUI the same choices are on each mod's version menu — including **Choose
+a version…**, which lists what that mod has actually published — and *More →
+Take the newest for all held mods* releases the lot at once.
 
 ## Mods that were already there
 
@@ -533,5 +569,5 @@ crates/modifile-gui/   egui desktop app (no webview, no Electron)
 packs/                 bundled game packs
 ```
 
-`cargo test` runs 51 tests, including ones that exercise the bundled packs
+`cargo test` runs 92 tests, including ones that exercise the bundled packs
 directly — flavor selection, client/server routing, and zip-slip rejection.

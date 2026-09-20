@@ -157,9 +157,11 @@ pub struct LockEntry {
     pub size: u64,
     #[serde(default)]
     pub published_at: String,
-    /// For a manually supplied mod: the newest version its source was
-    /// advertising when we last looked. Comparing against this is how a mod
-    /// nobody can download for you still gets update notifications.
+    /// The newest version the source was advertising when we last looked, set
+    /// only when it is not the version we are on. Two cases produce that:
+    /// a manually supplied mod, which nothing can download for you, and a
+    /// pinned one, which is deliberately not being moved. Both need saying;
+    /// silence in either case reads as "you are up to date".
     #[serde(default)]
     pub upstream: Option<String>,
     pub trust: TrustReport,
