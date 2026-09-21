@@ -48,6 +48,7 @@ kind = "client"
 flavor = "mists"
 markers = ["WowClassic.exe"]
 processes = ["WowClassic.exe"]
+launch = ["WowClassic.exe"]
 asset_reject = ["*-mainline*", "*-vanilla*"]
 candidates = [
   "${ProgramFiles(x86)}/World of Warcraft/_classic_",

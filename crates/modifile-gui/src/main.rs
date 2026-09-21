@@ -9,6 +9,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod art;
+mod browse;
+mod detail;
+mod shell;
 mod theme;
 
 use std::path::{Path, PathBuf};
@@ -19,15 +23,41 @@ use eframe::egui;
 use modifile_core::deploy::LinkMode;
 use modifile_core::engine::{format_bytes, Event, VersionOption};
 use modifile_core::pack::Target;
-use modifile_core::profile::ModEntry;
+use modifile_core::profile::{ModEntry, ProfileId};
 use modifile_core::{Engine, Lock, ModId, Paths, Profile, TrustLevel};
 
+/// The icon the window and the taskbar show while Modifile is running.
+///
+/// Separate from the one `build.rs` writes into the executable: that one is
+/// what Explorer and a pinned shortcut read, this one is what the window
+/// manager asks the running process for. Windows uses both, and on Linux the
+/// embedded resource means nothing at all, so this is the only one there.
+///
+/// 256px because the taskbar, Alt-Tab and the window corner all want different
+/// sizes and every one of them is a downscale from this.
+fn icon() -> Option<egui::IconData> {
+    let png = include_bytes!("../assets/modifile-256.png");
+    let image = image::load_from_memory(png).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 720.0])
+        .with_min_inner_size([820.0, 560.0])
+        .with_title("Modifile");
+    // A missing icon is not a reason to refuse to start.
+    if let Some(icon) = icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([820.0, 560.0])
-            .with_title("Modifile"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -55,6 +85,18 @@ enum Msg {
     /// Background work finished with nothing to report but its completion.
     /// Distinct from `Synced` so it does not wipe the update panel.
     Done,
+    /// A profile was created in the background, and should be selected.
+    Imported(ProfileId),
+    /// A piece of artwork finished loading and decoding.
+    Art(Box<art::Loaded>),
+    /// A mod's page finished loading. Boxed because it is much larger than
+    /// every other variant and they all pay for the biggest one.
+    Details(Box<modifile_core::source::Details>),
+    DetailsFailed(String),
+    /// A newer Modifile exists. `None` means the check came back clean.
+    UpdateFound(Box<Option<modifile_core::selfupdate::Available>>),
+    /// An update finished installing.
+    UpdateInstalled(String, usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,11 +169,43 @@ impl SyncOutcome {
     }
 }
 
+/// Which page the central panel is showing.
+///
+/// The shape follows the way people actually move through this: pick a game,
+/// then do something with it. `Games` is the front door, `Game` is a game's
+/// own page, and the rest are places you get to from there.
 #[derive(PartialEq, Clone, Copy)]
 enum View {
-    Profile,
+    /// The "choose a game" grid.
     Games,
+    /// One game's page, on one of its tabs.
+    Game(GameTab),
+    /// The selected profile, with everything you can do to it.
+    Profile,
+    /// A page about one mod or modpack.
+    Detail,
+    /// Every game's folders at once, and the state of the bundled packs.
+    /// Reached from Settings; the common case is the per-game card instead.
+    Folders,
     Settings,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum GameTab {
+    Profiles,
+    Mods,
+    Packs,
+}
+
+/// The page about one mod, and whatever we have managed to load of it.
+struct DetailState {
+    id: ModId,
+    loading: bool,
+    details: Option<modifile_core::source::Details>,
+    error: Option<String>,
+    /// The tab this page was opened from, so Back returns there rather than
+    /// always to the mod list.
+    from: GameTab,
 }
 
 struct ModRow {
@@ -172,6 +246,29 @@ struct Picker {
     loading: bool,
 }
 
+/// The open settings editor.
+///
+/// Holds both the edited text and the text as it was read, so "has this
+/// changed?" is answered by comparing them rather than by a dirty flag that
+/// can drift out of step with what is on screen.
+struct ConfigEditor {
+    target: String,
+    rel: PathBuf,
+    text: String,
+    original: String,
+    /// Narrows the file list. A modpack's config folder runs to hundreds of
+    /// files, which is unusable as a flat list.
+    filter: String,
+    /// What happened to the last save or open, shown in the window.
+    note: Option<(String, egui::Color32)>,
+}
+
+impl ConfigEditor {
+    fn changed(&self) -> bool {
+        self.text != self.original
+    }
+}
+
 struct TargetRow {
     target: Target,
     root: Option<PathBuf>,
@@ -186,12 +283,51 @@ struct TargetRow {
 
 /// A profile as the sidebar needs it: which game it belongs to, and whether its
 /// mods are currently in that game.
+/// What the game pages need to know about one game.
+///
+/// Cached rather than recomputed per frame, and not as an optimisation you
+/// could skip: working it out means probing Steam libraries and stat-ing
+/// candidate directories for every installed game, and `Engine::running`
+/// enumerates every process on the machine. Doing that sixty times a second
+/// makes the window stutter and the fans spin. It is refreshed when something
+/// could actually have changed it.
+#[derive(Clone)]
+struct GameInfo {
+    id: String,
+    name: String,
+    description: String,
+    icon: Option<String>,
+    banner: Option<String>,
+    /// target, its root if known, and whether that root was chosen by hand.
+    targets: Vec<(Target, Option<PathBuf>, bool)>,
+    /// How Play would start this game, already described.
+    launch_how: Option<String>,
+    /// The game is running right now, and why we think so.
+    running: Option<String>,
+    /// This game can be pointed at a profile's own directory, so Play exists
+    /// for it. When false there is no Play button, and the page says why.
+    instanced: bool,
+    /// This game's pack says where to look for modpacks.
+    has_modpacks: bool,
+}
+
+impl GameInfo {
+    fn found(&self) -> bool {
+        self.targets.iter().any(|(_, root, _)| root.is_some())
+    }
+}
+
 #[derive(Clone)]
 struct ProfileEntry {
+    id: ProfileId,
     name: String,
     game_name: String,
+    /// The pack id, for grouping a game's profiles onto its own page.
+    game_id: String,
     active: bool,
     mods: usize,
+    loader: Option<String>,
+    game_version: Option<String>,
 }
 
 struct App {
@@ -201,14 +337,45 @@ struct App {
 
     view: View,
     profiles: Vec<ProfileEntry>,
-    selected: Option<String>,
+    /// One entry per installed game pack. See `GameInfo` for why it is cached.
+    games: Vec<GameInfo>,
+    /// Total size of the download store, for the status bar.
+    ///
+    /// Cached because measuring it walks every file in the store. It changes
+    /// when something is downloaded or cleaned up, which is exactly when the
+    /// rest of the state is refreshed anyway.
+    store_bytes: u64,
+    /// Bytes of cached artwork on disk, for Settings. Same reasoning.
+    art_bytes: u64,
+    /// The selected profile, identified by game and name — because two games
+    /// may each have a `main` and the name alone no longer says which.
+    selected: Option<ProfileId>,
+    /// The game whose page we are on. Distinct from the selected profile: you
+    /// can be looking at a game with no profile chosen.
+    game: Option<String>,
+    /// Mod icons, screenshots and game art.
+    art: art::Art,
+    /// The mod page, when one is open.
+    detail: Option<DetailState>,
+    /// A newer Modifile, once the startup check has found one.
+    update: Option<modifile_core::selfupdate::Available>,
+    /// An update is downloading or installing right now.
+    updating: bool,
+    /// Set once an update has been installed, so the banner says to restart
+    /// rather than offering the same update again.
+    update_installed: Option<String>,
+    /// The startup check happens once per run, not once per frame.
+    update_checked: bool,
 
     profile: Option<Profile>,
     lock: Lock,
     targets: Vec<TargetRow>,
     rows: Vec<ModRow>,
-    /// Config files this profile is keeping, across all its targets.
-    config_files: Vec<PathBuf>,
+    /// Config files this profile is keeping: the target each belongs to, and
+    /// its display path within that target's settings folders. The target is
+    /// carried along because a client and a server can hold files of the same
+    /// name, and the editor has to write back to the right one.
+    config_files: Vec<(String, PathBuf)>,
     /// Config files sitting in the game folder right now. Shown when the
     /// profile has none saved yet, so an empty panel is not mistaken for an
     /// empty game folder.
@@ -274,6 +441,11 @@ struct App {
     new_profile_name: String,
     new_profile_game: String,
     show_new_profile: bool,
+    /// A pasted modpack link, and whether its window is open.
+    modpack_input: String,
+    show_modpack_link: bool,
+    /// The settings editor, when one is open.
+    config_editor: Option<ConfigEditor>,
 
     log: Arc<Mutex<Vec<String>>>,
     /// The log is a detail view, closed unless asked for.
@@ -301,13 +473,42 @@ impl App {
         let token = load_token(&paths);
         // `paths` is moved into the struct below, so read settings off it first.
         let paths_probe = paths.clone();
+
+        // Artwork gets its own keyless client: it talks to CDNs, never to an
+        // API, and has no business carrying anybody's token.
+        let art = art::Art::new(
+            paths_probe.cache.clone(),
+            tx.clone(),
+            runtime.handle().clone(),
+            modifile_core::http::Http::new(paths_probe.http_cache(), None)
+                .expect("http client"),
+            !paths_probe.no_artwork_file().exists(),
+        );
+
+        let engine = Engine::open(paths.clone(), token.clone()).ok();
+        // Sweep up a binary an earlier update parked aside. It could not be
+        // deleted then, because it was the program doing the updating.
+        if let Some(engine) = &engine {
+            engine.tidy_after_update();
+        }
+
         let mut app = Self {
-            engine: Engine::open(paths.clone(), token.clone()).ok(),
+            engine,
             paths,
             runtime,
-            view: View::Profile,
+            view: View::Games,
             profiles: Vec::new(),
+            games: Vec::new(),
+            store_bytes: 0,
+            art_bytes: 0,
             selected: None,
+            game: None,
+            art,
+            detail: None,
+            update: None,
+            updating: false,
+            update_installed: None,
+            update_checked: false,
             profile: None,
             lock: Lock::default(),
             targets: Vec::new(),
@@ -353,6 +554,9 @@ impl App {
             new_profile_name: String::new(),
             new_profile_game: String::new(),
             show_new_profile: false,
+            modpack_input: String::new(),
+            show_modpack_link: false,
+            config_editor: None,
             log: Arc::new(Mutex::new(Vec::new())),
             log_open: false,
             busy: false,
@@ -361,7 +565,7 @@ impl App {
         };
         app.reload_profiles();
         if let Some(first) = app.profiles.first().cloned() {
-            app.select(&first.name);
+            app.select(&first.id);
         }
         app
     }
@@ -377,13 +581,14 @@ impl App {
         let mut active_by_game: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        if let Ok(entries) = std::fs::read_dir(&self.paths.profiles) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                    continue;
-                }
-                let Ok(profile) = Profile::load(&path) else {
+        // Profiles live one directory per game now, so the engine walks them.
+        let ids = self
+            .engine()
+            .map(Engine::all_profiles)
+            .unwrap_or_default();
+        {
+            for id in ids {
+                let Ok(profile) = Profile::load(&self.paths.profile_file(&id)) else {
                     continue;
                 };
                 let game_name = self
@@ -402,10 +607,14 @@ impl App {
                 };
 
                 found.push(ProfileEntry {
+                    id: profile.id(),
                     name: profile.name.clone(),
                     game_name,
+                    game_id: profile.game.clone(),
                     active,
                     mods: profile.mods.iter().filter(|m| m.enabled).count(),
+                    loader: profile.loader.clone(),
+                    game_version: profile.game_version.clone(),
                 });
             }
         }
@@ -416,6 +625,92 @@ impl App {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         self.profiles = found;
+        self.reload_games();
+        self.refresh_sizes();
+    }
+
+    /// Re-measure the download store and the artwork cache.
+    ///
+    /// Both mean walking a directory tree — 12ms for a 1 GB store, warm — so
+    /// they are measured when something could have changed them rather than
+    /// while drawing. Doing this per frame was most of a frame's budget spent
+    /// on two numbers that move a few times an hour.
+    fn refresh_sizes(&mut self) {
+        self.store_bytes = self
+            .engine()
+            .map(|e| e.store.size_bytes())
+            .unwrap_or_default();
+        self.art_bytes = self.art.disk_bytes();
+    }
+
+    /// Rebuild the per-game cache.
+    ///
+    /// Everything here touches the filesystem or the process list, which is
+    /// why it happens on demand rather than while drawing.
+    fn reload_games(&mut self) {
+        let Some(engine) = self.engine() else {
+            self.games.clear();
+            return;
+        };
+
+        let mut games = Vec::new();
+        for pack in &engine.packs {
+            let targets: Vec<(Target, Option<PathBuf>, bool)> = pack
+                .pack
+                .targets
+                .iter()
+                .map(|t| {
+                    let remembered = engine
+                        .roots
+                        .get(pack.id(), &t.id)
+                        .filter(|p| p.is_dir())
+                        .cloned();
+                    let root = remembered
+                        .clone()
+                        .or_else(|| pack.detect(t).into_iter().next());
+                    (t.clone(), root, remembered.is_some())
+                })
+                .collect();
+
+            let launch_how = targets
+                .iter()
+                .find(|(_, root, _)| root.is_some())
+                .and_then(|(target, root, _)| {
+                    engine.launch_method(pack, target, root.as_ref()?)
+                })
+                .map(|m| m.describe());
+
+            let running = targets.iter().find_map(|(target, root, _)| {
+                let root = root.as_ref()?;
+                // Skip a folder on another machine: we cannot see its
+                // processes, and saying "not running" would be a guess.
+                if modifile_core::paths::is_network_path(root) {
+                    return None;
+                }
+                Engine::running(target, root).map(|r| r.to_string())
+            });
+
+            let rules = &pack.pack.search;
+            games.push(GameInfo {
+                id: pack.id().to_string(),
+                name: pack.pack.game.name.clone(),
+                description: pack.pack.game.description.clone(),
+                icon: pack.icon_url(),
+                banner: pack.banner_url(),
+                targets,
+                launch_how,
+                running,
+                instanced: pack.instancing().is_some(),
+                has_modpacks: rules.modrinth
+                    || rules.curseforge_modpack_class_id.is_some()
+                    || rules.thunderstore_community.is_some(),
+            });
+        }
+        self.games = games;
+    }
+
+    fn game_info(&self, id: &str) -> Option<&GameInfo> {
+        self.games.iter().find(|g| g.id == id)
     }
 
     fn is_active(&self, name: &str) -> bool {
@@ -424,13 +719,47 @@ impl App {
             .any(|p| p.name == name && p.active)
     }
 
-    fn select(&mut self, name: &str) {
+    /// Stop having a profile selected.
+    ///
+    /// The selection drives every action, so it must never outlive the page it
+    /// belongs to.
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.profile = None;
+        self.rows.clear();
+        self.targets.clear();
+        self.config_files.clear();
+        self.scans.clear();
+        self.last_sync.clear();
+        self.leftovers = 0;
+        self.lock = Lock::default();
+    }
+
+    /// The selected profile, but only when it belongs to the game on screen.
+    ///
+    /// Every action that changes something goes through this. Acting on a
+    /// profile from a game the user is not looking at is how "check for
+    /// updates" on Valheim once downloaded a R.E.P.O. modpack, and a stale
+    /// selection is easy to reintroduce by accident.
+    fn current_profile(&self) -> Option<Profile> {
+        let profile = self.profile.clone()?;
+        match &self.game {
+            Some(game) if *game != profile.game => None,
+            _ => Some(profile),
+        }
+    }
+
+    fn select(&mut self, id: &ProfileId) {
         // Captured before reassigning, otherwise the comparison below is always
         // false and a stale update summary follows you to the next profile.
-        let switching_profile = self.selected.as_deref() != Some(name);
+        let switching_profile = self.selected.as_ref() != Some(id);
 
-        self.selected = Some(name.to_string());
-        self.view = View::Profile;
+        self.selected = Some(id.clone());
+        // Selecting a profile puts you on its game, so the rail and the
+        // breadcrumb agree with the page. Deliberately not a view change:
+        // callers decide where to land, because some of them are only
+        // choosing which profile the current page is about.
+        self.game = Some(id.game.clone());
         self.rows.clear();
         self.targets.clear();
         self.config_files.clear();
@@ -446,11 +775,11 @@ impl App {
         }
         self.lock = Lock::default();
 
-        let Ok(profile) = Profile::load(&self.paths.profile_file(name)) else {
+        let Ok(profile) = Profile::load(&self.paths.profile_file(id)) else {
             self.profile = None;
             return;
         };
-        self.lock = Lock::load(&self.paths.lock_file(name)).unwrap_or_default();
+        self.lock = Lock::load(&self.paths.lock_file(id)).unwrap_or_default();
 
         let mut targets = Vec::new();
         let mut configs = Vec::new();
@@ -466,7 +795,12 @@ impl App {
                     }
                 }
                 for (target, root) in engine.targets(pack, &profile) {
-                    configs.extend(engine.saved_configs(pack, name, &target));
+                    configs.extend(
+                        engine
+                            .saved_configs(pack, id, &target)
+                            .into_iter()
+                            .map(|rel| (target.id.clone(), rel)),
+                    );
                     if let Some(root) = &root {
                         for (_, dir) in pack.state_dirs(&target, root) {
                             live_configs += modifile_core::state::list_files(&dir).len();
@@ -595,8 +929,8 @@ impl App {
     /// files as foreign.
     fn is_active_selection(&self) -> bool {
         self.selected
-            .as_deref()
-            .map(|name| self.is_active(name))
+            .as_ref()
+            .map(|id| self.is_active(&id.name))
             .unwrap_or(false)
     }
 
@@ -628,7 +962,7 @@ impl App {
     // --- actions ----------------------------------------------------------
 
     fn do_sync(&mut self, ctx: &egui::Context) {
-        let Some(profile) = self.profile.clone() else {
+        let Some(profile) = self.current_profile() else {
             return;
         };
         let paths = self.paths.clone();
@@ -658,7 +992,7 @@ impl App {
                     engine.policy.minimum = modifile_core::TrustLevel::Blocked;
                 }
                 let pack = engine.pack_for(&profile)?;
-                let lock_path = paths.lock_file(&profile.name);
+                let lock_path = paths.lock_file(&profile.id());
                 let previous = Lock::load(&lock_path)?;
 
                 // Update notices arrive as events during the run, so collect
@@ -801,7 +1135,16 @@ impl App {
     }
 
     fn do_deploy(&mut self, force: bool) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        self.deploy_into(force, false);
+    }
+
+    /// Install this profile, either into the game folder (Activate) or into
+    /// the profile's own tree (Play).
+    ///
+    /// The two are different destinations for the same files, so they are one
+    /// function with a switch rather than two that drift apart.
+    fn deploy_into(&mut self, force: bool, instanced: bool) {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -820,14 +1163,18 @@ impl App {
                 ));
                 continue;
             };
-            match engine
-                .plan(pack, &profile, &lock, &row.target, root)
+            let planned = if instanced {
+                engine.plan_instanced(pack, &profile, &lock, &row.target, root)
+            } else {
+                engine.plan(pack, &profile, &lock, &row.target, root)
+            };
+            match planned
                 .and_then(|plan| {
                     let report = engine.deploy(
                         pack,
                         &row.target,
                         &plan,
-                        &profile.name,
+                        &profile.id(),
                         modifile_core::engine::DeployOptions {
                             force,
                             assume_stopped: self.assume_stopped,
@@ -911,7 +1258,7 @@ impl App {
     }
 
     fn do_verify(&mut self) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -951,7 +1298,7 @@ impl App {
     /// `force` also deletes installed files that have since changed — a build
     /// dropped in by hand, or one a game update overwrote.
     fn undeploy_with(&mut self, force: bool) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -1003,7 +1350,7 @@ impl App {
 
     /// Search whichever index this game's pack nominates.
     fn do_search(&mut self, ctx: &egui::Context) {
-        let (Some(profile), query) = (self.profile.clone(), self.search_input.trim().to_string())
+        let (Some(profile), query) = (self.current_profile(), self.search_input.trim().to_string())
         else {
             return;
         };
@@ -1040,21 +1387,429 @@ impl App {
         });
     }
 
+    /// Look for a newer Modifile.
+    ///
+    /// One conditional request, on a worker thread, and silent when it finds
+    /// nothing — an update check that announces "you are up to date" on every
+    /// launch is noise.
+    fn do_check_update(&mut self, ctx: &egui::Context) {
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let found = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+                engine.check_for_update().await
+            });
+            // A failed check is not worth interrupting anyone over: no network,
+            // a rate limit, a repository that moved. The app works regardless.
+            let _ = tx.send(Msg::UpdateFound(Box::new(found.unwrap_or(None))));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Download, verify and install the update that was found.
+    fn do_install_update(&mut self, ctx: &egui::Context) {
+        let Some(available) = self.update.clone() else {
+            return;
+        };
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        let log = self.log.clone();
+        self.updating = true;
+        self.log_line(format!(
+            "Downloading Modifile {} ({})…",
+            available.version,
+            format_bytes(available.size())
+        ));
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let version = available.version.clone();
+            let result = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+                engine.install_update(&available).await
+            });
+            match result {
+                Ok(report) => {
+                    let _ = tx.send(Msg::UpdateInstalled(version, report.left_behind));
+                }
+                Err(e) => {
+                    if let Ok(mut log) = log.lock() {
+                        log.push(format!("Update failed: {e}"));
+                        log.push(
+                            "  Nothing was changed — the copy you are running is intact."
+                                .to_string(),
+                        );
+                    }
+                    let _ = tx.send(Msg::Error(format!("update failed: {e}")));
+                    let _ = tx.send(Msg::UpdateInstalled(String::new(), 0));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// A strip across the top when a newer Modifile exists.
+    ///
+    /// Above everything, because it is about the program rather than about any
+    /// one profile, and because a friend who never opens Settings should still
+    /// find out that a fix exists.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let installed = self.update_installed.clone();
+        let available = self.update.clone();
+        if installed.is_none() && available.is_none() {
+            return;
+        }
+
+        let mut install = false;
+        let mut dismiss = false;
+
+        egui::Panel::top("update")
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::ACCENT_DIM)
+                    .inner_margin(egui::Margin::symmetric(14, 7)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(version) = &installed {
+                        ui.label(
+                            egui::RichText::new(format!("Updated to Modifile {version}"))
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("— restart to use it.").color(theme::TEXT),
+                        );
+                        return;
+                    }
+
+                    let Some(update) = &available else { return };
+                    ui.label(
+                        egui::RichText::new(format!("Modifile {} is available", update.version))
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "— you have {}.",
+                            modifile_core::selfupdate::current_version()
+                        ))
+                        .color(theme::TEXT),
+                    );
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Not now").clicked() {
+                                dismiss = true;
+                            }
+                            ui.hyperlink_to(
+                                egui::RichText::new("What's new").small(),
+                                &update.web_url,
+                            );
+                            if self.updating {
+                                ui.add(egui::Spinner::new());
+                                ui.label(egui::RichText::new("installing…").small());
+                            } else if ui
+                                .button("Update now")
+                                .on_hover_text(format!(
+                                    "Downloads {} ({}), checks it against the digest \
+                                     GitHub publishes for it, and replaces the binaries \
+                                     in place. Your profiles, mods and settings are not \
+                                     touched. If anything fails, the copy you are running \
+                                     is left exactly as it is.",
+                                    update.asset.name,
+                                    format_bytes(update.size())
+                                ))
+                                .clicked()
+                            {
+                                install = true;
+                            }
+                        },
+                    );
+                });
+            });
+
+        if install {
+            let ctx = ui.ctx().clone();
+            self.do_install_update(&ctx);
+        }
+        if dismiss {
+            // For this run only. It is offered again next launch, because a
+            // dismissal is "not now", not "never".
+            self.update = None;
+        }
+    }
+
+    /// Whether anything knows how to start the selected profile's game.
+    fn launch_ready(&self) -> bool {
+        let Some(profile) = self.profile.as_ref() else {
+            return false;
+        };
+        let Some(engine) = self.engine() else {
+            return false;
+        };
+        let Ok(pack) = engine.pack_for(profile) else {
+            return false;
+        };
+        engine
+            .targets(pack, profile)
+            .iter()
+            .any(|(target, root)| {
+                root.as_ref()
+                    .is_some_and(|r| engine.launch_method(pack, target, r).is_some())
+            })
+    }
+
+    /// What Play will actually do, spelled out before it does it.
+    fn play_hover(&self, active: bool) -> String {
+        let revert = self
+            .profile
+            .as_ref()
+            .map(|p| p.revert_on_exit)
+            .unwrap_or(false);
+
+        let mut text = if active {
+            "Start the game with this profile.".to_string()
+        } else {
+            "Put these mods in the game folder, then start the game.".to_string()
+        };
+        text.push_str(if revert {
+            "\n\nModifile will wait for the game to close and then put it back to \
+             vanilla. Closing Modifile during that just leaves the mods installed."
+        } else {
+            "\n\nNothing stays running afterwards — this is Activate plus a shortcut. \
+             Turn on \"return to vanilla when I quit\" below to have it undo itself."
+        });
+        text
+    }
+
+    /// Activate if needed, then start the game.
+    ///
+    /// Deliberately one press rather than two: someone who wanted to activate
+    /// without playing already has the Activate button, and someone pressing
+    /// Play on an inactive profile plainly means "make this the one that runs".
+    fn do_play(&mut self, _ctx: &egui::Context) {
+        let Some(profile) = self.current_profile() else {
+            return;
+        };
+
+        // Activate first if this profile is not the one in the folder. Doing
+        // it here rather than inside `play` keeps the engine honest: it refuses
+        // to launch an inactive profile, and this is the UI choosing to fix
+        // that rather than the engine quietly tolerating it.
+        // Play installs into the profile's own tree, not the game folder, so
+        // this runs whether or not the profile is already activated: being
+        // active means the files are in the game folder, which is not where
+        // the game is about to be told to look.
+        self.deploy_into(false, true);
+        if !self.is_active_selection() {
+            // The deploy reported why; do not start an unmodded game on top
+            // of that.
+            return;
+        }
+
+        let Some(engine) = self.engine() else { return };
+        let Ok(pack) = engine.pack_for(&profile) else {
+            return;
+        };
+        let targets = engine.targets(pack, &profile);
+        let Some((target, root)) = targets
+            .iter()
+            .filter(|(_, root)| root.is_some())
+            .find(|(t, _)| t.kind == modifile_core::TargetKind::Client)
+            .or_else(|| targets.iter().find(|(_, root)| root.is_some()))
+            .map(|(t, root)| (t.clone(), root.clone().unwrap()))
+        else {
+            self.log_line("No game directory is known for this profile.");
+            return;
+        };
+
+        let game_name = pack.pack.game.name.clone();
+        let method = match engine.play(pack, &profile, &target, &root) {
+            Ok(method) => method,
+            Err(e) => {
+                self.log_line(e.to_string());
+                return;
+            }
+        };
+        self.log_line(format!("Starting {} — {}.", target.name, method.describe()));
+
+        self.log_line(format!(
+            "  `{}` has its own folder and {} was pointed at it for this run.",
+            profile.name, game_name
+        ));
+        self.log_line(
+            "  Your game install was not modified, so there is nothing to undo when you              quit — and nothing to lose if the machine loses power mid-session.",
+        );
+    }
+
+    /// Update every profile of every game.
+    ///
+    /// Deliberate and explicit, on the all-games page. Ordinary Check for
+    /// updates does one profile and must keep doing one profile: an update
+    /// that quietly reached into other games is how someone updating Valheim
+    /// ended up downloading a R.E.P.O. modpack.
+    fn do_sync_all(&mut self, ctx: &egui::Context) {
+        let ids = self
+            .engine()
+            .map(Engine::all_profiles)
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return;
+        }
+
+        let paths = self.paths.clone();
+        let log = self.log.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        let allow_no_source = self.allow_no_source;
+        self.busy = true;
+        self.log_open = true;
+        self.log_line(format!(
+            "Updating {} profile(s) across every game…",
+            ids.len()
+        ));
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let push = {
+                let log = log.clone();
+                let ctx = ctx.clone();
+                move |line: String| {
+                    if let Ok(mut log) = log.lock() {
+                        log.push(line);
+                    }
+                    ctx.request_repaint();
+                }
+            };
+
+            handle.block_on(async {
+                for id in &ids {
+                    push(format!("── {id}"));
+                    let result = async {
+                        let mut engine = Engine::open(paths.clone(), load_token(&paths))?;
+                        if allow_no_source {
+                            engine.policy.minimum = modifile_core::TrustLevel::Blocked;
+                        }
+                        let profile =
+                            Profile::load(&paths.profile_file(id))?;
+                        let pack = engine.pack_for(&profile)?;
+                        let lock_path = paths.lock_file(id);
+                        let previous = Lock::load(&lock_path)?;
+                        let (lock, issues) =
+                            engine.sync(pack, &profile, &previous, None).await?;
+                        lock.save(&lock_path)?;
+                        Ok::<_, modifile_core::Error>((lock.mods.len(), issues.len()))
+                    }
+                    .await;
+
+                    match result {
+                        Ok((ready, issues)) => push(format!(
+                            "   {ready} mod(s) ready{}",
+                            match issues {
+                                0 => String::new(),
+                                n => format!(", {n} not taken"),
+                            }
+                        )),
+                        // One profile failing must not stop the rest: not
+                        // having to babysit it is the point of asking for all
+                        // of them.
+                        Err(e) => push(format!("   failed: {e}")),
+                    }
+                }
+            });
+
+            push("Done. Activate whichever profiles you want in the game.".into());
+            let _ = tx.send(Msg::Done);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Search a game's indexes from the browse tabs.
+    ///
+    /// Unlike `do_search` this is not tied to a profile: browsing a game is
+    /// something you can do before deciding which profile the result belongs
+    /// in. When a profile *is* selected its game version and loader narrow the
+    /// results, because a mod that cannot run there is not a useful answer.
+    fn do_browse(&mut self, ctx: &egui::Context, game: String, packs: bool) {
+        let query = self.search_input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let filter = self
+            .profile
+            .as_ref()
+            .filter(|p| p.game == game)
+            .map(|p| modifile_core::source::modrinth::VersionFilter {
+                game_version: p.game_version.clone(),
+                loader: p.loader.clone(),
+            })
+            .unwrap_or_default();
+
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        self.searching = true;
+        self.search_results.clear();
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let result = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+                let pack = engine
+                    .pack(&game)
+                    .ok_or_else(|| modifile_core::Error::NotFound(game.clone()))?;
+                if packs {
+                    engine.search_modpacks(pack, &query).await
+                } else {
+                    engine.search(pack, &query, &filter, true).await
+                }
+            });
+            match result {
+                Ok(hits) => {
+                    let _ = tx.send(Msg::Found(hits));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e.to_string()));
+                    let _ = tx.send(Msg::Found(Vec::new()));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
     /// Add a mod straight from a search result.
     fn add_id(&mut self, id: &ModId) {
+        // Browsing happens on a game's page, where no profile need be selected
+        // — so this is a normal thing to hit, not an impossible one. Returning
+        // in silence made Add look broken.
         let Some(name) = self.selected.clone() else {
+            self.log_line(format!(
+                "Nothing to add {id} to yet — this game has no profile selected. \
+                 Make one on the My profiles tab, then add mods to it."
+            ));
+            self.log_open = true;
             return;
         };
         let path = self.paths.profile_file(&name);
-        if let Ok(mut profile) = Profile::load(&path) {
-            if profile.add(ModEntry::new(id.clone())) {
-                let _ = profile.save(&path);
-                self.log_line(format!(
-                    "Added {id}. Press Check for updates to download it."
-                ));
-            } else {
-                self.log_line(format!("{id} is already in this profile."));
+        match Profile::load(&path) {
+            Ok(mut profile) => {
+                if profile.add(ModEntry::new(id.clone())) {
+                    match profile.save(&path) {
+                        Ok(()) => self.log_line(format!(
+                            "Added {id} to `{name}`. Press Check for updates to download it."
+                        )),
+                        Err(e) => self.log_line(format!("Could not save `{name}`: {e}")),
+                    }
+                } else {
+                    self.log_line(format!("{id} is already in `{name}`."));
+                }
             }
+            Err(e) => self.log_line(format!("Could not open `{name}`: {e}")),
         }
         self.refresh();
     }
@@ -1428,9 +2183,14 @@ impl App {
             self.log_line("A profile needs a name and a game.");
             return;
         }
-        let path = self.paths.profile_file(&name);
+        // Only within this game: another game may already have a profile with
+        // this name, and that is fine.
+        let id = ProfileId::new(&game, &name);
+        let path = self.paths.profile_file(&id);
         if path.exists() {
-            self.log_line(format!("Profile `{name}` already exists."));
+            self.log_line(format!(
+                "This game already has a profile called `{name}`."
+            ));
             return;
         }
         if let Err(e) = Profile::new(&name, &game).save(&path) {
@@ -1440,7 +2200,8 @@ impl App {
         self.show_new_profile = false;
         self.new_profile_name.clear();
         self.reload_profiles();
-        self.select(&name);
+        self.select(&id);
+        self.view = View::Profile;
         self.log_line(format!(
             "Created `{name}`. Add mods below, then press Check for updates."
         ));
@@ -1458,15 +2219,15 @@ impl App {
     }
 
     fn open_rename(&mut self) {
-        if let Some(name) = self.selected.clone() {
-            self.rename_input = name;
+        if let Some(id) = self.selected.clone() {
+            self.rename_input = id.name;
             self.show_rename = true;
         }
     }
 
     /// Open the version picker and go fetch that mod's releases.
     fn open_picker(&mut self, id: &ModId) {
-        let Some(profile) = self.profile.clone() else {
+        let Some(profile) = self.current_profile() else {
             return;
         };
         let entry = profile.find(id);
@@ -1537,9 +2298,10 @@ impl App {
     /// Delete the selected profile, taking its mods out of the game first if
     /// they are in there.
     fn do_delete_profile(&mut self) {
-        let Some(name) = self.selected.clone() else {
+        let Some(id) = self.selected.clone() else {
             return;
         };
+        let name = id.name.clone();
         if self.is_active(&name) {
             self.log_line(format!("Taking {name} out of the game folder first…"));
             self.do_undeploy();
@@ -1559,7 +2321,7 @@ impl App {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        match engine.delete_profile(&name) {
+        match engine.delete_profile(&id) {
             Ok(()) => {
                 self.log_line(format!(
                     "Deleted `{name}`. Its downloads are still in the store, shared with your \
@@ -1573,10 +2335,16 @@ impl App {
                 self.show_delete = false;
                 self.delete_input.clear();
                 self.reload_profiles();
-                // Land somewhere real rather than on a blank panel.
-                if let Some(next) = self.profiles.first().map(|p| p.name.clone()) {
-                    self.select(&next);
-                }
+                // Land somewhere real rather than on a blank panel. The game's
+                // own page is the honest answer: the profile that was being
+                // looked at no longer exists, and picking an unrelated one
+                // pretends otherwise.
+                self.selected = None;
+                self.profile = None;
+                self.view = match self.game.clone() {
+                    Some(_) => View::Game(GameTab::Profiles),
+                    None => View::Games,
+                };
             }
             Err(e) => self.log_line(e.to_string()),
         }
@@ -1587,17 +2355,17 @@ impl App {
         else {
             return;
         };
-        if to.is_empty() || to == from {
+        if to.is_empty() || to == from.name {
             self.show_rename = false;
             return;
         }
         let Some(engine) = self.engine() else { return };
         match engine.rename_profile(&from, &to) {
-            Ok(name) => {
-                self.log_line(format!("`{from}` is now `{name}`."));
+            Ok(renamed) => {
+                self.log_line(format!("`{}` is now `{}`.", from.name, renamed.name));
                 self.show_rename = false;
                 self.reload_profiles();
-                self.select(&name);
+                self.select(&renamed);
             }
             Err(e) => self.log_line(e.to_string()),
         }
@@ -1605,7 +2373,7 @@ impl App {
 
     /// Write this profile to a file the user can send to a friend.
     fn do_export_bundle(&mut self, include_configs: bool) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -1664,6 +2432,7 @@ impl App {
             }
         };
         let Some(engine) = self.engine() else { return };
+        let game = bundle.game.clone();
         match engine.import_profile(&bundle, None, pin_versions) {
             Ok(name) => {
                 self.log_line(format!(
@@ -1693,10 +2462,110 @@ impl App {
                     self.log_line("  Press Check for updates to download them, then Activate.");
                 }
                 self.reload_profiles();
-                self.select(&name);
+                self.select(&ProfileId::new(&game, &name));
+                self.view = View::Profile;
             }
             Err(e) => self.log_line(e.to_string()),
         }
+    }
+
+    /// Import a modpack as a profile.
+    ///
+    /// Runs on a background thread because it is a download and a few hundred
+    /// API lookups, not a file read — the whole window would otherwise freeze
+    /// for the length of it.
+    fn do_import_modpack(&mut self, source: modifile_core::engine::ModpackSource, ctx: &egui::Context) {
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        let log = self.log.clone();
+        self.busy = true;
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let push = {
+                let log = log.clone();
+                let ctx = ctx.clone();
+                move |line: String| {
+                    if let Ok(mut log) = log.lock() {
+                        log.push(line);
+                    }
+                    ctx.request_repaint();
+                }
+            };
+            let reporter: modifile_core::engine::Reporter = {
+                let push = push.clone();
+                Arc::new(move |event: Event| {
+                    if let Event::Pack { stage, detail } = event {
+                        push(format!("{stage} {detail}"));
+                    }
+                })
+            };
+
+            let result = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+                engine.import_modpack(source, None, None, Some(reporter)).await
+            });
+
+            match result {
+                Ok(report) => {
+                    push(format!(
+                        "Imported `{}` from {} ({}) — {} mod(s){}{}.",
+                        report.profile,
+                        report.pack,
+                        report.format,
+                        report.mods,
+                        if report.untraced > 0 {
+                            format!(", {} file(s) held by hash", report.untraced)
+                        } else {
+                            String::new()
+                        },
+                        if report.overrides > 0 {
+                            format!(", {} pack file(s)", report.overrides)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                    if let Some(trust) = &report.trust {
+                        push(format!(
+                            "  The pack's own files are {} — {}",
+                            trust.level.label(),
+                            trust.level.explain()
+                        ));
+                    }
+                    for note in &report.notes {
+                        push(format!("  note: {note}"));
+                    }
+                    for (name, why) in &report.skipped {
+                        push(format!("  not taken — {name}: {why}"));
+                    }
+                    push("  Press Check for updates to download the mods, then Activate.".into());
+                    let _ = tx.send(Msg::Imported(ProfileId::new(
+                        report.game.clone(),
+                        report.profile.clone(),
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn pick_modpack_file(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open a modpack")
+            .add_filter("Modpack", &["mrpack", "zip"])
+            .pick_file()
+        else {
+            self.log_line(
+                "No file chosen. If the dialog did not open, use the CLI: \
+                 modifile pack add <file>",
+            );
+            return;
+        };
+        self.do_import_modpack(modifile_core::engine::ModpackSource::Path(path), ctx);
     }
 
     fn run_gc(&mut self) {
@@ -1829,6 +2698,18 @@ fn markers_hint(target: &Target) -> String {
     }
 }
 
+/// Open a URL in the user's browser.
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 /// Show a folder in the system file manager.
 fn reveal(path: &Path) {
     let _ = if cfg!(windows) {
@@ -1861,6 +2742,56 @@ impl eframe::App for App {
                     self.busy = false;
                     self.refresh();
                 }
+                Msg::Imported(id) => {
+                    self.busy = false;
+                    self.reload_profiles();
+                    self.select(&id);
+                    self.view = View::Profile;
+                }
+                Msg::Art(loaded) => {
+                    let ctx = ui.ctx().clone();
+                    self.art.accept(&ctx, *loaded);
+                }
+                Msg::Details(details) => {
+                    // The page may have been closed while this was in flight.
+                    // The id is not checked, because a source is entitled to
+                    // answer with its canonical id where we asked by slug.
+                    if let Some(state) = self.detail.as_mut() {
+                        state.details = Some(*details);
+                        state.loading = false;
+                    }
+                }
+                Msg::DetailsFailed(error) => {
+                    if let Some(state) = self.detail.as_mut() {
+                        state.error = Some(error);
+                        state.loading = false;
+                    }
+                }
+                Msg::UpdateFound(found) => {
+                    self.update = *found;
+                    // Automatic installs are opt-in, and this is the moment
+                    // they happen: found, verified, and the user already said
+                    // yes to this in advance.
+                    let auto = self.engine().is_some_and(Engine::auto_updates);
+                    if auto && self.update.is_some() && !self.updating {
+                        let ctx = ui.ctx().clone();
+                        self.do_install_update(&ctx);
+                    }
+                }
+                Msg::UpdateInstalled(version, left) => {
+                    self.updating = false;
+                    self.update = None;
+                    self.update_installed = Some(version.clone());
+                    self.log_line(format!(
+                        "Updated to Modifile {version}. Restart to use it."
+                    ));
+                    if left > 0 {
+                        self.log_line(
+                            "  The previous binary is still running and will be cleared \
+                             on the next launch.",
+                        );
+                    }
+                }
                 Msg::Repaired => {
                     self.busy = false;
                     self.refresh();
@@ -1890,9 +2821,23 @@ impl eframe::App for App {
             }
         }
 
+        // One conditional request, once per run, after the window is up so it
+        // never delays the first frame.
+        if !self.update_checked {
+            self.update_checked = true;
+            if self.engine().is_some_and(Engine::checks_for_updates) {
+                let ctx = ui.ctx().clone();
+                self.do_check_update(&ctx);
+            }
+        }
+
+        // Above the rail: this is about Modifile itself, not about a game.
+        self.update_banner(ui);
+        // The rail is outermost of the rest: it is the one thing on screen
+        // that never changes, and every other panel sits inside it.
+        self.rail(ui);
         self.top_bar(ui);
         self.status_bar(ui);
-        self.sidebar(ui);
         self.log_panel(ui);
 
         egui::CentralPanel::default()
@@ -1903,8 +2848,11 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.view {
+                        View::Games => self.games_grid(ui),
+                        View::Game(tab) => self.game_page(ui, tab),
                         View::Profile => self.profile_view(ui),
-                        View::Games => self.games_view(ui),
+                        View::Detail => self.detail_page(ui),
+                        View::Folders => self.games_view(ui),
                         View::Settings => self.settings_view(ui),
                     });
             });
@@ -1933,20 +2881,99 @@ impl eframe::App for App {
             let ctx = ui.ctx().clone();
             self.loader_window(&ctx);
         }
+        if self.show_modpack_link {
+            let ctx = ui.ctx().clone();
+            self.modpack_link_window(&ctx);
+        }
+        if self.config_editor.is_some() {
+            let ctx = ui.ctx().clone();
+            self.config_window(&ctx);
+        }
+
+        // Last, once everything has been laid out and any widget that wants a
+        // cursor of its own has asked for one.
+        theme::pointer_cursor(ui.ctx());
     }
 }
 
 impl App {
+    /// Where you are, and the way back out.
+    ///
+    /// The rail says which game; this says which page of it. Each step is a
+    /// link, because the alternative — a Back button that guesses — gets it
+    /// wrong as soon as anyone arrives somewhere by a second route.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let muted = |text: &str| egui::RichText::new(text).color(theme::MUTED);
+        let mut go: Option<View> = None;
+
+        if ui
+            .add(egui::Label::new(egui::RichText::new("Modifile").strong()).sense(
+                egui::Sense::click(),
+            ))
+            .on_hover_text("All games")
+            .clicked()
+        {
+            go = Some(View::Games);
+        }
+
+        // Not on the grid: there is no game in context there, and naming the
+        // last one visited claims you are somewhere you are not.
+        let game_name = (self.view != View::Games)
+            .then_some(self.game.as_deref())
+            .flatten()
+            .and_then(|id| self.engine().and_then(|e| e.pack(id)))
+            .map(|p| p.pack.game.name.clone());
+
+        if let Some(name) = game_name {
+            ui.label(muted("›"));
+            if ui
+                .add(egui::Label::new(name).sense(egui::Sense::click()))
+                .clicked()
+            {
+                go = Some(View::Game(GameTab::Profiles));
+            }
+        }
+
+        match self.view {
+            View::Profile => {
+                if let Some(profile) = self.selected.clone() {
+                    ui.label(muted("›"));
+                    ui.label(egui::RichText::new(profile.name).strong());
+                }
+            }
+            View::Detail => {
+                if let Some(state) = self.detail.as_ref() {
+                    ui.label(muted("›"));
+                    let title = state
+                        .details
+                        .as_ref()
+                        .map(|d| d.title.clone())
+                        .unwrap_or_else(|| state.id.short().to_string());
+                    ui.label(egui::RichText::new(title).strong());
+                }
+            }
+            View::Settings => {
+                ui.label(muted("›"));
+                ui.label(egui::RichText::new("Settings").strong());
+            }
+            View::Folders => {
+                ui.label(muted("›"));
+                ui.label(egui::RichText::new("Games & folders").strong());
+            }
+            View::Games | View::Game(_) => {}
+        }
+
+        if let Some(view) = go {
+            self.view = view;
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top")
             .frame(theme::bar_frame())
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Modifile");
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("universal mod manager").color(theme::MUTED),
-                    );
+                    self.breadcrumb(ui);
 
                     // These all act on the selected profile, so they belong to
                     // the profile page. Sitting there greyed over Settings or
@@ -1975,9 +3002,42 @@ impl App {
 
                         let active = self
                             .selected
-                            .as_deref()
-                            .map(|n| self.is_active(n))
+                            .as_ref()
+                            .map(|id| self.is_active(&id.name))
                             .unwrap_or(false);
+
+                        // Play sits beside Activate rather than replacing it,
+                        // because the two mean genuinely different things and
+                        // collapsing them would take away the choice this
+                        // project is built around: Activate leaves and lets
+                        // you launch however you like, Play starts the game.
+                        let can_play = ready
+                            && has_lock
+                            && running.is_none()
+                            && self.launch_ready();
+                        if theme::glyph_button(
+                            ui,
+                            theme::Glyph::Play,
+                            "Play",
+                            Some(theme::ACCENT_DIM),
+                            can_play,
+                        )
+                            .on_hover_text(self.play_hover(active))
+                            .on_disabled_hover_text(match &running {
+                                Some(found) => {
+                                    format!("The game is already running ({found}).")
+                                }
+                                _ if !has_lock => "Download the mods first.".to_string(),
+                                _ => "This game cannot be handed a profile for a single \
+                                      run — activate one and start the game yourself."
+                                    .to_string(),
+                            })
+                            .clicked()
+                        {
+                            let ctx = ui.ctx().clone();
+                            self.do_play(&ctx);
+                        }
+                        ui.add_space(6.0);
 
                         // One button in one place: it says what pressing it will
                         // do right now, rather than offering both states at once.
@@ -2139,13 +3199,16 @@ impl App {
             .frame(theme::bar_frame())
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let store = self
-                        .engine()
-                        .map(|e| e.store.size_bytes())
-                        .unwrap_or_default();
+                    // Read, never computed. Working this out means walking the
+                    // whole store — 12ms on a 1 GB one, warm — and doing that
+                    // per frame spent three quarters of the frame budget on a
+                    // number that changes a few times an hour.
                     ui.label(
-                        egui::RichText::new(format!("downloads {}", format_bytes(store)))
-                            .color(theme::MUTED),
+                        egui::RichText::new(format!(
+                            "downloads {}",
+                            format_bytes(self.store_bytes)
+                        ))
+                        .color(theme::MUTED),
                     );
                     ui.separator();
 
@@ -2162,135 +3225,6 @@ impl App {
                         self.view = View::Settings;
                     }
                 });
-            });
-    }
-
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("nav")
-            .exact_size(216.0)
-            .frame(theme::panel_frame())
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::Button::new("+  New profile").fill(theme::ACCENT_DIM),
-                    )
-                    .clicked()
-                {
-                    self.open_new_profile();
-                }
-                ui.add_space(10.0);
-
-                ui.menu_button("Import a shared profile…", |ui| {
-                    if ui
-                        .button("Exactly as they had it")
-                        .on_hover_text(
-                            "Holds every mod at the version the sender was running. Update \
-                             checks will not move them — the mod list says which ones newer \
-                             releases have passed, and you can take those whenever you like.",
-                        )
-                        .clicked()
-                    {
-                        self.do_import_bundle(true);
-                        ui.close();
-                    }
-                    if ui
-                        .button("But take the newest versions")
-                        .on_hover_text("Same mod list, latest release of each")
-                        .clicked()
-                    {
-                        self.do_import_bundle(false);
-                        ui.close();
-                    }
-                });
-                ui.add_space(12.0);
-
-                if self.profiles.is_empty() {
-                    ui.label(egui::RichText::new("PROFILES").small().color(theme::MUTED));
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("none yet").color(theme::MUTED));
-                }
-
-                // Grouped by game, so a dozen profiles across three games stay
-                // legible. The active one in each game is marked with a dot.
-                let profiles = self.profiles.clone();
-                let mut current_game: Option<String> = None;
-                for entry in profiles {
-                    if current_game.as_deref() != Some(entry.game_name.as_str()) {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(entry.game_name.to_uppercase())
-                                .small()
-                                .color(theme::MUTED),
-                        );
-                        ui.add_space(2.0);
-                        current_game = Some(entry.game_name.clone());
-                    }
-
-                    let selected = self.view == View::Profile
-                        && self.selected.as_deref() == Some(entry.name.as_str());
-
-                    ui.horizontal(|ui| {
-                        status_dot(ui, entry.active).on_hover_text(if entry.active {
-                            "Active — these mods are in the game folder right now"
-                        } else {
-                            "Not active"
-                        });
-                        let row = ui
-                            .selectable_label(selected, &entry.name)
-                            .on_hover_text(format!("{} mod(s)", entry.mods));
-                        if row.clicked() {
-                            self.select(&entry.name);
-                        }
-                        // Right-click is where people look for "delete this
-                        // one", and it is the only place that names which
-                        // profile it means before you commit to anything.
-                        row.context_menu(|ui| {
-                            ui.label(
-                                egui::RichText::new(&entry.name).small().color(theme::MUTED),
-                            );
-                            ui.separator();
-                            if ui.button("Rename…").clicked() {
-                                self.select(&entry.name);
-                                self.open_rename();
-                                ui.close();
-                            }
-                            if ui
-                                .button(egui::RichText::new("Delete…").color(theme::BAD))
-                                .clicked()
-                            {
-                                // Select it first: the dialog reports whether
-                                // it is active and which game is running, and
-                                // both come from the selected profile.
-                                self.select(&entry.name);
-                                self.delete_input.clear();
-                                self.show_delete = true;
-                                ui.close();
-                            }
-                        });
-                    });
-                }
-
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                if ui
-                    .selectable_label(self.view == View::Games, "Games & folders")
-                    .clicked()
-                {
-                    self.view = View::Games;
-                }
-                if ui
-                    .selectable_label(self.view == View::Settings, "Settings")
-                    .clicked()
-                {
-                    self.view = View::Settings;
-                    // Load the listing on open, so the panel is never a button
-                    // you have to discover before it shows anything.
-                    self.refresh_storage();
-                }
             });
     }
 
@@ -2422,25 +3356,27 @@ impl App {
                 ui.horizontal(|ui| {
                     status_dot(ui, active);
                     if active {
-                        ui.label(egui::RichText::new("Active").strong().color(theme::GOOD));
+                        theme::badge(ui, "mods installed", theme::GOOD);
                         ui.label(
                             egui::RichText::new(format!(
-                                "— these mods are in your {game_name} folder now. \
-                                 Start the game as you normally would; Modifile does not \
-                                 launch it."
+                                "— these mods are in your {game_name} folder right now, \
+                                 whether or not the game is running. Start it however you \
+                                 like, or press Play."
                             ))
                             .color(theme::MUTED),
                         );
                     } else {
-                        ui.label(egui::RichText::new("Not active").strong());
+                        theme::badge(ui, "not installed", theme::MUTED);
                         ui.label(
-                            egui::RichText::new(
-                                "— the game is vanilla. Press Activate to put these mods in.",
-                            )
+                            egui::RichText::new(format!(
+                                "— your {game_name} folder is vanilla. Activate puts these \
+                                 mods in; Play does that and starts the game."
+                            ))
                             .color(theme::MUTED),
                         );
                     }
                 });
+
             });
 
         // Deactivating can leave files behind, and saying nothing about it reads
@@ -2678,7 +3614,7 @@ impl App {
     fn do_install_loader(&mut self, ctx: &egui::Context) {
         use modifile_core::loader::LoaderState;
 
-        let Some(profile) = self.profile.clone() else {
+        let Some(profile) = self.current_profile() else {
             return;
         };
         // Every target that needs it: a dedicated server needs its own copy in
@@ -3101,7 +4037,7 @@ impl App {
     /// the damage; re-download whatever failed; then delete the changed files
     /// so a normal activate can place the recorded version.
     fn do_repair(&mut self, ctx: &egui::Context) {
-        let (Some(profile), Some(_)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(_)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let lock = self.lock.clone();
@@ -3152,7 +4088,7 @@ impl App {
 
                 // Re-fetch whatever is now absent, damaged entries included.
                 let pack = engine.pack_for(&profile)?;
-                let lock_path = paths.lock_file(&profile.name);
+                let lock_path = paths.lock_file(&profile.id());
                 let previous = modifile_core::Lock::load(&lock_path)?;
                 let (fresh, _) = engine.sync(pack, &profile, &previous, None).await?;
                 fresh.save(&lock_path)?;
@@ -3184,7 +4120,7 @@ impl App {
 
     /// Re-read every target's game folder.
     fn do_scan(&mut self) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -3222,11 +4158,12 @@ impl App {
     fn configs_section(&mut self, ui: &mut egui::Ui) {
         let saved = self.config_files.len();
         let mut reset = false;
+        let mut edit = false;
         let mut import: Option<modifile_core::engine::ConfigSource> = None;
         let others: Vec<String> = self
             .profiles
             .iter()
-            .filter(|p| Some(p.name.as_str()) != self.selected.as_deref())
+            .filter(|p| Some(&p.id) != self.selected.as_ref() && Some(&p.game_id) == self.game.as_ref())
             .map(|p| p.name.clone())
             .collect();
 
@@ -3260,6 +4197,21 @@ impl App {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(saved > 0, egui::Button::new("Edit…"))
+                            .on_hover_text(
+                                "Open this profile's settings files. Many mods have no \
+                                 in-game options screen and are configured only by \
+                                 editing these.",
+                            )
+                            .on_disabled_hover_text(
+                                "Nothing to edit yet. Mods write their settings the first \
+                                 time they run, and activating this profile adopts them.",
+                            )
+                            .clicked()
+                        {
+                            edit = true;
+                        }
                         ui.menu_button("Import from…", |ui| {
                             if ui
                                 .button("This game's current folder")
@@ -3324,10 +4276,260 @@ impl App {
         if let Some(source) = import {
             self.do_import_configs(source);
         }
+        if edit {
+            // Open on the first file rather than on an empty pane: with one
+            // config there is nothing to choose, and with many the list is
+            // right there to choose from.
+            if let Some((target, rel)) = self.config_files.first().cloned() {
+                self.open_config(&target, &rel);
+            }
+        }
+    }
+
+    /// Open a settings file for editing, or report why it cannot be.
+    fn open_config(&mut self, target: &str, rel: &std::path::Path) {
+        let filter = self
+            .config_editor
+            .as_ref()
+            .map(|e| e.filter.clone())
+            .unwrap_or_default();
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
+            return;
+        };
+        let (Ok(pack), Some(row)) = (
+            engine.pack_for(&profile),
+            self.targets.iter().find(|r| r.target.id == target),
+        ) else {
+            return;
+        };
+
+        match engine.read_config(pack, &profile.id(), &row.target, rel) {
+            Ok(text) => {
+                self.config_editor = Some(ConfigEditor {
+                    target: target.to_string(),
+                    rel: rel.to_path_buf(),
+                    original: text.clone(),
+                    text,
+                    filter,
+                    note: None,
+                });
+            }
+            Err(e) => {
+                // Keep the window open on the file list, so a binary file in
+                // among the configs is a message rather than a dead end.
+                if let Some(editor) = self.config_editor.as_mut() {
+                    editor.note = Some((e.to_string(), theme::BAD));
+                } else {
+                    self.log_line(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn save_config(&mut self) {
+        let Some(editor) = self.config_editor.as_ref() else {
+            return;
+        };
+        let (target, rel, text) = (editor.target.clone(), editor.rel.clone(), editor.text.clone());
+
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
+            return;
+        };
+        let (Ok(pack), Some(row)) = (
+            engine.pack_for(&profile),
+            self.targets.iter().find(|r| r.target.id == target),
+        ) else {
+            return;
+        };
+
+        let written = engine.write_config(
+            pack,
+            &profile.id(),
+            &row.target,
+            &rel,
+            &text,
+            row.root.as_deref(),
+        );
+        let note = match written {
+            // The distinction that matters: whether the game will read this
+            // now, or only after the profile is activated again.
+            Ok(true) => (
+                "Saved. The game folder has it now.".to_string(),
+                theme::GOOD,
+            ),
+            Ok(false) => (
+                "Saved to this profile. Activate it to put this in the game folder."
+                    .to_string(),
+                theme::WARN,
+            ),
+            Err(e) => (e.to_string(), theme::BAD),
+        };
+        let saved_cleanly = note.1 != theme::BAD;
+        if let Some(editor) = self.config_editor.as_mut() {
+            // Only then does the edited text become the new "as opened" text,
+            // so a failed save leaves the file still showing as changed.
+            if saved_cleanly {
+                editor.original = editor.text.clone();
+            }
+            editor.note = Some(note);
+        }
+        self.refresh_sizes();
+    }
+
+    /// The settings editor: the file list on the left, the file on the right.
+    fn config_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let mut pick: Option<(String, PathBuf)> = None;
+        let mut save = false;
+        let mut revert = false;
+
+        let files = self.config_files.clone();
+        let multi_target = self.targets.len() > 1;
+
+        egui::Window::new("Settings files")
+            .open(&mut open)
+            .resizable(true)
+            .default_size(egui::vec2(820.0, 520.0))
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let Some(editor) = self.config_editor.as_mut() else {
+                    return;
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "These belong to this profile alone. Another profile for the \
+                             same game keeps its own.",
+                        )
+                        .small()
+                        .color(theme::MUTED),
+                    );
+                });
+                ui.add_space(6.0);
+
+                ui.horizontal_top(|ui| {
+                    // --- the list -------------------------------------------
+                    ui.vertical(|ui| {
+                        ui.set_width(280.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.filter)
+                                .hint_text("Filter")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+
+                        let needle = editor.filter.to_lowercase();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                let mut shown = 0;
+                                for (target, rel) in &files {
+                                    let label = rel.to_string_lossy().replace('\\', "/");
+                                    if !needle.is_empty()
+                                        && !label.to_lowercase().contains(&needle)
+                                    {
+                                        continue;
+                                    }
+                                    shown += 1;
+                                    let selected =
+                                        *target == editor.target && *rel == editor.rel;
+                                    // The target only earns a mention when
+                                    // there is more than one to confuse.
+                                    let text = if multi_target {
+                                        format!("{label}  ({target})")
+                                    } else {
+                                        label
+                                    };
+                                    if ui.selectable_label(selected, text).clicked() {
+                                        pick = Some((target.clone(), rel.clone()));
+                                    }
+                                }
+                                if shown == 0 {
+                                    ui.label(
+                                        egui::RichText::new("Nothing matches that.")
+                                            .color(theme::MUTED),
+                                    );
+                                }
+                            });
+                    });
+
+                    ui.separator();
+
+                    // --- the file -------------------------------------------
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    editor.rel.to_string_lossy().replace('\\', "/"),
+                                )
+                                .strong(),
+                            );
+                            if editor.changed() {
+                                theme::badge(ui, "unsaved", theme::WARN);
+                            }
+                        });
+                        ui.add_space(4.0);
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("config-text")
+                            .auto_shrink([false, false])
+                            .max_height(390.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut editor.text)
+                                        .code_editor()
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(22),
+                                );
+                            });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    editor.changed(),
+                                    egui::Button::new("Save").fill(theme::ACCENT_DIM),
+                                )
+                                .clicked()
+                            {
+                                save = true;
+                            }
+                            if ui
+                                .add_enabled(editor.changed(), egui::Button::new("Revert"))
+                                .on_hover_text("Go back to the file as it was opened")
+                                .clicked()
+                            {
+                                revert = true;
+                            }
+                            if let Some((note, colour)) = &editor.note {
+                                ui.label(egui::RichText::new(note).color(*colour).small());
+                            }
+                        });
+                    });
+                });
+            });
+
+        if revert {
+            if let Some(editor) = self.config_editor.as_mut() {
+                editor.text = editor.original.clone();
+                editor.note = None;
+            }
+        }
+        if save {
+            self.save_config();
+        }
+        if let Some((target, rel)) = pick {
+            self.open_config(&target, &rel);
+        }
+        if !open {
+            self.config_editor = None;
+        }
     }
 
     fn do_reset_configs(&mut self) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -3335,7 +4537,7 @@ impl App {
         };
         let mut messages = Vec::new();
         for row in &self.targets {
-            match engine.reset_configs(pack, &profile.name, &row.target, row.root.as_deref()) {
+            match engine.reset_configs(pack, &profile.id(), &row.target, row.root.as_deref()) {
                 Ok(count) if count > 0 => messages.push(format!(
                     "{}: discarded {count} settings file(s) — press Activate to restore defaults",
                     row.target.name
@@ -3351,7 +4553,7 @@ impl App {
     }
 
     fn do_import_configs(&mut self, source: modifile_core::engine::ConfigSource) {
-        let (Some(profile), Some(engine)) = (self.profile.clone(), self.engine()) else {
+        let (Some(profile), Some(engine)) = (self.current_profile(), self.engine()) else {
             return;
         };
         let Ok(pack) = engine.pack_for(&profile) else {
@@ -3361,7 +4563,7 @@ impl App {
         for row in &self.targets {
             match engine.import_configs(
                 pack,
-                &profile.name,
+                &profile.id(),
                 &row.target,
                 &source,
                 row.root.as_deref(),
@@ -3931,9 +5133,10 @@ impl App {
                                             )
                                         } else if row.installed {
                                             (
-                                                "in game",
+                                                "installed",
                                                 theme::GOOD,
-                                                "Downloaded, and its files are in the game folder",
+                                                "Downloaded, and its files are in the game \
+                                                 folder right now",
                                             )
                                         } else {
                                             (
@@ -4038,33 +5241,19 @@ impl App {
             targets: Vec<(Target, Option<PathBuf>, bool)>,
         }
 
+        // From the cache: working this out means probing Steam libraries and
+        // stat-ing candidate directories for every installed game, and this
+        // runs on every frame the page is open.
         let entries: Vec<Entry> = self
-            .engine()
-            .map(|engine| {
-                engine
-                    .packs
-                    .iter()
-                    .map(|pack| Entry {
-                        game: pack.id().to_string(),
-                        name: pack.pack.game.name.clone(),
-                        description: pack.pack.game.description.clone(),
-                        targets: pack
-                            .pack
-                            .targets
-                            .iter()
-                            .map(|t| {
-                                let remembered = engine.roots.get(pack.id(), &t.id).cloned();
-                                let found = remembered
-                                    .clone()
-                                    .filter(|p| p.is_dir())
-                                    .or_else(|| pack.detect(t).into_iter().next());
-                                (t.clone(), found, remembered.is_some())
-                            })
-                            .collect(),
-                    })
-                    .collect()
+            .games
+            .iter()
+            .map(|g| Entry {
+                game: g.id.clone(),
+                name: g.name.clone(),
+                description: g.description.clone(),
+                targets: g.targets.clone(),
             })
-            .unwrap_or_default();
+            .collect();
 
         let mut choose: Option<(String, Target)> = None;
         let mut forget: Option<(String, String)> = None;
@@ -4244,10 +5433,227 @@ impl App {
         }
     }
 
+    /// Keeping Modifile itself current.
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(engine) = self.engine() else { return };
+        let mut check = engine.checks_for_updates();
+        let mut auto = engine.auto_updates();
+        let current = modifile_core::selfupdate::current_version();
+
+        let mut set_check = None;
+        let mut set_auto = None;
+        let mut check_now = false;
+        let mut install = false;
+
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Modifile itself").strong());
+                ui.label(
+                    egui::RichText::new(format!("version {current}"))
+                        .small()
+                        .color(theme::MUTED),
+                );
+            });
+            ui.add_space(4.0);
+
+            match (&self.update_installed, &self.update) {
+                (Some(version), _) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Updated to {version} — restart to use it."
+                        ))
+                        .color(theme::GOOD),
+                    );
+                }
+                (None, Some(update)) => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} is available.",
+                                update.version
+                            ))
+                            .color(theme::GOOD),
+                        );
+                        ui.hyperlink_to("What's new", &update.web_url);
+                    });
+                    ui.add_space(4.0);
+                    if self.updating {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label("Downloading and verifying…");
+                        });
+                    } else if ui.button("Install it now").clicked() {
+                        install = true;
+                    }
+                }
+                (None, None) => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("No newer version has been published.")
+                                .color(theme::MUTED),
+                        );
+                        if ui.small_button("Check now").clicked() {
+                            check_now = true;
+                        }
+                    });
+                }
+            }
+
+            ui.add_space(8.0);
+            if ui
+                .checkbox(&mut check, "Look for new versions when Modifile starts")
+                .on_hover_text(
+                    "One request to GitHub, cached, and silent when there is nothing \
+                     new. It is how you find out a bug you hit has been fixed.",
+                )
+                .changed()
+            {
+                set_check = Some(check);
+            }
+            if ui
+                .checkbox(&mut auto, "Install them without asking")
+                .on_hover_text(
+                    "Off by default: replacing the program you are running is not \
+                     something to do on a default. With it on, an update found at \
+                     startup is downloaded, checked against the digest GitHub \
+                     publishes for it, and swapped in — and you are told to restart.",
+                )
+                .changed()
+            {
+                set_auto = Some(auto);
+            }
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Updates come from this project's GitHub releases and are verified \
+                     before anything is replaced. Your profiles, mods, downloads and \
+                     settings are never touched by an update.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+        });
+
+        // Applied after the frame, so the engine is not borrowed while drawing.
+        if let Some(on) = set_check {
+            if let Some(engine) = self.engine() {
+                let _ = engine.set_update_checks(on);
+            }
+        }
+        if let Some(on) = set_auto {
+            if let Some(engine) = self.engine() {
+                let _ = engine.set_auto_update(on);
+            }
+        }
+        if check_now {
+            let ctx = ui.ctx().clone();
+            self.log_line("Checking for a newer Modifile…");
+            self.do_check_update(&ctx);
+        }
+        if install {
+            let ctx = ui.ctx().clone();
+            self.do_install_update(&ctx);
+        }
+    }
+
+    /// The one switch for the only thing here that touches the network purely
+    /// to look nice.
+    fn artwork_settings(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.art.enabled();
+        let resident = self.art.resident();
+        // Cached: measuring it reads a directory, and this panel redraws every
+        // frame it is open.
+        let disk = self.art_bytes;
+        let mut clear = false;
+
+        theme::card_frame().show(ui, |ui| {
+            ui.label(egui::RichText::new("Artwork").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Mod icons, screenshots and game art, fetched from the same indexes \
+                     the mods come from and cached on disk. Everything works without \
+                     them — turning this off costs you pictures and nothing else.",
+                )
+                .color(theme::MUTED),
+            );
+            ui.add_space(8.0);
+
+            if ui
+                .checkbox(&mut on, "Load artwork from the internet")
+                .on_hover_text(
+                    "Off: no image is ever fetched, every texture is freed, and tiles \
+                     are drawn from the name instead.",
+                )
+                .changed()
+            {
+                self.art.set_enabled(on);
+                let marker = self.paths.no_artwork_file();
+                if on {
+                    let _ = std::fs::remove_file(&marker);
+                } else {
+                    let _ = modifile_core::paths::write_atomic(
+                        &marker,
+                        b"Artwork is switched off. Delete this file to turn it back on.\n",
+                    );
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{resident} image(s) in memory · {} cached on disk",
+                        format_bytes(disk)
+                    ))
+                    .small()
+                    .color(theme::MUTED),
+                );
+                if disk > 0 && ui.small_button("Clear cached artwork").clicked() {
+                    clear = true;
+                }
+            });
+        });
+
+        if clear {
+            match self.art.clear_disk() {
+                Ok(freed) => {
+                    self.art_bytes = 0;
+                    self.log_line(format!("Cleared {} of cached artwork.", format_bytes(freed)))
+                }
+                Err(e) => self.log_line(format!("Could not clear artwork: {e}")),
+            }
+        }
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.heading("Settings");
         ui.add_space(12.0);
+
+        self.update_settings(ui);
+        ui.add_space(10.0);
+
+        self.artwork_settings(ui);
+        ui.add_space(10.0);
+
+        theme::card_frame().show(ui, |ui| {
+            ui.label(egui::RichText::new("Games & folders").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Every game at once, and whether the bundled packs are current. \
+                     A single game's folders are on its own page.",
+                )
+                .color(theme::MUTED),
+            );
+            ui.add_space(8.0);
+            if ui.button("Open games & folders").clicked() {
+                self.view = View::Folders;
+            }
+        });
+        ui.add_space(10.0);
 
         egui::Frame::NONE
             .fill(theme::CARD)
@@ -4574,6 +5980,77 @@ impl App {
         }
     }
 
+    fn modpack_link_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_modpack_link;
+        let mut go = false;
+
+        egui::Window::new("Import a modpack")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Paste a Modrinth version link, or a direct link to a pack archive.");
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "modrinth.com/modpack/<name>/version/<id>, or any https:// link \
+                         ending in .mrpack or .zip",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.add_space(8.0);
+
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.modpack_input)
+                        .desired_width(420.0)
+                        .hint_text("https://…"),
+                );
+                let entered =
+                    field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let ready = !self.modpack_input.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new("Import").fill(theme::ACCENT_DIM),
+                        )
+                        .clicked()
+                        || (entered && ready)
+                    {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        go = false;
+                        self.show_modpack_link = false;
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "A CurseForge pack needs the API key you supply in Settings. \
+                         A Modrinth .mrpack needs nothing.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+            });
+
+        if !open {
+            self.show_modpack_link = false;
+        }
+        if go {
+            let source =
+                modifile_core::engine::ModpackSource::parse(self.modpack_input.trim());
+            self.show_modpack_link = false;
+            self.do_import_modpack(source, ctx);
+        }
+    }
+
     fn rename_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_rename;
         let mut commit = false;
@@ -4617,10 +6094,11 @@ impl App {
     /// Deleting a profile, which is the one destructive thing in here that no
     /// amount of re-downloading undoes.
     fn delete_window(&mut self, ctx: &egui::Context) {
-        let Some(name) = self.selected.clone() else {
+        let Some(id) = self.selected.clone() else {
             self.show_delete = false;
             return;
         };
+        let name = id.name.clone();
         let active = self.is_active(&name);
         let running = self.targets.iter().find_map(|t| t.running.clone());
         let mut open = self.show_delete;

@@ -345,3 +345,303 @@ fn minecraft_client_and_server_reject_each_others_builds() {
     let server = mc.select_asset(&assets, mc.target("server").unwrap()).unwrap();
     assert_eq!(assets[server], "mod-1.0-server.jar");
 }
+
+// --- modpack overrides ------------------------------------------------------
+//
+// A modpack's overrides/ tree is routed by the same install rules as any other
+// archive, which is the whole reason importing one needs no new deploy code.
+// These pin that routing, because getting it wrong is silent: files simply do
+// not appear, and the game starts with the wrong settings rather than failing.
+
+/// Where one archive path ends up for one target, or `None` if nothing claims it.
+fn place(mc: &CompiledPack, path: &str, target: &str) -> Option<(std::path::PathBuf, bool)> {
+    let t = mc.target(target).unwrap();
+    let rule = mc.rule_for(path, target)?;
+    let dest = mc.destination_for(path, t, rule)?;
+    Some((dest, rule.mutable))
+}
+
+#[test]
+fn modpack_overrides_land_where_the_pack_meant_them() {
+    let mc = pack("minecraft.toml");
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+
+    let cases = [
+        // Jars in a pack's overrides are mods like any other: linked, tracked,
+        // and removed again on deactivate.
+        ("overrides/mods/extra.jar", "mods/extra.jar", false),
+        // Configs are the profile's to edit.
+        ("overrides/config/sodium.json", "config/sodium.json", true),
+        ("overrides/resourcepacks/faithful.zip", "resourcepacks/faithful.zip", false),
+        ("overrides/shaderpacks/bsl.zip", "shaderpacks/bsl.zip", false),
+        // Everything else a pack ships lands at the game root.
+        ("overrides/options.txt", "options.txt", true),
+        ("overrides/kubejs/server_scripts/s.js", "kubejs/server_scripts/s.js", true),
+        ("overrides/defaultconfigs/x.toml", "defaultconfigs/x.toml", true),
+    ];
+
+    for (path, want, mutable) in cases {
+        let (dest, is_mutable) = place(&mc, path, "client")
+            .unwrap_or_else(|| panic!("nothing claimed {path}"));
+        assert_eq!(dest, std::path::PathBuf::from(want.replace('/', &sep)), "{path}");
+        assert_eq!(is_mutable, mutable, "{path} mutability");
+    }
+}
+
+#[test]
+fn a_packs_index_is_not_installed() {
+    // The manifest describes the pack; it is not part of the game.
+    let mc = pack("minecraft.toml");
+    for path in ["manifest.json", "modrinth.index.json"] {
+        assert!(
+            mc.rule_for(path, "client").is_none(),
+            "{path} should not be installed into the game folder"
+        );
+    }
+}
+
+#[test]
+fn side_specific_overrides_stay_on_their_own_side() {
+    // The trap this guards: the general config rule carries no target, so
+    // without the side-specific rules coming first, a client-only config would
+    // be planted on a dedicated server.
+    let mc = pack("minecraft.toml");
+
+    assert!(place(&mc, "client-overrides/config/gui.json", "client").is_some());
+    assert!(
+        place(&mc, "client-overrides/config/gui.json", "server").is_none(),
+        "a client override must never reach the server"
+    );
+
+    assert!(place(&mc, "server-overrides/server.properties", "server").is_some());
+    assert!(
+        place(&mc, "server-overrides/server.properties", "client").is_none(),
+        "a server override must never reach the client"
+    );
+
+    // And they still route by kind, rather than all landing at the root.
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let (dest, _) = place(&mc, "client-overrides/mods/clientonly.jar", "client").unwrap();
+    assert_eq!(dest, std::path::PathBuf::from("mods/clientonly.jar".replace('/', &sep)));
+}
+
+// --- BepInEx as a modpack dependency ----------------------------------------
+//
+// Thunderstore modpacks list BepInEx as an ordinary dependency, so its package
+// arrives through the same path as any mod. Getting this wrong is silent in the
+// worst way: every file installs, and the game then loads no mods at all.
+
+#[test]
+fn bepinex_core_never_lands_in_plugins() {
+    for name in ["repo.toml", "valheim.toml"] {
+        let p = pack(name);
+        let target = p.pack.targets[0].clone();
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+
+        // The Thunderstore BepInExPack nests everything under BepInExPack/.
+        let cases = [
+            ("BepInExPack/BepInEx/core/BepInEx.dll", "BepInEx/core/BepInEx.dll"),
+            ("BepInExPack/BepInEx/core/0Harmony.dll", "BepInEx/core/0Harmony.dll"),
+            ("BepInExPack/BepInEx/core/Mono.Cecil.dll", "BepInEx/core/Mono.Cecil.dll"),
+            // The shim that actually starts BepInEx sits beside the game exe.
+            ("BepInExPack/winhttp.dll", "winhttp.dll"),
+            ("BepInExPack/doorstop_config.ini", "doorstop_config.ini"),
+        ];
+
+        for (archive_path, want) in cases {
+            let rule = p
+                .rule_for(archive_path, &target.id)
+                .unwrap_or_else(|| panic!("{name}: nothing claimed {archive_path}"));
+            let dest = p
+                .destination_for(archive_path, &target, rule)
+                .unwrap_or_else(|| panic!("{name}: no destination for {archive_path}"));
+            assert_eq!(
+                dest,
+                std::path::PathBuf::from(want.replace('/', &sep)),
+                "{name}: {archive_path} went to the wrong place"
+            );
+        }
+    }
+}
+
+#[test]
+fn thunderstore_packaging_files_are_not_installed() {
+    // Every Thunderstore package carries these. None belong in a game folder.
+    for name in ["repo.toml", "valheim.toml"] {
+        let p = pack(name);
+        let target = p.pack.targets[0].id.clone();
+        for junk in ["manifest.json", "icon.png", "README.md", "CHANGELOG.md"] {
+            assert!(
+                p.rule_for(junk, &target).is_none(),
+                "{name}: {junk} should not be installed"
+            );
+        }
+    }
+}
+
+#[test]
+fn repo_content_bundles_keep_their_folders() {
+    // MoreHead cosmetics are found by scanning for a Decorations/ directory
+    // under plugins. Flattening them is how every one of them stops loading.
+    let p = pack("repo.toml");
+    let target = p.target("client").unwrap();
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+
+    for (archive_path, want) in [
+        ("Decorations/Alex_head.hhh", "BepInEx/plugins/Decorations/Alex_head.hhh"),
+        ("DecapitatedMonsters.repobundle", "BepInEx/plugins/DecapitatedMonsters.repobundle"),
+    ] {
+        let rule = p
+            .rule_for(archive_path, "client")
+            .unwrap_or_else(|| panic!("nothing claimed {archive_path}"));
+        let dest = p.destination_for(archive_path, target, rule).unwrap();
+        assert_eq!(dest, std::path::PathBuf::from(want.replace('/', &sep)));
+    }
+}
+
+// --- launching --------------------------------------------------------------
+
+#[test]
+fn a_pack_never_names_anything_outside_the_game_folder() {
+    // The safety line for the Play button: a pack may point at a file inside
+    // the folder the user chose, and nothing else. This asserts the bundled
+    // packs stay on the right side of it, so a careless edit is caught here
+    // rather than by someone's antivirus.
+    for (name, _) in BUNDLED_PACKS {
+        let p = pack(name);
+        for target in &p.pack.targets {
+            for entry in &target.launch {
+                assert!(
+                    !entry.contains("..")
+                        && !entry.starts_with('/')
+                        && !entry.starts_with('\\')
+                        && entry.chars().nth(1) != Some(':'),
+                    "{name}: `{entry}` escapes the game folder"
+                );
+                // A command line is not a path, and this is the field that
+                // must never become one.
+                assert!(
+                    !entry.contains(' ') || entry.ends_with(".app"),
+                    "{name}: `{entry}` looks like a command, not an executable path"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_game_can_be_started_somehow() {
+    // Either Steam knows it, or the pack names an executable. A game with
+    // neither is one whose Play button can only ever be greyed out, which is
+    // worth knowing when the pack is written rather than when it is used.
+    for (name, _) in BUNDLED_PACKS {
+        let p = pack(name);
+        let client = p
+            .pack
+            .targets
+            .iter()
+            .find(|t| t.kind == modifile_core::TargetKind::Client);
+        let Some(client) = client else { continue };
+
+        let startable = client.steam.is_some() || !client.launch.is_empty();
+        // Minecraft is the honest exception: its launcher lives outside the
+        // game directory, so there is nothing a pack is allowed to name.
+        if *name == "minecraft.toml" {
+            assert!(
+                !startable,
+                "minecraft's launcher is outside the game folder; if that changed, \
+                 update this test and the pack together"
+            );
+            continue;
+        }
+        assert!(
+            startable,
+            "{name}: the client declares neither a Steam app id nor an executable"
+        );
+    }
+}
+
+// --- instanced play ---------------------------------------------------------
+//
+// The safety argument for the Play button. An instanced profile puts its mods
+// in a directory of its own, so the game install is never modified and there
+// is nothing to undo when the game closes — or crashes, or the power goes out.
+// These pin the part that makes that true.
+
+#[test]
+fn games_that_can_be_instanced_say_so() {
+    // Play exists only for these. A game that cannot hand its mods to another
+    // directory gets no Play button rather than one that modifies the install.
+    for name in ["repo.toml", "valheim.toml", "minecraft.toml"] {
+        assert!(
+            pack(name).instancing().is_some(),
+            "{name} should declare how it can be instanced"
+        );
+    }
+    for name in ["wow.toml", "wow-classic.toml", "wow-classic-era.toml"] {
+        assert!(
+            pack(name).instancing().is_none(),
+            "{name} reads addons from one fixed place and must not claim otherwise"
+        );
+    }
+}
+
+#[test]
+fn only_the_injector_is_allowed_in_the_game_folder() {
+    // Everything else belongs to the instance. If this ever widens, an
+    // "instanced" profile would start modifying the real install again.
+    for name in ["repo.toml", "valheim.toml"] {
+        let p = pack(name);
+
+        for injector in [
+            "winhttp.dll",
+            "doorstop_config.ini",
+            "run_bepinex.sh",
+            ".doorstop_version",
+        ] {
+            assert!(
+                p.belongs_in_game_dir(std::path::Path::new(injector)),
+                "{name}: {injector} has to sit beside the executable"
+            );
+        }
+
+        for mine in [
+            "BepInEx/plugins/SomeMod.dll",
+            "BepInEx/config/SomeMod.cfg",
+            "BepInEx/core/BepInEx.dll",
+            "BepInEx/patchers/Thing.dll",
+            "options.txt",
+        ] {
+            assert!(
+                !p.belongs_in_game_dir(std::path::Path::new(mine)),
+                "{name}: {mine} belongs to the instance, not the game folder"
+            );
+        }
+    }
+}
+
+#[test]
+fn minecraft_needs_nothing_in_the_game_folder() {
+    // Its launcher takes a gameDir, so the vanilla install is untouched
+    // entirely — there is not even an injector to plant.
+    let mc = pack("minecraft.toml");
+    let rules = mc.instancing().expect("minecraft can be instanced");
+    assert!(rules.game_files.is_empty());
+    assert!(!mc.belongs_in_game_dir(std::path::Path::new("mods/sodium.jar")));
+}
+
+#[test]
+fn a_doorstop_pack_names_the_assembly_to_invoke() {
+    // BepInEx works out its whole root from where this was loaded from, which
+    // is the entire mechanism. Without it there is nothing to point at.
+    for name in ["repo.toml", "valheim.toml"] {
+        let p = pack(name);
+        let rules = p.instancing().expect("declared above");
+        assert_eq!(rules.kind, modifile_core::pack::InstanceKind::Doorstop);
+        assert_eq!(
+            rules.target.as_deref(),
+            Some("BepInEx/core/BepInEx.Preloader.dll"),
+            "{name}"
+        );
+    }
+}

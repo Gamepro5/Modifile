@@ -1,0 +1,155 @@
+schema = 1
+
+[game]
+id = "repo"
+name = "R.E.P.O."
+description = """
+BepInEx plugins, from Thunderstore. There is no dedicated server — R.E.P.O. is
+peer-hosted — so a profile has one target, the game itself.
+Plugins ship as compiled .dll, so most R.E.P.O. mods read as `unverified binary`
+unless the author publishes build attestations. Many do publish their source on
+GitHub, and Thunderstore carries that link, so the trust ladder can usually say
+where the code is even when it cannot check the binary against it."""
+maintainers = ["bundled"]
+
+# Without BepInEx the game never reads BepInEx/plugins at all, and mods install
+# perfectly while doing nothing. Installing it is extracting one archive over
+# the game root, so Modifile can do it rather than sending you to a web page.
+[[loaders]]
+id = "bepinex"
+name = "BepInEx"
+kind = "archive"
+source = "github:BepInEx/BepInEx"
+page = "https://thunderstore.io/c/repo/p/BepInEx/BepInExPack/"
+# R.E.P.O. is a 64-bit Unity Mono game, so this is the same build Valheim uses.
+windows_assets = ["bepinex_win_x64_*.zip", "bepinex_x64_*.zip"]
+linux_assets = ["bepinex_linux_x64_*.zip", "bepinex_unix_x64_*.zip"]
+macos_assets = ["bepinex_macos_x64_*.zip", "bepinex_unix_x64_*.zip"]
+markers = ["BepInEx/core/BepInEx.dll", "winhttp.dll", "doorstop_config.ini"]
+
+# R.E.P.O. can be pointed at a mod folder that is not its own, so Play gives
+# each profile a real instance: the game directory is never modified, and
+# quitting — or crashing, or losing power — leaves nothing to undo.
+#
+# BepInEx works out its own root from wherever its preloader was loaded from,
+# so naming an assembly inside the instance takes plugins, configs and patchers
+# with it. This is what r2modman does, and why it never has to "revert".
+[instance]
+kind = "doorstop"
+target = "BepInEx/core/BepInEx.Preloader.dll"
+# The one thing that cannot live in the instance: the game loads this DLL by
+# name at startup, so it has to be beside the executable. It does nothing
+# unless Modifile launches the game with redirection switched on — started from
+# Steam or a shortcut, the game runs vanilla.
+game_files = [
+  "winhttp.dll", "doorstop_config.ini", ".doorstop_version",
+  "run_bepinex.sh", "libdoorstop.so", "libdoorstop_x64.so",
+]
+
+# Thunderstore is where R.E.P.O. mods and modpacks are, and it needs no key.
+# The slug is the one in the site's own URL: thunderstore.io/c/repo/.
+[search]
+thunderstore_community = "repo"
+github_topics = ["repo-mod", "repo-mods"]
+
+# BepInEx rewrites every plugin's .cfg on startup and the user edits them, so
+# they belong to the profile rather than to the mod — two profiles want two
+# different sets.
+[state]
+paths = ["config"]
+
+[paths]
+plugins = "BepInEx/plugins"
+patchers = "BepInEx/patchers"
+config = "BepInEx/config"
+core = "BepInEx/core"
+root = "."
+
+[assets]
+prefer = ["*.zip"]
+accept = ["*.dll"]
+reject = ["*sources*", "*symbols*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+# Rules are tried in order; the first match wins. The nested-path rules come
+# first so a mod that ships a full BepInEx tree lands correctly, and the bare
+# .dll rule catches the flat zips that most Thunderstore packages actually are.
+
+# Thunderstore packaging. Every package carries these and none of them belong
+# in a game directory. Claimed explicitly so the rules below can be broad.
+[[install]]
+match = "**/{manifest.json,icon.png,README.md,CHANGELOG.md,LICENSE,LICENSE.md,LICENSE.txt}"
+into = "root"
+skip = true
+
+# BepInEx itself, which modpacks list as an ordinary dependency. Its core
+# assemblies are not plugins: swept into plugins/ by the bare .dll rule below
+# they give you a game that loads nothing at all, which is the most confusing
+# way a pack can fail — everything installs, nothing happens.
+[[install]]
+match = "**/bepinex/core/**"
+into = "core"
+strip = "core/"
+
+# The doorstop shim that actually starts BepInEx. It belongs beside the game
+# executable, not inside the BepInEx tree.
+[[install]]
+match = "**/{winhttp.dll,doorstop_config.ini,.doorstop_version,run_bepinex.sh,libdoorstop.so,libdoorstop_x64.so}"
+into = "root"
+flatten = true
+
+[[install]]
+match = "**/bepinex/patchers/**"
+into = "patchers"
+strip = "patchers/"
+
+[[install]]
+match = "**/bepinex/plugins/**"
+into = "plugins"
+strip = "plugins/"
+
+[[install]]
+match = "**/bepinex/config/**"
+into = "config"
+strip = "config/"
+mutable = true
+
+[[install]]
+match = "**/*.dll"
+into = "plugins"
+flatten = true
+
+# Loose config files sitting at the archive root. Deliberately a short list of
+# extensions rather than "anything not a .dll": every Thunderstore package
+# carries manifest.json, icon.png and README.md, and none of those belong in a
+# game directory.
+[[install]]
+match = "*.{cfg,ini,yml,yaml,toml}"
+into = "config"
+flatten = true
+mutable = true
+
+# Content a plugin loads at runtime: REPOLib's .repobundle packs, MoreHead's
+# .hhh cosmetics, raw asset bundles. These are found by scanning underneath
+# plugins/, so the folder layout the author shipped is preserved rather than
+# flattened — a cosmetics pack is a `Decorations/` directory and flattening it
+# is how every one of its files stops being found.
+[[install]]
+match = "**/*.{repobundle,hhh,assetbundle,bundle}"
+into = "plugins"
+
+[[targets]]
+id = "client"
+name = "R.E.P.O."
+kind = "client"
+markers = ["REPO.exe", "REPO_Data"]
+processes = ["REPO.exe"]
+candidates = [
+  "${ProgramFiles(x86)}/Steam/steamapps/common/REPO",
+  "${ProgramFiles}/Steam/steamapps/common/REPO",
+  "${HOME}/.steam/steam/steamapps/common/REPO",
+]
+
+[targets.steam]
+app_id = 3241660
+dir = "REPO"

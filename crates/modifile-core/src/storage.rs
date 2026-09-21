@@ -84,34 +84,49 @@ pub fn report(
 ) -> Result<StorageReport> {
     let mut uses: BTreeMap<String, Vec<StoreUse>> = BTreeMap::new();
 
-    for entry in std::fs::read_dir(&paths.profiles)
+    // Profiles live one directory per game, so this walks games and then
+    // their lockfiles. A stray file at the top level is ignored rather than
+    // guessed at; the startup migration moves real ones down.
+    for game_entry in std::fs::read_dir(&paths.profiles)
         .ctx(format!("reading {}", paths.profiles.display()))?
         .flatten()
     {
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        let game_dir = game_entry.path();
+        if !game_dir.is_dir() {
             continue;
-        };
-        let Some(name) = file_name.strip_suffix(".lock.json") else {
+        }
+        let Ok(entries) = std::fs::read_dir(&game_dir) else {
             continue;
         };
 
-        let lock = Lock::load(&path)?;
-        let game = Profile::load(&paths.profile_file(name))
-            .map(|p| p.game)
-            .unwrap_or_default();
-        let active = active_by_game
-            .get(&game)
-            .map(|names| names.iter().any(|n| n == name))
-            .unwrap_or(false);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(name) = file_name.strip_suffix(".lock.json") else {
+                continue;
+            };
 
-        for locked in &lock.mods {
-            uses.entry(locked.sha256.clone()).or_default().push(StoreUse {
-                profile: name.to_string(),
-                mod_id: locked.id.clone(),
-                version: locked.version.clone(),
-                active,
-            });
+            let lock = Lock::load(&path)?;
+            // The profile beside the lock names the game authoritatively; the
+            // directory name is only a sanitised version of it.
+            let game = Profile::load(&game_dir.join(format!("{name}.toml")))
+                .map(|p| p.game)
+                .unwrap_or_default();
+            let active = active_by_game
+                .get(&game)
+                .map(|names| names.iter().any(|n| n == name))
+                .unwrap_or(false);
+
+            for locked in &lock.mods {
+                uses.entry(locked.sha256.clone()).or_default().push(StoreUse {
+                    profile: name.to_string(),
+                    mod_id: locked.id.clone(),
+                    version: locked.version.clone(),
+                    active,
+                });
+            }
         }
     }
 

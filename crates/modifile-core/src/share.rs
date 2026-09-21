@@ -51,6 +51,12 @@ pub struct BundleMod {
     /// import unless the importer asks for latest.
     #[serde(default)]
     pub version: Option<String>,
+    /// The source's exact file handle, when the sender had one. A profile that
+    /// came from a modpack pins CurseForge file ids, and dropping them here
+    /// would quietly hand the recipient a different set of mods than the one
+    /// that was tested.
+    #[serde(default)]
+    pub file: Option<String>,
     #[serde(default)]
     pub prerelease: bool,
 }
@@ -172,6 +178,7 @@ impl Bundle {
                         .pin
                         .clone()
                         .or_else(|| lock.get(&entry.id).map(|l| l.version.clone())),
+                    file: entry.file.clone(),
                     prerelease: entry.prerelease,
                 })
                 .collect(),
@@ -212,6 +219,9 @@ impl Bundle {
                 enabled: m.enabled,
                 targets: m.targets.clone(),
                 pin: if pin_versions { m.version.clone() } else { None },
+                // The exact file goes with the pin: asking for the newest
+                // release means asking to be let off the sender's exact one.
+                file: if pin_versions { m.file.clone() } else { None },
                 prerelease: m.prerelease,
                 // A bundle carries no files, so a mod the exporter supplied by
                 // hand cannot be reconstructed from it — the importer has to
@@ -223,10 +233,14 @@ impl Bundle {
     }
 
     /// Write the bundle's configs into a profile's state directories.
-    pub fn write_configs(&self, profiles_dir: &Path, name: &str) -> Result<usize> {
+    pub fn write_configs(
+        &self,
+        profiles_dir: &Path,
+        id: &crate::profile::ProfileId,
+    ) -> Result<usize> {
         let mut written = 0;
         for (target, files) in &self.configs {
-            let base = crate::state::profile_state_dir(profiles_dir, name, target);
+            let base = crate::state::profile_state_dir(profiles_dir, id, target);
             for (rel, file) in files {
                 let Some(safe) = safe_relative(rel) else {
                     continue;
@@ -307,6 +321,7 @@ mod tests {
                 enabled: true,
                 targets: None,
                 version: Some("0.9.9.15".into()),
+                file: None,
                 prerelease: false,
             }],
             configs: BTreeMap::new(),

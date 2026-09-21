@@ -11,6 +11,16 @@ Retail, Classic Era and progression Classic are separate games in Modifile, not
 flavors of one, because their addons are not interchangeable: they target
 different APIs and an addon built for one will not run on another."""
 maintainers = ["bundled"]
+# WoW is not on Steam, so there is no app id to derive art from. This is the
+# game's own icon, on a content-addressed URL — the path is a hash of the
+# bytes, so it cannot quietly change to something else.
+#
+# Deliberately only on this pack. Blizzard serves the same icon for Classic and
+# Classic Era, and three identical tiles in the rail would undo the thing
+# `art::initials` takes three letters to achieve: telling the WoW packs apart
+# at a glance. Those two keep their generated tiles until there is art that
+# actually distinguishes them.
+icon = "https://d2ertrwg9e34np.cloudfront.net/en/wow/original/1X/36dbe0c913654c607f510eb7bca5b5baa6a7b1bf.png"
 
 # Addons are plain Lua read at load time — nothing holds the files open, and
 # /reload picks up changes. So unlike a BepInEx game, mods can be installed
@@ -58,6 +68,10 @@ kind = "client"
 flavor = "mainline"
 markers = ["Wow.exe", "World of Warcraft.app", "WowT.exe"]
 processes = ["Wow.exe", "WowT.exe"]
+# Starting the game directly skips the Battle.net launcher, which is usually
+# what someone pressing Play wants. Paths only, and only inside the folder you
+# chose — a pack cannot name a command.
+launch = ["Wow.exe", "World of Warcraft.app"]
 # Refuse every other flavor's build.
 asset_reject = [
   "*-classic*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",

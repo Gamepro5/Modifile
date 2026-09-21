@@ -9,6 +9,7 @@ pub mod curseforge;
 pub mod forge;
 pub mod github;
 pub mod modrinth;
+pub mod thunderstore;
 
 use std::fmt;
 use std::str::FromStr;
@@ -27,6 +28,10 @@ pub enum SourceKind {
     Gitea,
     Modrinth,
     CurseForge,
+    /// Thunderstore. Keyless, and the index for most BepInEx games — Valheim,
+    /// Lethal Company, Risk of Rain 2, R.E.P.O. Its packages address each
+    /// other by exact version, which is also how its modpacks are built.
+    Thunderstore,
     /// A file the user supplied themselves. The escape hatch for mods no API
     /// will hand over — CurseForge projects whose authors disabled third-party
     /// downloads, private betas, your own local build.
@@ -41,6 +46,7 @@ impl SourceKind {
             SourceKind::Gitea => "gitea",
             SourceKind::Modrinth => "modrinth",
             SourceKind::CurseForge => "curseforge",
+            SourceKind::Thunderstore => "thunderstore",
             SourceKind::Local => "local",
         }
     }
@@ -52,6 +58,7 @@ impl SourceKind {
             SourceKind::Gitea => "Gitea",
             SourceKind::Modrinth => "Modrinth",
             SourceKind::CurseForge => "CurseForge",
+            SourceKind::Thunderstore => "Thunderstore",
             SourceKind::Local => "your file",
         }
     }
@@ -168,6 +175,9 @@ impl ModId {
             SourceKind::CurseForge => {
                 format!("https://www.curseforge.com/projects/{}", self.repo)
             }
+            SourceKind::Thunderstore => {
+                format!("https://thunderstore.io/package/{}/{}/", self.owner, self.repo)
+            }
             SourceKind::Local => String::new(),
         }
     }
@@ -241,6 +251,25 @@ impl FromStr for ModId {
                 return Ok(ModId::project(SourceKind::Modrinth, slug));
             }
         }
+        if let Some(rest) = bare.strip_prefix("thunderstore.io/") {
+            // Two shapes, both of which people copy out of the address bar:
+            //   /package/<namespace>/<name>/
+            //   /c/<community>/p/<namespace>/<name>/
+            let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+            let pair = match parts.as_slice() {
+                ["package", ns, name, ..] => Some((*ns, *name)),
+                ["c", _community, "p", ns, name, ..] => Some((*ns, *name)),
+                _ => None,
+            };
+            if let Some((ns, name)) = pair {
+                return Ok(ModId {
+                    kind: SourceKind::Thunderstore,
+                    owner: ns.to_string(),
+                    repo: name.to_string(),
+                    host: None,
+                });
+            }
+        }
         if let Some(rest) = bare.strip_prefix("curseforge.com/") {
             // curseforge.com/minecraft/mc-mods/<slug>
             if let Some(slug) = rest.split('/').filter(|p| !p.is_empty()).next_back() {
@@ -274,9 +303,28 @@ impl FromStr for ModId {
                 "local" => Ok(ModId::project(SourceKind::Local, rest)),
                 "modrinth" | "mr" => Ok(ModId::project(SourceKind::Modrinth, rest)),
                 "curseforge" | "cf" => Ok(ModId::project(SourceKind::CurseForge, rest)),
+                // Thunderstore addresses a package as namespace/name. Its own
+                // `Namespace-Name-Version` spelling is a *dependency* string
+                // and carries a version, so it is parsed where versions mean
+                // something — see `modpack::ThunderstoreManifest`.
+                "thunderstore" | "ts" => {
+                    let mut parts = rest.split('/').filter(|p| !p.is_empty());
+                    match (parts.next(), parts.next()) {
+                        (Some(ns), Some(name)) => Ok(ModId {
+                            kind: SourceKind::Thunderstore,
+                            owner: ns.to_string(),
+                            repo: name.to_string(),
+                            host: None,
+                        }),
+                        _ => Err(Error::other(format!(
+                            "`{s}` is not a Thunderstore id — expected \
+                             `thunderstore:Namespace/PackageName`"
+                        ))),
+                    }
+                }
                 other => Err(Error::other(format!(
                     "unknown mod source `{other}` — supported: github, gitlab, gitea, \
-                     codeberg, modrinth, curseforge"
+                     codeberg, modrinth, curseforge, thunderstore"
                 ))),
             };
         }
@@ -356,6 +404,39 @@ pub struct SearchHit {
     pub source_url: Option<String>,
     /// `Some(false)` means we checked and it publishes nothing installable.
     pub installable: Option<bool>,
+    /// A small square image for the project. Every index publishes one; none
+    /// of them published it into this struct until there was a UI that could
+    /// show it.
+    #[allow(clippy::doc_markdown)]
+    pub icon_url: Option<String>,
+    /// Who wrote it, where the index says so.
+    pub author: Option<String>,
+}
+
+/// The long form of a project, for a page about one mod rather than a row in a
+/// list.
+///
+/// Separate from `SearchHit` because it costs extra requests — a description,
+/// a screenshot list — and a list of twenty results should not pay for twenty
+/// of those to show twenty one-line summaries.
+#[derive(Debug, Clone, Default)]
+pub struct Details {
+    pub id: Option<ModId>,
+    pub title: String,
+    /// The one-line summary.
+    pub summary: String,
+    /// The full description, already reduced to plain text. Sources publish
+    /// this as HTML or Markdown and neither is worth rendering here.
+    pub body: Option<String>,
+    pub icon_url: Option<String>,
+    pub gallery: Vec<String>,
+    pub authors: Vec<String>,
+    pub downloads: u64,
+    pub source_url: Option<String>,
+    pub web_url: String,
+    pub license: Option<String>,
+    /// True when this project is a modpack rather than a single mod.
+    pub is_pack: bool,
 }
 
 impl SearchHit {

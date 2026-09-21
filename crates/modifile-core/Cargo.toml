@@ -15,9 +15,14 @@ serde_json = "1.0.151"
 sha2 = "0.10"
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 toml = "1.1.6"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# The Linux release archive is a .tar.gz, so self-update needs to open one.
+# flate2 is already in the tree behind zip's deflate support, so this costs a
+# small tar reader and nothing else.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 toml = "1.1.6"

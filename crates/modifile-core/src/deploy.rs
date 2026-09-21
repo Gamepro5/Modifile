@@ -47,11 +47,30 @@ impl LinkMode {
     }
 }
 
+/// Which directory a file's `rel` is relative to.
+///
+/// An instanced profile puts almost everything in its own directory and leaves
+/// the game folder alone. The exception is the injector — a DLL the game loads
+/// on startup, which by definition has to be beside the executable. Tracking
+/// the base per file is what lets one manifest describe both and take both
+/// back out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Base {
+    /// The game's own directory.
+    #[default]
+    Game,
+    /// This profile's instance directory.
+    Instance,
+}
+
 /// One file that will be placed in the game directory.
 #[derive(Debug, Clone)]
 pub struct PlannedFile {
-    /// Destination relative to the target root.
+    /// Destination relative to `base`.
     pub rel: PathBuf,
+    /// Which root `rel` hangs off.
+    pub base: Base,
     /// Absolute path inside the store.
     pub src: PathBuf,
     pub size: u64,
@@ -74,7 +93,11 @@ pub struct Conflict {
 pub struct Plan {
     pub game: String,
     pub target: String,
+    /// The game's own directory.
     pub root: PathBuf,
+    /// Where this profile's own tree goes, when it is instanced. `None` means
+    /// the ordinary case: everything lands in the game directory.
+    pub instance: Option<PathBuf>,
     pub files: Vec<PlannedFile>,
     pub conflicts: Vec<Conflict>,
     /// Mods with nothing to install here — usually a pack missing a rule.
@@ -88,6 +111,25 @@ pub struct Plan {
 impl Plan {
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
+    }
+
+    /// The directory one planned file lands in.
+    pub fn base_dir(&self, base: Base) -> &Path {
+        match base {
+            Base::Instance => self.instance.as_deref().unwrap_or(&self.root),
+            Base::Game => &self.root,
+        }
+    }
+
+    /// How many files this puts into the real game directory.
+    ///
+    /// For an instanced profile this should be the injector and nothing else,
+    /// and it is worth being able to say so out loud.
+    pub fn touching_game_dir(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|f| f.base == Base::Game)
+            .count()
     }
 }
 
@@ -105,6 +147,11 @@ pub struct Manifest {
     pub target: String,
     pub profile: String,
     pub root: PathBuf,
+    /// The instance directory this profile was deployed into, when it is an
+    /// instanced one. Absent on every manifest written before instancing
+    /// existed, which is exactly what `Base::Game` then means.
+    #[serde(default)]
+    pub instance: Option<PathBuf>,
     pub mode: Option<LinkMode>,
     pub deployed_ms: u64,
     /// False once the profile has been deactivated. The record survives
@@ -121,6 +168,10 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFile {
     pub rel: PathBuf,
+    /// Which root `rel` hangs off. Defaults to the game directory, so a
+    /// manifest written before instancing reads correctly.
+    #[serde(default)]
+    pub base: Base,
     pub store_sha: String,
     pub size: u64,
     /// Modification time as observed right after we created the file. Together
@@ -130,6 +181,19 @@ pub struct ManifestFile {
 }
 
 impl Manifest {
+    /// The directory a recorded file lives in.
+    pub fn base_dir(&self, base: Base) -> &Path {
+        match base {
+            Base::Instance => self.instance.as_deref().unwrap_or(&self.root),
+            Base::Game => &self.root,
+        }
+    }
+
+    /// The absolute path of one recorded file.
+    pub fn path_of(&self, file: &ManifestFile) -> PathBuf {
+        self.base_dir(file.base).join(&file.rel)
+    }
+
     pub fn load(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
@@ -188,6 +252,7 @@ pub fn plan(
     pack: &CompiledPack,
     target: &Target,
     root: &Path,
+    instance: Option<&Path>,
     profile: &Profile,
     lock: &Lock,
     store: &Store,
@@ -221,10 +286,18 @@ pub fn plan(
                 continue;
             };
 
+            // Instanced: everything goes to the instance except the injector,
+            // which has to sit beside the executable to be loaded at all.
+            let base = match instance {
+                Some(_) if !pack.belongs_in_game_dir(&rel) => Base::Instance,
+                _ => Base::Game,
+            };
+
             if let Some(previous) = claims.insert(
                 rel.clone(),
                 PlannedFile {
                     rel: rel.clone(),
+                    base,
                     src: file.abs,
                     size: file.size,
                     mod_id: mod_id.clone(),
@@ -272,6 +345,7 @@ pub fn plan(
         game: pack.id().to_string(),
         target: target.id.clone(),
         root: root.to_path_buf(),
+        instance: instance.map(Path::to_path_buf),
         files: claims.into_values().collect(),
         conflicts,
         empty_mods,
@@ -406,7 +480,8 @@ pub fn apply(
     let mut files = Vec::with_capacity(plan.files.len());
 
     for planned in &plan.files {
-        let dst = plan.root.join(&planned.rel);
+        let base = plan.base_dir(planned.base).to_path_buf();
+        let dst = base.join(&planned.rel);
 
         if let Some(parent) = dst.parent() {
             if !parent.exists() {
@@ -415,7 +490,7 @@ pub fn apply(
                 // Record every level we brought into existence so revert can
                 // unwind exactly those and leave the game's own dirs alone.
                 let mut cursor = parent.to_path_buf();
-                while cursor.starts_with(&plan.root) && cursor != plan.root {
+                while cursor.starts_with(&base) && cursor != base {
                     created_dirs.insert(cursor.clone());
                     let Some(up) = cursor.parent().map(|p| p.to_path_buf()) else {
                         break;
@@ -467,6 +542,7 @@ pub fn apply(
         report.bytes += planned.size;
         files.push(ManifestFile {
             rel: planned.rel.clone(),
+            base: planned.base,
             store_sha: planned.store_sha.clone(),
             size: planned.size,
             mtime_ms: mtime_ms(&dst),
@@ -484,6 +560,7 @@ pub fn apply(
             target: plan.target.clone(),
             profile: profile_name.to_string(),
             root: plan.root.clone(),
+            instance: plan.instance.clone(),
             mode: Some(mode),
             deployed_ms: crate::paths::now_millis(),
             active: true,
@@ -503,7 +580,7 @@ pub fn apply(
 pub fn revert(manifest: &Manifest, report: &mut DeployReport, force: bool) -> Result<usize> {
     let mut removed = 0;
     for record in &manifest.files {
-        let path = manifest.root.join(&record.rel);
+        let path = manifest.path_of(record);
         if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
             continue;
         }
@@ -541,7 +618,7 @@ pub fn drop_modified(manifest: &Manifest) -> (usize, Vec<PathBuf>) {
     let mut dropped = 0;
     let mut failed = Vec::new();
     for record in &manifest.files {
-        let path = manifest.root.join(&record.rel);
+        let path = manifest.path_of(record);
         if !path.exists() {
             continue;
         }
@@ -699,7 +776,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf, u64)>
 pub fn verify(manifest: &Manifest) -> VerifyReport {
     let mut report = VerifyReport::default();
     for record in &manifest.files {
-        let path = manifest.root.join(&record.rel);
+        let path = manifest.path_of(record);
         if std::fs::symlink_metadata(&path).is_err() {
             report.missing.push(record.rel.clone());
         } else if !still_ours(&path, record) {
@@ -740,6 +817,8 @@ mod tests {
                 name: "Scan Test".into(),
                 description: String::new(),
                 maintainers: vec![],
+                icon: None,
+                art: None,
             },
             targets: vec![Target {
                 id: "client".into(),
@@ -752,6 +831,7 @@ mod tests {
                 paths: BTreeMap::new(),
                 steam: None,
                 candidates: vec![],
+                launch: vec![],
             }],
             paths,
             assets: Default::default(),
@@ -760,6 +840,7 @@ mod tests {
             },
             versions: Default::default(),
             loaders: Vec::new(),
+            instance: None,
             search: Default::default(),
             running: Default::default(),
             install: vec![
@@ -770,6 +851,7 @@ mod tests {
                     flatten: true,
                     targets: None,
                     mutable: false,
+                    skip: false,
                 },
                 InstallRule {
                     pattern: "**/*.cfg".into(),
@@ -778,6 +860,7 @@ mod tests {
                     flatten: true,
                     targets: None,
                     mutable: true,
+                    skip: false,
                 },
             ],
             readable_extensions: vec!["lua".into()],
@@ -804,6 +887,7 @@ mod tests {
 
         let record = |rel: &str, size: u64| ManifestFile {
             rel: PathBuf::from("BepInEx/plugins").join(rel),
+            base: Base::Game,
             store_sha: "0".into(),
             size,
             mtime_ms: mtime_ms(&plugins.join(rel)),
@@ -814,6 +898,7 @@ mod tests {
             target: "client".into(),
             profile: "main".into(),
             root: root.clone(),
+            instance: None,
             mode: Some(LinkMode::Hardlink),
             deployed_ms: 0,
             active: true,
@@ -869,6 +954,7 @@ mod tests {
 
         let record = |name: &str, path: &std::path::Path| ManifestFile {
             rel: PathBuf::from("BepInEx/plugins").join(name),
+            base: Base::Game,
             store_sha: "0".into(),
             size: std::fs::metadata(path).unwrap().len(),
             mtime_ms: mtime_ms(path),
@@ -879,6 +965,7 @@ mod tests {
             target: "client".into(),
             profile: "main".into(),
             root: root.clone(),
+            instance: None,
             mode: Some(LinkMode::Copy),
             deployed_ms: 0,
             active: true,
@@ -928,6 +1015,7 @@ mod tests {
 
         let record = ManifestFile {
             rel: PathBuf::from("x.txt"),
+            base: Base::Game,
             store_sha: "0".into(),
             size: 5,
             mtime_ms: mtime_ms(&file),

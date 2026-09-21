@@ -84,6 +84,58 @@ fn add_launcher_profile(mc_dir: &Path, id: &str, name: &str) -> Result<()> {
     write_atomic(&path, &serde_json::to_vec_pretty(&file)?)
 }
 
+/// Point a Minecraft launcher profile at an instance directory.
+///
+/// This is how Minecraft is instanced: the official launcher takes a `gameDir`
+/// per profile, and everything the game writes — mods, config, saves, options
+/// — goes there instead of into `.minecraft`. Prism and MultiMC do the same
+/// thing with their own instance folders.
+///
+/// The launcher owns the process, so Modifile writes the profile and opens the
+/// launcher; you pick the profile there. Less seamless than a Play button that
+/// starts the game outright, and honest about what it can actually do.
+///
+/// Unknown keys in `launcher_profiles.json` are preserved, because that file
+/// belongs to the launcher and holds accounts and settings Modifile has no
+/// business rewriting.
+pub fn write_game_dir_profile(mc_dir: &Path, profile_name: &str, game_dir: &Path) -> Result<()> {
+    let path = mc_dir.join("launcher_profiles.json");
+    if !path.exists() {
+        return Err(Error::NotFound(format!(
+            "{} — Modifile writes a launcher profile pointing at this instance, and the \
+             Minecraft launcher has not created its profile list yet. Run the launcher \
+             once first.",
+            path.display()
+        )));
+    }
+    std::fs::create_dir_all(game_dir).ctx(format!("creating {}", game_dir.display()))?;
+
+    let raw = std::fs::read(&path).ctx(format!("reading {}", path.display()))?;
+    let mut file: LauncherProfiles = serde_json::from_slice(&raw).unwrap_or_default();
+
+    // Keyed by a name of ours so repeated launches update one entry rather
+    // than filling the launcher with duplicates.
+    let key = format!("modifile-{}", crate::engine::sanitize_name(profile_name));
+    let existing = file.profiles.get(&key).cloned();
+    let last_version = existing
+        .as_ref()
+        .and_then(|e| e.get("lastVersionId").cloned())
+        .unwrap_or(serde_json::Value::String("latest-release".to_string()));
+
+    file.profiles.insert(
+        key,
+        serde_json::json!({
+            "name": format!("{profile_name} (Modifile)"),
+            "type": "custom",
+            "lastVersionId": last_version,
+            "gameDir": game_dir.to_string_lossy(),
+            "icon": "Furnace",
+        }),
+    );
+
+    write_atomic(&path, &serde_json::to_vec_pretty(&file)?)
+}
+
 /// Install Fabric or Quilt by writing the version profile their metadata
 /// service hands out.
 pub async fn install_meta_loader(

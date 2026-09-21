@@ -37,6 +37,10 @@ pub struct Pack {
     /// Mod loaders this game can use, installable from here.
     #[serde(default)]
     pub loaders: Vec<LoaderDef>,
+    /// How this game can be pointed at a mod directory that is not its own.
+    /// Absent means it cannot, and Play is not offered for it.
+    #[serde(default)]
+    pub instance: Option<InstanceRules>,
     #[serde(default)]
     pub search: SearchRules,
     #[serde(default)]
@@ -82,6 +86,17 @@ pub struct GameMeta {
     /// Who to blame for the pack, not the game.
     #[serde(default)]
     pub maintainers: Vec<String>,
+    /// A square icon for the game, as a URL.
+    ///
+    /// A URL rather than a bundled file, deliberately. Game artwork is not
+    /// ours to redistribute, and a pack is data that anyone may write — so the
+    /// pack points at art it is entitled to point at, and a pack that names
+    /// none gets a generated tile instead of a broken image.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// A wide image for the game's own page.
+    #[serde(default)]
+    pub art: Option<String>,
 }
 
 /// An install target: a client, a dedicated server, or a game flavor (WoW
@@ -121,6 +136,15 @@ pub struct Target {
     /// Extra guesses, `${VAR}` expanded. Skipped when a variable is unset.
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// Executables that start this target, relative to its root. The first one
+    /// that exists is used, which is how one entry covers `game.exe` and
+    /// `game.x86_64` without knowing the platform.
+    ///
+    /// Paths only, and only inside the game directory — a pack cannot name a
+    /// command. See `crate::launch` for why that line is where it is. Steam
+    /// targets need nothing here: `[targets.steam]` is a better route.
+    #[serde(default)]
+    pub launch: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -226,6 +250,54 @@ pub struct RunningRules {
 /// Minecraft and has nothing at all for World of Warcraft; WoW addons live on
 /// CurseForge, but the ones that can actually be installed from here are the
 /// ones that publish GitHub releases — so for WoW, GitHub *is* the right index.
+/// How a game can be told to read its mods from somewhere else.
+///
+/// This is what makes Play safe. Activating puts mods in the game folder and
+/// leaves them there; an instance never touches the game folder at all, so
+/// there is nothing to undo when you quit and nothing to lose if the power
+/// goes out mid-session. It is what r2modman and Prism do, and the reason
+/// neither of them has to "revert" anything.
+///
+/// It costs almost nothing here. Other launchers duplicate mod files per
+/// profile; Modifile deploys by hard link from one content-addressed store, so
+/// ten instances of the same 900 MB pack cost 900 MB and some directory
+/// entries. The only per-instance data is saves and configs, which you wanted
+/// separate anyway.
+///
+/// Not every game can do this. WoW reads addons from `Interface/AddOns` and
+/// nowhere else, so its pack declares no `[instance]` and Modifile says so
+/// rather than pretending.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstanceRules {
+    pub kind: InstanceKind,
+    /// `doorstop`: the assembly to invoke, relative to the instance. BepInEx
+    /// derives its whole root from where this lives, which is exactly the
+    /// hook an instance needs.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Files that must sit in the *real* game folder for the redirection to
+    /// work at all — the doorstop shim is a DLL the game loads on startup, so
+    /// it cannot live anywhere else.
+    ///
+    /// These are the only things an instanced profile writes into the game
+    /// directory, and they do nothing unless Modifile launches the game with
+    /// redirection switched on. Launched any other way, the game is vanilla.
+    #[serde(default)]
+    pub game_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstanceKind {
+    /// UnityDoorstop, which every BepInEx game uses. The game is launched with
+    /// `--doorstop-target-assembly <instance>/…`, and BepInEx then reads its
+    /// plugins and configs from beside that assembly.
+    Doorstop,
+    /// Minecraft's own launcher, which takes a `gameDir` per profile. Modifile
+    /// writes the profile; the launcher runs the game against it.
+    MinecraftLauncher,
+}
+
 /// Which to use is therefore a property of the game, and lives in the pack.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SearchRules {
@@ -243,6 +315,22 @@ pub struct SearchRules {
     /// slug copied out of a URL has to be looked up against a specific game.
     #[serde(default)]
     pub curseforge_game_id: Option<u32>,
+    /// CurseForge's class id for this game's *mods*. Per game, not universal —
+    /// Minecraft mods are 6, and a number from one game means nothing in
+    /// another. Absent means "do not narrow", which returns everything the
+    /// game publishes and is the safe answer for a pack that has not been
+    /// told which class to ask for.
+    #[serde(default)]
+    pub curseforge_class_id: Option<u32>,
+    /// CurseForge's class id for this game's *modpacks*, where it has them.
+    /// Absent means this game has no modpacks to browse.
+    #[serde(default)]
+    pub curseforge_modpack_class_id: Option<u32>,
+    /// Thunderstore's community slug for this game — `valheim`, `repo`,
+    /// `lethal-company`. A Thunderstore package names no game, so this is what
+    /// lets a downloaded pack be matched to the game pack it belongs to.
+    #[serde(default)]
+    pub thunderstore_community: Option<String>,
 }
 
 impl SearchRules {
@@ -390,6 +478,16 @@ pub struct InstallRule {
     /// removed on undeploy — the profile owns it from then on.
     #[serde(default)]
     pub mutable: bool,
+    /// Matched, and deliberately not installed.
+    ///
+    /// Needed because matching is first-wins and the general rules carry no
+    /// target restriction. A modpack's `client-overrides/config/**` has to be
+    /// claimed for the server by *something*, or it falls through to the plain
+    /// config rule and gets planted on a dedicated server — which is the one
+    /// thing naming the tree "client" was meant to prevent. `into` is ignored
+    /// for these.
+    #[serde(default)]
+    pub skip: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +501,8 @@ pub struct CompiledPack {
     install: Vec<CompiledRule>,
     reject: Vec<GlobMatcher>,
     unpack: Vec<GlobMatcher>,
+    /// `[instance] game_files`, compiled once.
+    game_files: Vec<GlobMatcher>,
 }
 
 #[derive(Debug, Clone)]
@@ -479,18 +579,88 @@ impl CompiledPack {
             .filter_map(|p| compile(p).ok())
             .collect();
 
+        let game_files = pack
+            .instance
+            .as_ref()
+            .map(|i| {
+                i.game_files
+                    .iter()
+                    .filter_map(|p| compile(&p.to_ascii_lowercase()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             reject,
             unpack,
             install,
+            game_files,
             pack,
         })
+    }
+
+    /// Can this game read its mods from a directory that is not its own?
+    pub fn instancing(&self) -> Option<&InstanceRules> {
+        self.pack.instance.as_ref()
+    }
+
+    /// Does this destination have to go into the real game folder even when
+    /// the profile is instanced?
+    ///
+    /// Only the injector does. Everything else belongs to the instance, which
+    /// is the entire point: the game directory stays vanilla.
+    pub fn belongs_in_game_dir(&self, rel: &Path) -> bool {
+        if self.game_files.is_empty() {
+            return false;
+        }
+        let lowered = rel.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+        let base = lowered.rsplit('/').next().unwrap_or(&lowered).to_string();
+        self.game_files
+            .iter()
+            .any(|m| m.is_match(&lowered) || m.is_match(&base))
     }
 
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).ctx(format!("reading {}", path.display()))?;
         let pack: Pack = toml::from_str(&text).ctx(format!("parsing {}", path.display()))?;
         Self::new(pack)
+    }
+
+    /// The Steam app id of this game's client, if it has one.
+    fn steam_app(&self) -> Option<u32> {
+        self.pack
+            .targets
+            .iter()
+            .find(|t| t.kind == TargetKind::Client)
+            .or_else(|| self.pack.targets.first())
+            .and_then(|t| t.steam.as_ref())
+            .map(|s| s.app_id)
+    }
+
+    /// Portrait box art for the game, for a tile in a grid.
+    ///
+    /// A pack's own `icon` wins. Failing that, a game with a Steam app id gets
+    /// Steam's public library art — which is the game's own store artwork,
+    /// served by the same CDN a browser would use, and costs the pack author
+    /// nothing to have. A game with neither gets `None`, and the UI draws a
+    /// generated tile rather than a broken image.
+    pub fn icon_url(&self) -> Option<String> {
+        if let Some(url) = &self.pack.game.icon {
+            return Some(url.clone());
+        }
+        self.steam_app().map(|id| {
+            format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/library_600x900.jpg")
+        })
+    }
+
+    /// A wide image for the top of the game's own page.
+    pub fn banner_url(&self) -> Option<String> {
+        if let Some(url) = &self.pack.game.art {
+            return Some(url.clone());
+        }
+        self.steam_app().map(|id| {
+            format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/header.jpg")
+        })
     }
 
     pub fn id(&self) -> &str {
@@ -520,6 +690,10 @@ impl CompiledPack {
     }
 
     /// Pick the install rule for one archive entry, or `None` to skip the file.
+    ///
+    /// A rule marked `skip` answers `None` too: it exists to stop a later,
+    /// broader rule from claiming the file, and "nothing installs this" is the
+    /// same answer either way as far as every caller is concerned.
     pub fn rule_for(&self, archive_path: &str, target_id: &str) -> Option<&InstallRule> {
         let lowered = archive_path.to_ascii_lowercase();
         self.install
@@ -534,6 +708,7 @@ impl CompiledPack {
                 applies && c.matcher.is_match(&lowered)
             })
             .map(|c| &c.rule)
+            .filter(|rule| !rule.skip)
     }
 
     /// Where one archive entry lands, relative to the target root.

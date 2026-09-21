@@ -16,17 +16,21 @@ pub mod engine;
 pub mod error;
 pub mod hash;
 pub mod http;
+pub mod launch;
 pub mod loader;
+pub mod modpack;
 pub mod pack;
 pub mod paths;
 pub mod process;
 pub mod profile;
 pub mod roots;
+pub mod selfupdate;
 pub mod share;
 pub mod source;
 pub mod state;
 pub mod steam;
 pub mod storage;
+pub mod text;
 pub mod store;
 pub mod trust;
 
@@ -52,6 +56,7 @@ pub const BUNDLED_PACKS: &[(&str, &str)] = &[
         include_str!("../../../packs/wow-classic.toml"),
     ),
     ("valheim.toml", include_str!("../../../packs/valheim.toml")),
+    ("repo.toml", include_str!("../../../packs/repo.toml")),
     ("minecraft.toml", include_str!("../../../packs/minecraft.toml")),
 ];
 

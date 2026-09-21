@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use modifile_core::deploy::LinkMode;
-use modifile_core::engine::{format_bytes, DeployOptions, Event};
+use modifile_core::engine::{format_bytes, DeployOptions, Event, ModpackSource};
 use modifile_core::pack::Target;
-use modifile_core::profile::ModEntry;
+use modifile_core::profile::{ModEntry, ProfileId};
 use modifile_core::{Engine, Lock, ModId, Paths, Profile, Result};
 
 #[derive(Parser)]
@@ -100,9 +100,19 @@ enum Command {
         target: String,
         path: PathBuf,
     },
-    /// Check GitHub for new versions and download anything missing.
+    /// Check each mod's source for new versions and download anything missing.
+    ///
+    /// One profile by default. `--all` does every profile of every game, which
+    /// is a thing you should have to ask for: it is a lot of downloading, and
+    /// it changes profiles you were not looking at.
     #[command(alias = "sync")]
-    Update { profile: String },
+    Update {
+        /// The profile to update. Omit it with `--all`.
+        profile: Option<String>,
+        /// Update every profile of every game.
+        #[arg(long)]
+        all: bool,
+    },
     /// Put this profile's mods into the game. Modifile is not a launcher —
     /// afterwards you start the game however you normally do.
     #[command(alias = "deploy")]
@@ -237,6 +247,76 @@ enum Command {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Import or inspect a modpack.
+    ///
+    /// A modpack is a profile somebody else assembled — a game version, a
+    /// loader, a pinned mod list and a tree of config files. Importing one
+    /// writes exactly that and stops; the mods are fetched by the next
+    /// `modifile update`, through the same verification and trust checks
+    /// every other mod goes through.
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
+    /// Activate a profile and start the game.
+    ///
+    /// A convenience, not a supervisor. By default this activates, launches,
+    /// and exits — nothing of Modifile's is left running, exactly as if you
+    /// had started the game from Steam.
+    ///
+    /// With `--revert-on-exit` it instead waits for the game to close and then
+    /// deactivates, so the game is vanilla again afterwards. Killing Modifile
+    /// during that wait leaves the mods installed, which is the ordinary
+    /// activated state — there is nothing half-applied to recover from.
+    Play {
+        profile: String,
+        /// Which target to start. Defaults to the client.
+        #[arg(long)]
+        target: Option<String>,
+        /// Obsolete, and accepted only so an old command line still runs.
+        /// Play no longer modifies the game install, so there is nothing to
+        /// revert.
+        #[arg(long, hide = true)]
+        revert_on_exit: bool,
+        /// Set the command used to start this profile's game, instead of
+        /// playing. Use an empty string to clear it.
+        #[arg(long)]
+        set_command: Option<String>,
+    },
+    /// Update Modifile itself.
+    ///
+    /// Checks the project's GitHub releases for a newer version, verifies the
+    /// download against the digest GitHub publishes for it, and swaps the
+    /// binaries in place. The previous ones are kept aside until the next run
+    /// in case the swap goes wrong.
+    #[command(alias = "self-update")]
+    Selfupdate {
+        /// Report what is available and stop.
+        #[arg(long)]
+        check: bool,
+        /// Install without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Look for new versions on startup. Off means never check.
+        #[arg(long)]
+        check_on_startup: Option<bool>,
+        /// Install updates without asking, whenever one is found.
+        #[arg(long)]
+        automatic: Option<bool>,
+    },
+    /// Show or change what Modifile is willing to install.
+    ///
+    /// By default it refuses a mod that ships a compiled file, publishes no
+    /// source anywhere and declares no licence — there is simply nothing to
+    /// check. That is the right default and the wrong one for some libraries:
+    /// most Thunderstore mods for Unity games are closed-source binaries, so a
+    /// modpack for one of those games is largely unusable until you decide to
+    /// accept that.
+    Trust {
+        /// Install mods that publish no source code at all.
+        #[arg(long)]
+        allow_no_source: Option<bool>,
+    },
     /// Show what is downloaded and which profiles still want it.
     Storage {
         /// Delete everything nothing references.
@@ -245,6 +325,48 @@ enum Command {
     },
     /// Delete store entries no profile references.
     Gc,
+}
+
+#[derive(Subcommand)]
+enum PackAction {
+    /// Create a profile from a modpack.
+    ///
+    /// Takes a Modrinth `.mrpack`, a CurseForge pack zip, or a Thunderstore
+    /// package — as a file you downloaded, a link, or an id such as
+    /// `thunderstore:Author-PackName` or `modrinth:some-pack`.
+    ///
+    /// Modrinth and Thunderstore need no API key. CurseForge needs the one
+    /// you supply with `modifile auth --curseforge`.
+    Add {
+        /// A file path, a URL, or a pack id.
+        source: String,
+        /// Name the profile something other than the pack's own name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Which game the pack is for. Only needed for Thunderstore packs,
+        /// which do not record their game anywhere.
+        #[arg(long)]
+        game: Option<String>,
+        /// Download the mods straight away, rather than leaving it to
+        /// `modifile update`.
+        #[arg(long)]
+        update: bool,
+    },
+    /// Read a modpack and print what is in it, without importing anything.
+    Info {
+        /// A file path, a URL, or a pack id.
+        source: String,
+        /// Which game the pack is for, for Thunderstore packs.
+        #[arg(long)]
+        game: Option<String>,
+    },
+    /// Find a modpack by name.
+    Search {
+        query: Vec<String>,
+        /// Which game's packs to look for. Optional when you have one pack.
+        #[arg(long)]
+        game: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -303,7 +425,10 @@ fn run() -> Result<()> {
         .build()
         .map_err(modifile_core::Error::Io)?;
 
-    let engine = Engine::open(paths.clone(), load_token(&paths))?;
+    let mut engine = Engine::open(paths.clone(), load_token(&paths))?;
+    // A binary replaced by an update is parked aside until nothing is running
+    // it, which is the run after the one that installed it. This is that run.
+    engine.tidy_after_update();
     for (path, error) in &engine.pack_errors {
         eprintln!("warning: ignoring pack {}: {error}", path.display());
     }
@@ -353,7 +478,14 @@ fn run() -> Result<()> {
             target,
             path,
         } => cmd_root(&engine, &profile, &target, path),
-        Command::Update { profile } => runtime.block_on(cmd_sync(&engine, &profile)),
+        Command::Update { profile, all } => match (all, profile) {
+            (true, _) => runtime.block_on(cmd_sync_all(&engine)),
+            (false, Some(name)) => runtime.block_on(cmd_sync(&engine, &name)),
+            (false, None) => Err(modifile_core::Error::other(
+                "which profile? Name one, or pass --all to update every profile of \
+                 every game.",
+            )),
+        },
         Command::Set {
             profile,
             loader,
@@ -377,7 +509,7 @@ fn run() -> Result<()> {
             if let Some(v) = &game_version {
                 loaded.game_version = Some(v.clone());
             }
-            loaded.save(&engine.paths.profile_file(&profile))?;
+            loaded.save(&engine.paths.profile_file(&loaded.id()))?;
             println!(
                 "`{profile}` is now for {} {}",
                 loaded.game_version.as_deref().unwrap_or("any version"),
@@ -389,7 +521,7 @@ fn run() -> Result<()> {
             runtime.block_on(cmd_loader(&engine, &profile, install))
         }
         Command::Rename { from, to } => {
-            let name = engine.rename_profile(&from, &to)?;
+            let name = engine.rename_profile(&resolve(&engine, &from)?, &to)?;
             println!("`{from}` is now `{name}`.");
             Ok(())
         }
@@ -449,6 +581,53 @@ fn run() -> Result<()> {
         Command::Search { query, profile } => {
             runtime.block_on(cmd_search(&engine, &query.join(" "), profile.as_deref()))
         }
+        Command::Pack { action } => match action {
+            PackAction::Add {
+                source,
+                name,
+                game,
+                update,
+            } => runtime.block_on(cmd_pack_add(
+                &engine,
+                &source,
+                name.as_deref(),
+                game.as_deref(),
+                update,
+            )),
+            PackAction::Info { source, game } => {
+                runtime.block_on(cmd_pack_info(&engine, &source, game.as_deref()))
+            }
+            PackAction::Search { query, game } => runtime.block_on(cmd_pack_search(
+                &engine,
+                &query.join(" "),
+                game.as_deref(),
+            )),
+        },
+        Command::Play {
+            profile,
+            target,
+            revert_on_exit,
+            set_command,
+        } => cmd_play(
+            &engine,
+            &profile,
+            target.as_deref(),
+            revert_on_exit,
+            set_command.as_deref(),
+        ),
+        Command::Selfupdate {
+            check,
+            yes,
+            check_on_startup,
+            automatic,
+        } => runtime.block_on(cmd_selfupdate(
+            &engine,
+            check,
+            yes,
+            check_on_startup,
+            automatic,
+        )),
+        Command::Trust { allow_no_source } => cmd_trust(&mut engine, allow_no_source),
         Command::Storage { clean } => cmd_storage(&engine, clean),
         Command::Gc => cmd_gc(&engine),
     }
@@ -475,6 +654,366 @@ fn cmd_export(
         bundle.config_count()
     );
     println!("Send that file to anyone; they run `modifile import <file>`.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Modpacks
+// ---------------------------------------------------------------------------
+
+fn cmd_play(
+    engine: &Engine,
+    name: &str,
+    target: Option<&str>,
+    _revert_on_exit: bool,
+    set_command: Option<&str>,
+) -> Result<()> {
+    let profile = load_profile(engine, name)?;
+    let pack = engine.pack_for(&profile)?;
+
+    if let Some(command) = set_command {
+        engine.set_launch_command(pack.id(), Some(command))?;
+        return match command.trim().is_empty() {
+            true => {
+                println!("Cleared the launch command for {}.", pack.pack.game.name);
+                Ok(())
+            }
+            false => {
+                println!("{} will start with: {command}", pack.pack.game.name);
+                Ok(())
+            }
+        };
+    }
+
+    // The client unless told otherwise: nobody means "start the dedicated
+    // server" by "play".
+    let targets = engine.targets(pack, &profile);
+    let (chosen, root) = targets
+        .iter()
+        .filter(|(t, root)| root.is_some() && target.is_none_or(|want| want == t.id))
+        .find(|(t, _)| target.is_some() || t.kind == modifile_core::TargetKind::Client)
+        .or_else(|| targets.iter().find(|(_, root)| root.is_some()))
+        .map(|(t, root)| (t.clone(), root.clone().unwrap()))
+        .ok_or_else(|| {
+            modifile_core::Error::other(format!(
+                "no game directory is known for `{name}`. Set one with `modifile root`."
+            ))
+        })?;
+
+    // Play installs into the profile's own tree, which is not where Activate
+    // puts things, so this runs whether or not the profile is activated.
+    let lock = modifile_core::profile::Lock::load(&engine.paths.lock_file(&profile.id()))?;
+    let plan = engine.plan_instanced(pack, &profile, &lock, &chosen, &root)?;
+    let report = engine.deploy(
+        pack,
+        &chosen,
+        &plan,
+        &profile.id(),
+        modifile_core::engine::DeployOptions::default(),
+    )?;
+    if report.linked > 0 {
+        println!("{} file(s) placed in this profile's own folder.", report.linked);
+    }
+
+    let method = engine.play(pack, &profile, &chosen, &root)?;
+    println!("Starting {} — {}.", chosen.name, method.describe());
+    println!();
+    println!(
+        "`{name}` has its own folder and the game was pointed at it for this run. Your 
+         {} install was not modified, so there is nothing to undo when you quit — and 
+         nothing to lose if the machine loses power mid-session.",
+        pack.pack.game.name
+    );
+    Ok(())
+}
+
+/// Update every profile of every game.
+///
+/// Sequential on purpose: each profile prints its own block, and interleaving
+/// a dozen of them would make the output useless. One profile failing does not
+/// stop the rest — the point of asking for all of them is not having to babysit
+/// it.
+async fn cmd_sync_all(engine: &Engine) -> Result<()> {
+    let ids = engine.all_profiles();
+    if ids.is_empty() {
+        println!("No profiles to update.");
+        return Ok(());
+    }
+
+    println!("Updating {} profile(s) across every game.\n", ids.len());
+    let mut failed = Vec::new();
+    for id in &ids {
+        println!("──── {id} ────");
+        if let Err(e) = cmd_sync(engine, &id.qualified()).await {
+            eprintln!("  {id}: {e}");
+            failed.push(id.clone());
+        }
+        println!();
+    }
+
+    if failed.is_empty() {
+        println!("All {} profile(s) updated.", ids.len());
+    } else {
+        println!(
+            "{} of {} updated; {} could not be: {}.",
+            ids.len() - failed.len(),
+            ids.len(),
+            failed.len(),
+            failed
+                .iter()
+                .map(|id| id.qualified())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_selfupdate(
+    engine: &Engine,
+    check_only: bool,
+    yes: bool,
+    check_on_startup: Option<bool>,
+    automatic: Option<bool>,
+) -> Result<()> {
+    // Settings first, so `--automatic true` on its own is a way to set it.
+    let mut changed = false;
+    if let Some(on) = check_on_startup {
+        engine.set_update_checks(on)?;
+        changed = true;
+    }
+    if let Some(on) = automatic {
+        engine.set_auto_update(on)?;
+        changed = true;
+    }
+    if changed {
+        println!(
+            "Check for new versions on startup: {}",
+            yes_no(engine.checks_for_updates())
+        );
+        println!(
+            "Install them without asking:       {}",
+            yes_no(engine.auto_updates())
+        );
+        if check_on_startup.is_some() && automatic.is_none() {
+            return Ok(());
+        }
+        if automatic.is_some() && !check_only {
+            return Ok(());
+        }
+    }
+
+    let current = modifile_core::selfupdate::current_version();
+    println!("This is Modifile {current}.");
+
+    let Some(available) = engine.check_for_update().await? else {
+        println!("Nothing newer has been published.");
+        return Ok(());
+    };
+
+    println!();
+    println!("Modifile {} is available.", available.version);
+    if !available.published_at.is_empty() {
+        println!("  published {}", available.published_at);
+    }
+    println!("  {} ({})", available.asset.name, format_bytes(available.size()));
+    println!("  {}", available.web_url);
+
+    if check_only {
+        println!();
+        println!("Install it with `modifile selfupdate --yes`.");
+        return Ok(());
+    }
+
+    if !yes {
+        println!();
+        println!("This replaces the `modifile` and `modifile-gui` binaries where they are");
+        println!("installed. Run it again with --yes to go ahead.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Downloading and verifying…");
+    let report = engine.install_update(&available).await?;
+
+    println!(
+        "Updated to {}: {}.",
+        available.version,
+        report.replaced.join(", ")
+    );
+    if report.left_behind > 0 {
+        println!(
+            "  {} old binary/binaries are still in use and will be cleared on the next run.",
+            report.left_behind
+        );
+    }
+    println!("Restart Modifile to use the new version.");
+    Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn cmd_trust(engine: &mut Engine, allow_no_source: Option<bool>) -> Result<()> {
+    if let Some(on) = allow_no_source {
+        engine.set_allow_no_source(on)?;
+    }
+
+    let allowed = engine.allows_no_source();
+    println!(
+        "Mods with no source code anywhere: {}",
+        if allowed { "allowed" } else { "refused" }
+    );
+    if allowed {
+        println!(
+            "  A compiled file with no published source and no licence cannot be checked \
+             by anyone — not by Modifile, not by you. You have accepted that."
+        );
+        println!("  Turn it back off with `modifile trust --allow-no-source false`.");
+    } else {
+        println!(
+            "  Mods that publish source, or carry a licence, or come with build \
+             attestations are installed as normal."
+        );
+        println!(
+            "  Most Thunderstore mods for Unity games are closed-source binaries. If that \
+             is what you want to run, `modifile trust --allow-no-source true`."
+        );
+    }
+    Ok(())
+}
+
+fn print_pack_report(report: &modifile_core::engine::ModpackReport) {
+    println!("{} ({})", report.pack, report.format);
+    let versions = [
+        report.game_version.clone(),
+        report.loader.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if !versions.is_empty() {
+        println!("  {versions}");
+    }
+    println!(
+        "  {} mod(s){}{}",
+        report.mods,
+        if report.untraced > 0 {
+            format!(", {} file(s) held by hash", report.untraced)
+        } else {
+            String::new()
+        },
+        if report.overrides > 0 {
+            format!(", {} pack file(s)", report.overrides)
+        } else {
+            String::new()
+        }
+    );
+
+    if let Some(trust) = &report.trust {
+        println!(
+            "  the pack's own files are {} — {}",
+            trust.level.label(),
+            trust.level.explain()
+        );
+    }
+    for note in &report.notes {
+        println!("  note: {note}");
+    }
+    if !report.skipped.is_empty() {
+        println!();
+        println!("Not taken:");
+        for (name, why) in &report.skipped {
+            println!("  {name}: {why}");
+        }
+    }
+}
+
+async fn cmd_pack_add(
+    engine: &Engine,
+    source: &str,
+    name: Option<&str>,
+    game: Option<&str>,
+    update: bool,
+) -> Result<()> {
+    let reporter: modifile_core::engine::Reporter = Arc::new(|event: Event| {
+        if let Event::Pack { stage, detail } = event {
+            println!("  {stage} {detail}");
+        }
+    });
+
+    let report = engine
+        .import_modpack(ModpackSource::parse(source), name, game, Some(reporter))
+        .await?;
+
+    println!();
+    print_pack_report(&report);
+    println!();
+    println!("Created `{}`.", report.profile);
+
+    if update {
+        println!();
+        return cmd_sync(engine, &report.profile).await;
+    }
+
+    println!();
+    println!("Next: `modifile update {}` to download the mods,", report.profile);
+    println!("then  `modifile activate {}` to put them in the game.", report.profile);
+    Ok(())
+}
+
+async fn cmd_pack_info(engine: &Engine, source: &str, game: Option<&str>) -> Result<()> {
+    // Reading a pack means fetching it, and a fetched pack is already in the
+    // store — so this is genuinely free next time, and importing it later
+    // downloads nothing twice.
+    let report = engine
+        .inspect_modpack(ModpackSource::parse(source), game)
+        .await?;
+    print_pack_report(&report);
+    println!();
+    println!("Nothing was imported. `modifile pack add` creates a profile from it.");
+    Ok(())
+}
+
+async fn cmd_pack_search(engine: &Engine, query: &str, game: Option<&str>) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(modifile_core::Error::other("give me something to search for"));
+    }
+
+    let pack = match game {
+        Some(id) => engine.pack(id).ok_or_else(|| {
+            modifile_core::Error::NotFound(format!("game pack `{id}`"))
+        })?,
+        None if engine.packs.len() == 1 => &engine.packs[0],
+        None => {
+            return Err(modifile_core::Error::other(
+                "say which game's packs to search: --game <id>",
+            ))
+        }
+    };
+
+    println!("Searching {} modpacks for \"{query}\"…\n", pack.pack.game.name);
+    let hits = engine.search_modpacks(pack, query).await?;
+    if hits.is_empty() {
+        println!("Nothing found.");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        println!("{}", hit.label());
+        println!("  {}  ·  {}", hit.id, hit.popularity());
+        if !hit.description.is_empty() {
+            println!("  {}", hit.description);
+        }
+        println!();
+    }
+    println!("Install one with `modifile pack add <id or link>`.");
     Ok(())
 }
 
@@ -528,7 +1067,7 @@ fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
             let pack = engine.pack_for(&profile)?;
             let mut any = false;
             for (target, _) in engine.targets(pack, &profile) {
-                let files = engine.saved_configs(pack, &profile.name, &target);
+                let files = engine.saved_configs(pack, &profile.id(), &target);
                 if files.is_empty() {
                     continue;
                 }
@@ -563,7 +1102,7 @@ fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
                 if target.as_deref().map(|o| o != t.id).unwrap_or(false) {
                     continue;
                 }
-                total += engine.reset_configs(pack, &loaded.name, &t, root.as_deref())?;
+                total += engine.reset_configs(pack, &loaded.id(), &t, root.as_deref())?;
             }
             println!(
                 "Discarded {total} saved config file(s). Run `modifile activate {profile}` to \
@@ -595,7 +1134,7 @@ fn cmd_config(engine: &Engine, action: ConfigAction) -> Result<()> {
                 if target.as_deref().map(|o| o != t.id).unwrap_or(false) {
                     continue;
                 }
-                total += engine.import_configs(pack, &loaded.name, &t, &source, root.as_deref())?;
+                total += engine.import_configs(pack, &loaded.id(), &t, &source, root.as_deref())?;
             }
             println!("Imported {total} config file(s) into `{profile}`.");
         }
@@ -623,14 +1162,27 @@ fn load_token(paths: &Paths) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn load_profile(engine: &Engine, name: &str) -> Result<Profile> {
-    let path = engine.paths.profile_file(name);
-    if !path.exists() {
-        return Err(modifile_core::Error::NotFound(format!(
-            "profile `{name}` — create it with `modifile new {name} --game <id>`"
-        )));
-    }
-    Profile::load(&path)
+/// Find the profile someone named.
+///
+/// Profile names are scoped to their game, so `main` is only ambiguous when
+/// two games both have one — and then it says so rather than guessing. A
+/// `game/name` spelling is always unambiguous.
+fn load_profile(engine: &Engine, spec: &str) -> Result<Profile> {
+    let id = resolve(engine, spec)?;
+    Profile::load(&engine.paths.profile_file(&id))
+}
+
+fn resolve(engine: &Engine, spec: &str) -> Result<ProfileId> {
+    engine.resolve_profile(spec).map_err(|e| {
+        // A missing profile is the common case and deserves the better message.
+        if matches!(e, modifile_core::Error::NotFound(_)) {
+            modifile_core::Error::NotFound(format!(
+                "profile `{spec}` — create it with `modifile new {spec} --game <id>`"
+            ))
+        } else {
+            e
+        }
+    })
 }
 
 fn cmd_init(paths: &Paths) -> Result<()> {
@@ -754,10 +1306,13 @@ fn cmd_new(engine: &Engine, name: &str, game: &str, targets: Vec<String>) -> Res
             "game pack `{game}` — see `modifile games`"
         )));
     }
-    let path = engine.paths.profile_file(name);
+    // Only within this game: another game may well have a `main` too, and
+    // that is the point.
+    let id = ProfileId::new(game, name);
+    let path = engine.paths.profile_file(&id);
     if path.exists() {
         return Err(modifile_core::Error::other(format!(
-            "profile `{name}` already exists"
+            "`{game}` already has a profile called `{name}`"
         )));
     }
     let mut profile = Profile::new(name, game);
@@ -768,25 +1323,46 @@ fn cmd_new(engine: &Engine, name: &str, game: &str, targets: Vec<String>) -> Res
 }
 
 fn cmd_profiles(engine: &Engine) -> Result<()> {
+    let ids = engine.all_profiles();
     let mut any = false;
-    if let Ok(entries) = std::fs::read_dir(&engine.paths.profiles) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
+    let mut current_game = String::new();
+
+    for id in &ids {
+        let Ok(profile) = Profile::load(&engine.paths.profile_file(id)) else {
+            continue;
+        };
+        // Grouped under their game, because that is now part of the identity
+        // and two of these may legitimately share a name.
+        if current_game != id.game {
+            if any {
+                println!();
             }
-            if let Ok(profile) = Profile::load(&path) {
-                let enabled = profile.mods.iter().filter(|m| m.enabled).count();
-                println!(
-                    "{:<20} {:<12} {} mod(s)",
-                    profile.name, profile.game, enabled
-                );
-                any = true;
-            }
+            let title = engine
+                .pack(&id.game)
+                .map(|p| p.pack.game.name.clone())
+                .unwrap_or_else(|| id.game.clone());
+            println!("{title} ({})", id.game);
+            current_game = id.game.clone();
         }
+        let enabled = profile.mods.iter().filter(|m| m.enabled).count();
+        let active = engine.active_profiles(&id.game).contains(&id.name);
+        println!(
+            "  {:<22} {} mod(s){}",
+            profile.name,
+            enabled,
+            if active { "  [mods installed]" } else { "" }
+        );
+        any = true;
     }
+
     if !any {
         println!("No profiles yet. Try `modifile new my-profile --game valheim`.");
+    } else {
+        println!();
+        println!(
+            "Names are per game, so two games can both have a `main`. Where that is \
+             ambiguous, say `game/name`."
+        );
     }
     Ok(())
 }
@@ -794,7 +1370,7 @@ fn cmd_profiles(engine: &Engine) -> Result<()> {
 fn cmd_show(engine: &Engine, name: &str) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
-    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    let lock = Lock::load(&engine.paths.lock_file(&profile.id()))?;
 
     println!("{} — {}", profile.name, pack.pack.game.name);
     println!();
@@ -876,7 +1452,7 @@ fn cmd_add(
         println!("{id} is already in `{name}`");
         return Ok(());
     }
-    profile.save(&engine.paths.profile_file(name))?;
+    profile.save(&engine.paths.profile_file(&profile.id()))?;
     println!("Added {id} to `{name}`. Run `modifile update {name}` to resolve it.");
     Ok(())
 }
@@ -892,7 +1468,7 @@ fn cmd_delete(engine: &Engine, name: &str, yes: bool) -> Result<()> {
         println!("Re-run with --yes to go ahead.");
         return Ok(());
     }
-    engine.delete_profile(name)?;
+    engine.delete_profile(&profile.id())?;
     println!("Deleted `{name}`.");
     println!("Unused downloads can be cleared with `modifile gc`.");
     Ok(())
@@ -901,7 +1477,7 @@ fn cmd_delete(engine: &Engine, name: &str, yes: bool) -> Result<()> {
 async fn cmd_versions(engine: &Engine, name: &str, id: &str) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let id: ModId = id.parse()?;
-    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    let lock = Lock::load(&engine.paths.lock_file(&profile.id()))?;
     let installed = lock.get(&id).map(|l| l.version.clone());
     let pinned = profile.find(&id).and_then(|e| e.pin.clone());
 
@@ -969,7 +1545,7 @@ fn cmd_hold(
             entry.pin = pin.clone();
         }
     }
-    profile.save(&engine.paths.profile_file(name))?;
+    profile.save(&engine.paths.profile_file(&profile.id()))?;
     match &pin {
         Some(v) => println!("{id} is held at {v}."),
         None => println!("{id} will take the newest release."),
@@ -1039,10 +1615,10 @@ fn cmd_add_file(
     let id = id.map(|s| s.parse::<ModId>()).transpose()?;
 
     let entry = engine.import_file(pack, &mut profile, file, id)?;
-    profile.save(&engine.paths.profile_file(name))?;
+    profile.save(&engine.paths.profile_file(&profile.id()))?;
 
     // Write it straight into the lock: there is nothing to resolve later.
-    let lock_path = engine.paths.lock_file(name);
+    let lock_path = engine.paths.lock_file(&profile.id());
     let mut lock = Lock::load(&lock_path)?;
     lock.mods.retain(|m| m.id != entry.id);
     lock.mods.push(entry.clone());
@@ -1069,7 +1645,7 @@ fn cmd_rm(engine: &Engine, name: &str, id: &str) -> Result<()> {
     if !profile.remove(&id) {
         return Err(modifile_core::Error::NotFound(format!("{id} in `{name}`")));
     }
-    profile.save(&engine.paths.profile_file(name))?;
+    profile.save(&engine.paths.profile_file(&profile.id()))?;
     println!("Removed {id}. Run `modifile activate {name}` to take it out of the game.");
     Ok(())
 }
@@ -1094,7 +1670,7 @@ fn cmd_root(engine: &Engine, name: &str, target: &str, path: PathBuf) -> Result<
         );
     }
     profile.roots.insert(target.to_string(), path.clone());
-    profile.save(&engine.paths.profile_file(name))?;
+    profile.save(&engine.paths.profile_file(&profile.id()))?;
     println!("`{target}` -> {}", path.display());
     Ok(())
 }
@@ -1102,7 +1678,7 @@ fn cmd_root(engine: &Engine, name: &str, target: &str, path: PathBuf) -> Result<
 async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
-    let lock_path = engine.paths.lock_file(name);
+    let lock_path = engine.paths.lock_file(&profile.id());
     let previous = Lock::load(&lock_path)?;
 
     if !engine.github.http().has_token() {
@@ -1135,6 +1711,7 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
             println!("  ready    {id} {version} [{}]", trust.level.label())
         }
         Event::Failed { id, error } => eprintln!("  FAILED   {id}: {error}"),
+        Event::Pack { stage, detail } => println!("  {stage} {detail}"),
     });
 
     println!("Checking `{name}` for updates...");
@@ -1218,8 +1795,34 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
         }
         println!("  Take one: modifile hold {name} <mod> --latest, then update again.");
     }
-    for issue in &broken {
+    // A mod refused by the trust policy is not broken — it is a decision, and
+    // the same decision every time. Printing ninety identical paragraphs
+    // buries the one sentence that would let someone act on it, which is
+    // exactly what importing a Thunderstore modpack used to produce.
+    let (refused, other): (Vec<&modifile_core::engine::SyncIssue>, Vec<_>) = broken
+        .iter()
+        .partition(|issue| issue.message.contains("your policy refuses it"));
+
+    for issue in &other {
         eprintln!("  {}: {}", issue.id, issue.message);
+    }
+    if !refused.is_empty() {
+        println!();
+        println!(
+            "{} mod(s) publish no source code and no licence, so there is nothing to \
+             check, and Modifile refused them:",
+            refused.len()
+        );
+        for issue in refused.iter().take(8) {
+            println!("  {}", issue.id);
+        }
+        if refused.len() > 8 {
+            println!("  …and {} more", refused.len() - 8);
+        }
+        println!(
+            "  This is most Thunderstore mods for Unity games. To run them anyway: \
+             `modifile trust --allow-no-source true`, then update again."
+        );
     }
     println!("Next: modifile activate {name}");
     Ok(())
@@ -1234,7 +1837,7 @@ fn cmd_deploy(
 ) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
-    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    let lock = Lock::load(&engine.paths.lock_file(&profile.id()))?;
     if lock.mods.is_empty() && !profile.mods.is_empty() {
         return Err(modifile_core::Error::other(format!(
             "`{name}` has no lockfile — run `modifile update {name}` first"
@@ -1260,7 +1863,7 @@ fn cmd_deploy(
         if dry_run {
             continue;
         }
-        let report = engine.deploy(pack, &target, &plan, &profile.name, options)?;
+        let report = engine.deploy(pack, &target, &plan, &profile.id(), options)?;
         deployed_any = true;
 
         println!(
@@ -1372,7 +1975,7 @@ fn cmd_verify(engine: &Engine, name: &str) -> Result<()> {
     let mut clean = true;
     let mut disturbed = false;
 
-    let lock = Lock::load(&engine.paths.lock_file(name))?;
+    let lock = Lock::load(&engine.paths.lock_file(&profile.id()))?;
     for (target, root) in engine.targets(pack, &profile) {
         let Some(root) = root else { continue };
         let scan = engine.scan(pack, &profile, &lock, &target, &root)?;
@@ -1435,7 +2038,7 @@ fn cmd_verify(engine: &Engine, name: &str) -> Result<()> {
 /// Put a disturbed install back to exactly what the lockfile says.
 async fn cmd_repair(engine: &Engine, name: &str) -> Result<()> {
     let profile = load_profile(engine, name)?;
-    let lock_path = engine.paths.lock_file(name);
+    let lock_path = engine.paths.lock_file(&profile.id());
     let lock = Lock::load(&lock_path)?;
 
     // The store first. A deployed file is a hard link to the stored one, so

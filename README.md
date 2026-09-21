@@ -1,19 +1,23 @@
 # Modifile
 
 A universal mod manager. It files your mods into place and then gets out of the
-way — no launcher to keep open, no duplicated game installs, no ads, no account.
+way — nothing to keep open, no duplicated game installs, no ads, no account.
 
 Two binaries, no runtime dependencies:
 
 | | size |
 |---|---|
-| `modifile` (CLI) | 5.3 MB |
-| `modifile-gui` (desktop) | 10.0 MB |
+| `modifile` (CLI) | 6.6 MB |
+| `modifile-gui` (desktop) | 12.0 MB |
 
 ## Four rules it is built around
 
-1. **Nothing runs while you play.** Mods are hard-linked into the game directory
-   and stay there. Launch from Steam, a shortcut, or anywhere else.
+1. **Nothing runs while you play.** Mods are hard-linked into the game
+   directory and stay there. Launch from Steam, a shortcut, or anywhere else.
+   There *is* a Play button, and it does not break this: it gives the profile a
+   directory of its own and points the game at it for that run, so nothing has
+   to watch the session and nothing has to be undone afterwards. See
+   [Play](#play).
 2. **Profiles do not duplicate the game.** One content-addressed store, hard
    links into the game directory. A profile costs a text file. Switching
    profiles moves zero bytes.
@@ -33,29 +37,44 @@ against `SHA256SUMS.txt` if you like.
 
 Or build it yourself; see [Building](#building).
 
+Mods come from GitHub, GitLab, Gitea/Forgejo, Modrinth, Thunderstore and
+CurseForge, and **modpacks** from Modrinth, Thunderstore and CurseForge — so one
+tool covers a Minecraft `.mrpack` and a R.E.P.O. Thunderstore pack without
+keeping two launchers around.
+
 ## Quick start (GUI)
 
 Run `modifile-gui`. Everything is doable from the window — you never need the
 terminal.
 
-1. **＋ New profile** — pick the game, name the profile.
-2. **Add** a mod by pasting a GitHub repo (`WeakAuras/WeakAuras2`, or the URL).
-3. **Check for updates** downloads them. **Activate** puts them in the game.
-4. Launch the game however you normally do.
+1. Pick your game from the rail down the left, or the **Choose a game** grid.
+2. **＋ New profile**, or **Import a modpack…** to start from someone else's.
+3. **Browse mods** to search, or paste a link. **Check for updates** downloads
+   them; **Activate** puts them in the game.
+4. Launch the game however you normally do — or press **▶ Play**, which gives
+   the profile its own folder and leaves your install untouched.
 
-**Modifile is not a launcher.** Activating a profile puts files in your game
-folder and then Modifile is done — you start the game from Steam, a shortcut,
-or wherever you normally do, and nothing needs to be running.
+**Modifile is still not a launcher**, in the sense that matters: nothing has to
+be running for your mods to work, and nothing watches your session. Play hands
+the game a directory and gets out of the way. See [Play](#play).
 
-Profiles are grouped by game in the sidebar, and the active one in each game is
-marked with a green dot. **Deactivate** takes its mods back out so the game runs
+The window is arranged the way a storefront client is, because that part of
+CurseForge is genuinely good: a rail of games, a page per game, tabs for
+profiles and browsing. What is missing is the rest of it — no ads, no account,
+no background service, no duplicated game installs. Mod icons, screenshots and
+game art are fetched from the same indexes the mods come from and cached on
+disk; **Settings → Artwork** turns the lot off and frees the textures, and
+everything still works without a single picture.
+
+**Deactivate** takes a profile's mods back out so the game runs
 vanilla again; nothing is lost, your settings are saved into the profile and you
 can activate it again whenever.
 
-If your game folder wasn't found automatically, press **Choose folder…** on that
-target. The choice is remembered for every profile of that game. **Games &
-folders** in the sidebar shows what was detected; **Settings** takes a GitHub
-token and cleans up unused downloads.
+If your game folder wasn't found automatically, press **Choose folder…** in the
+**Game folders** card on that game's page. The choice is remembered for every
+profile of that game. **Settings** holds the GitHub token, the artwork and
+update switches, and the download cleanup — and **Settings → Games & folders**
+shows every game's detected paths at once.
 
 ## Quick start (CLI)
 
@@ -68,6 +87,24 @@ modifile update wow-main                  # check GitHub, download
 modifile activate wow-main                # put the mods in the game
 modifile deactivate wow retail            # take them out again — vanilla
 ```
+
+**Profile names are per game.** Every game can have its own `main`; the name
+only has to be unique within the game it belongs to. Commands take a bare name
+while it is unambiguous, and ask you to qualify it when it is not:
+
+```sh
+modifile show main            # fine, until two games have one
+modifile show valheim/main    # always unambiguous
+```
+
+Profiles that already existed are moved into their game's directory
+automatically on first run, with their versions and saved settings.
+
+**Updates are per profile.** `modifile update <profile>` touches that profile
+and nothing else; in the GUI, *Check for updates* does the profile on screen.
+Updating everything is a separate, explicit thing — `modifile update --all`, or
+*Check every game for updates* on the all-games page — because it downloads a
+lot and changes profiles you were not looking at.
 
 A mod can be restricted to one side of the game, which matters for a dedicated
 server:
@@ -97,6 +134,17 @@ token you get 5000/hour and revalidations become free.
 | `modifile hold <profile> <mod> --latest` | follow the newest release again |
 | `modifile export <profile>` | write a shareable `.modifile.json` |
 | `modifile import <file>` | create a profile from one someone sent you |
+| `modifile update <profile>` | check that profile's mods and download what is missing |
+| `modifile update --all` | every profile of every game, deliberately |
+| `modifile pack search <query> --game <id>` | find a modpack |
+| `modifile pack info <file\|link\|id>` | what a modpack contains, importing nothing |
+| `modifile pack add <file\|link\|id>` | turn a modpack into a profile |
+| `modifile play <profile>` | start the game with this profile's own folder |
+| `modifile play <profile> --set-command <cmd>` | how to start this game, for one no pack can name |
+| `modifile selfupdate --check` | is there a newer Modifile? |
+| `modifile selfupdate --yes` | install it |
+| `modifile trust` | what Modifile is currently willing to install |
+| `modifile trust --allow-no-source true` | accept mods nobody can audit |
 | `modifile root <profile> <target> <path>` | point a target at a directory autodetection missed |
 | `modifile verify <profile>` | check the deployment is intact — finds files a game patch clobbered |
 | `modifile repair <profile>` | checksum the stored copies and put changed or missing files back |
@@ -176,7 +224,7 @@ it has to start with a digit or a `v`.
 
 Bundled packs: **World of Warcraft** (retail, Classic Era, progression Classic),
 **Valheim** (client + dedicated server), **Minecraft** (client + dedicated
-server). Adding a game means writing a TOML file, not recompiling.
+server), **R.E.P.O.** Adding a game means writing a TOML file, not recompiling.
 
 Dedicated servers are first-class. A Valheim profile deploys to the client and
 the server from one mod list; a Minecraft profile sends `.jar` files to both
@@ -220,6 +268,22 @@ flatten = false               # or discard directory structure entirely
 targets = ["client"]          # omit for all targets
 mutable = false               # true = a default the user will edit: copied,
                               # only if absent, and never removed
+skip    = false               # true = matched and deliberately not installed
+
+# A target may also name how to start the game. Paths inside the game folder
+# only — a pack can never name a command. See "Play".
+launch = ["Wow.exe", "World of Warcraft.app"]
+
+# How this game can be pointed at a profile's own folder. Omit it and the game
+# gets no Play button, which is the right answer for one that cannot be
+# redirected. See "Play".
+[instance]
+kind = "doorstop"                                # or "minecraft-launcher"
+target = "BepInEx/core/BepInEx.Preloader.dll"    # what doorstop invokes
+# The only things an instanced profile writes into the real game folder,
+# because the game loads them by name at startup. Inert unless Modifile
+# launches the game with redirection switched on.
+game_files = ["winhttp.dll", "doorstop_config.ini"]
 
 # A target is a client, a dedicated server, or a game flavor.
 [[targets]]
@@ -241,6 +305,19 @@ second drive is found without configuration.
 
 `unpack` is declared rather than sniffed on purpose: a Minecraft `.jar` is a zip
 that must be installed **unopened**, and file magic cannot tell you that.
+
+`skip` exists because matching is first-wins and the general rules carry no
+target restriction. A modpack's `client-overrides/config/**` has to be claimed
+for the server by *something*, or it falls through to the plain config rule and
+gets planted on a dedicated server — which is the one thing naming the tree
+"client" was meant to prevent. The same rule keeps Thunderstore's `manifest.json`
+and `icon.png` out of a game directory.
+
+In `[search]`, `thunderstore_community` is the slug in the site's own URL —
+`thunderstore.io/c/repo/` is `"repo"`. It is what lets a downloaded Thunderstore
+pack be matched to a game, because a Thunderstore package records no game
+anywhere. `curseforge_class_id` and `curseforge_modpack_class_id` are per-game
+numbers, not universal ones.
 
 ## Downloads are not an archive
 
@@ -520,6 +597,7 @@ quietly re-uploaded under the same tag is detected.
 | **GitLab** | no | gitlab.com and self-hosted |
 | **Gitea / Forgejo** | no | Codeberg and self-hosted |
 | **Modrinth** | no | publishes each project's source repository |
+| **Thunderstore** | no | where BepInEx games' mods are — Valheim, R.E.P.O. |
 | **CurseForge** | **yours** | see below |
 
 Paste a URL from any of them, or use a short id:
@@ -531,6 +609,8 @@ modifile add mc https://modrinth.com/mod/lithium
 modifile add x gitlab:group/project
 modifile add x https://codeberg.org/owner/repo
 modifile add x gitea:git.example.com/owner/repo      # self-hosted
+modifile add repo-main thunderstore:Zehs/REPOLib
+modifile add repo-main https://thunderstore.io/c/repo/p/Zehs/REPOLib/
 ```
 
 ### Finding a mod
@@ -562,16 +642,237 @@ Supported, but on CurseForge's terms rather than ours:
 For most mods, searching Modrinth or GitHub finds the same thing without any of
 that.
 
+## Modifile updates itself
+
+Modifile checks its own GitHub releases when it starts, and offers a newer
+version if one is published. One conditional request, cached like everything
+else, and silent when there is nothing new.
+
+```sh
+modifile selfupdate --check                  # is there anything newer?
+modifile selfupdate --yes                    # install it
+modifile selfupdate --check-on-startup false # stop looking
+modifile selfupdate --automatic true         # install without asking
+```
+
+In the GUI a strip appears across the top — *"Modifile 1.2 is available"*, with
+**What's new** and **Update now** — and Settings has both switches.
+
+**Checking is on by default; installing is not.** Replacing the program someone
+is running is not a thing to do on a default, so it asks. Turn on *Install them
+without asking* and it stops asking.
+
+**It is verified before anything is replaced.** GitHub publishes a SHA-256 for
+every release asset through its API, and the release carries a `SHA256SUMS.txt`;
+both are checked. A release publishing neither is refused rather than installed
+on trust. What that proves is that the bytes are the ones GitHub is serving —
+not that they are benign. Nothing downloaded can prove that, and this project
+does not tell that lie about mods either.
+
+**A failed update leaves the working copy alone.** The new binary is written
+beside the old one and swapped in by rename; if the swap fails halfway the
+previous binary is put back. Windows will not delete a running executable, so
+the old one is parked aside and cleared on the next launch. Your profiles,
+mods, downloads and settings are never touched by an update.
+
+### Publishing one (for whoever maintains this)
+
+```sh
+# 1. The crate version and the tag must agree.
+#    Edit workspace.package.version in Cargo.toml to 1.2.0
+git commit -am "1.2"
+git tag v1.2 && git push origin v1.2
+
+# 2. The workflow builds both platforms and opens a DRAFT release.
+# 3. Check the archives, edit the notes, press Publish.
+```
+
+Nobody is offered an update until you press Publish — drafts are invisible to
+the API, which is the point of building them as drafts.
+
+**The version in `Cargo.toml` must match the tag.** Modifile decides whether it
+is out of date by comparing its built-in version against the newest published
+tag, so a binary built from `0.1.0` and released as `v1.1` believes it is
+permanently behind itself and re-offers the same update for ever. The release
+workflow refuses to build a tag that disagrees, so this cannot ship by accident.
+
+## Play
+
+Some people want a launcher. The obvious way to build one — put the mods in the
+game folder, take them out when the game closes — is also a bad one: a crash, a
+power cut, or simply closing Modifile leaves the install modified.
+
+Other launchers do not have this problem because **they do not revert anything.
+They redirect.** r2modman never puts mods in the game folder at all; it starts
+the game with `--doorstop-target-assembly <profile>/BepInEx/…`, and BepInEx
+reads its plugins and configs from there. Prism does the same for Minecraft
+with `gameDir`. The install stays vanilla permanently, so there is nothing to
+undo and a power cut costs nothing.
+
+Modifile does that:
+
+```sh
+modifile play raiding      # give this profile its own folder, point the game at it
+```
+
+| | what happens | game install |
+|---|---|---|
+| **Activate** | mods go into the game folder and stay | modified until you deactivate |
+| **▶ Play** | the profile gets its own folder; the game is pointed at it for that run | **never touched** |
+
+**Instances are nearly free here.** Other launchers duplicate mod files per
+profile. Modifile deploys by hard link from one content-addressed store, so ten
+instances of the same 900 MB pack cost 900 MB and some directory entries — a
+real 91-mod pack measures *909 MB on disk, 0 duplicated*. The only per-instance
+data is saves and configs, which you wanted separate anyway.
+
+**One file does go into the game folder**, and only one: the injector. A
+doorstop shim is a DLL the game loads by name at startup, so it cannot live
+anywhere else. It does nothing on its own — started from Steam or a shortcut,
+the game finds a doorstop that has not been told to do anything and runs
+vanilla. Minecraft needs not even that.
+
+Measured on a real R.E.P.O. pack:
+
+```
+game folder        instance
+REPO.exe           BepInEx/core/      18 files
+winhttp.dll        BepInEx/plugins/  932 files
+doorstop_config.ini  …               954 total
+```
+
+### Which games can do this
+
+| game | Play | why |
+|---|---|---|
+| **Valheim, R.E.P.O.** | yes | BepInEx, via UnityDoorstop |
+| **Minecraft** | yes | the launcher takes a `gameDir` per profile |
+| **World of Warcraft** | **no** | addons must live in `Interface/AddOns`; there is no redirection |
+
+A game that cannot be instanced gets **no Play button**, and says why. Giving it
+one would mean modifying the install and putting it back — exactly the design
+this replaced.
+
+Minecraft is the honest half-measure: Modifile writes a launcher profile
+pointing at the instance, and the launcher owns the process, so Play opens the
+launcher and you pick the profile there.
+
+**Modifile will not start a game unmodded and say nothing.** Play on a profile
+that has not been set up refuses rather than launching vanilla and letting you
+find out twenty minutes later.
+
+### How a game gets started
+
+Steam first, where it applies — that keeps Proton, cloud saves and the overlay,
+all of which running the executable directly would lose. Otherwise the pack may
+name an executable *inside the game folder you chose*:
+
+```toml
+[[targets]]
+launch = ["Wow.exe", "World of Warcraft.app"]   # first one that exists wins
+```
+
+**A pack may not name a command.** Packs are data contributed by strangers and
+cannot execute anything; that rule does not get relaxed for a Play button. A
+pack-declared path may not be absolute, may not contain `..`, may not carry a
+drive letter, and must still resolve inside the game directory after symlinks
+are followed — there is a test asserting the bundled packs stay on the right
+side of that line.
+
+A free-form command line is a **user** setting, kept in `launch.json` and never
+readable from a pack. That is the escape hatch for a game whose launcher lives
+elsewhere — Minecraft's does, so its pack declares nothing and says so:
+
+```sh
+modifile play mc --set-command "java -jar /path/to/launcher.jar"
+```
+
+## Modpacks
+
+**A modpack is a profile somebody else assembled.** It carries exactly what a
+profile holds — a game version, a loader, a pinned mod list and a tree of config
+files — so importing one writes a profile and stops. The mods are fetched by the
+next `modifile update`, through the same resolve, verify and trust path every
+other mod takes. A pack gets no shortcut past the trust ladder for arriving in
+bulk.
+
+```sh
+modifile pack search "optimized" --game minecraft   # find one
+modifile pack info <file|link|id>                   # what's in it, importing nothing
+modifile pack add <file|link|id>                    # -> a profile
+modifile update <that profile>                      # download its mods
+modifile activate <that profile>                    # put them in the game
+```
+
+Three formats, and the differences are the stores' choices rather than ours:
+
+| format | games | key needed |
+|---|---|---|
+| **Modrinth `.mrpack`** | Minecraft | no |
+| **Thunderstore** | any BepInEx game — Valheim, R.E.P.O. | no |
+| **CurseForge** | Minecraft | **yours** |
+
+A source is a file you downloaded, a link you copied, or an id that
+`pack search` printed:
+
+```sh
+modifile pack add ./Fabulously.Optimized-v15.mrpack
+modifile pack add https://modrinth.com/modpack/fabulously-optimized/version/9TjRcKTW
+modifile pack add modrinth:fabulously-optimized          # newest version
+modifile pack add thunderstore:Blazed/REPO_The_God_Pack
+modifile pack add curseforge:1075252
+```
+
+**Why the pinned versions matter.** A pack names an exact build of every mod,
+because that is the combination its author actually ran. Modifile keeps those
+pins, so `modifile update` will not quietly walk a 90-mod pack forward one mod
+at a time into a combination nobody has tested. The mod list says which pins
+newer releases have passed, and `modifile hold <profile> <mod> --latest` takes
+one when you want it.
+
+A pack's own files — CurseForge and Modrinth call it `overrides/`, Thunderstore
+just ships them — are installed by the game pack's ordinary rules. Its configs
+become profile state you can edit, and two profiles from two packs keep two
+different sets.
+
+### Thunderstore packs and the trust ladder
+
+Most Thunderstore mods for Unity games are compiled DLLs with no published
+source and no licence. There is genuinely nothing to check, so the default
+policy refuses them, and a 90-mod R.E.P.O. pack will mostly not install until
+you say otherwise:
+
+```sh
+modifile trust                             # what is currently allowed
+modifile trust --allow-no-source true      # accept binaries nobody can audit
+```
+
+That is a real decision, not a formality, which is why it is a separate command
+rather than a flag buried in the import. The GUI has the same switch in
+Settings.
+
+### Known limits
+
+- CurseForge and Modrinth pack formats are Minecraft-only by definition
+  (`manifestType: "minecraftModpack"`, and `.mrpack` defines only Minecraft).
+  Thunderstore's format is the one that carries packs for other games.
+- A pack's loader *version* is recorded and reported, not pinned — Modifile
+  installs the newest stable build of that loader.
+- Thunderstore's API serves one version at a time and rate-limits hard.
+  Modifile holds its own concurrency down and retries with backoff, which is why
+  importing a large pack takes a few seconds longer than it looks like it should.
+- Dependency resolution is still the pack's job, not Modifile's. A pack lists
+  what it needs; nothing here works out what a pack forgot.
+
 ## What it deliberately does not do
 
-- **No CurseForge, no Nexus.** CurseForge API keys are human-reviewed,
-  non-transferable, unshippable in an open-source client, and authors can
-  disable third-party distribution entirely. Nexus gates download links behind a
-  premium account. Both are out of scope; Modrinth and Thunderstore are keyless
-  and are the natural next adapters.
+- **No Nexus.** It gates download links behind a premium account, so there is
+  nothing a client like this can fetch. CurseForge *is* supported now, on its
+  own terms — you supply the key, and some mods still cannot be fetched at all.
 - **No dependency resolution or loader/version matching for Minecraft.** It
   installs the release you asked for. Pin versions when a mod is
-  version-sensitive.
+  version-sensitive. A modpack does this for you, because its author already
+  worked out the combination.
 - **Attestation checking is API-based, not full offline Sigstore verification.**
   The certificate chain and transparency log are not yet verified locally.
 
@@ -582,6 +883,11 @@ that.
 - A destination that already holds a file we did not place is skipped and
   reported, not clobbered, unless `--force`.
 - Archive extraction rejects absolute paths, `..`, and drive letters (zip-slip).
+- A pack may name an executable to launch, but only inside the game directory
+  you chose, and only after canonicalisation — so a symlink out of the tree is
+  refused too. A command line can only ever come from you.
+- The GitHub token is sent to GitHub hosts and nowhere else. It used to travel
+  with every download, including to CurseForge and Modrinth CDNs.
 - Deployment state lives outside the game directory, so a game update or a Steam
   file verification cannot destroy the bookkeeping along with the mods.
 - Game packs are pure data and cannot execute anything.
@@ -589,11 +895,17 @@ that.
 ## Layout
 
 ```
-crates/modifile-core/  engine, packs, store, deploy, trust, GitHub source
+crates/modifile-core/  engine, packs, store, deploy, trust, modpacks, sources
 crates/modifile-cli/   the `modifile` command
 crates/modifile-gui/   egui desktop app (no webview, no Electron)
+  main.rs                state, background work, the profile page
+  shell.rs               game rail, game grid, a game's page
+  browse.rs  detail.rs   finding mods, and the page about one
+  art.rs                 icons and screenshots, cached and switchable
 packs/                 bundled game packs
 ```
 
-`cargo test` runs 97 tests, including ones that exercise the bundled packs
-directly — flavor selection, client/server routing, and zip-slip rejection.
+`cargo test` runs 165 tests, including ones that exercise the bundled packs
+directly — flavor selection, client/server routing, zip-slip rejection,
+modpack override routing, and the refusal to let a pack name an executable
+outside the game folder.

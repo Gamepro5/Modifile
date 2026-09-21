@@ -26,10 +26,26 @@ macos_assets = ["bepinex_macos_x64_*.zip", "bepinex_unix_x64_*.zip"]
 # Any one of these means it is already laid over the game.
 markers = ["BepInEx/core/BepInEx.dll", "winhttp.dll", "run_bepinex.sh", "doorstop_config.ini"]
 
-# Valheim mods mostly live on Thunderstore, which has no adapter yet. The ones
-# installable today publish GitHub releases, so that is what gets searched.
+# Valheim can be pointed at a mod folder that is not its own, so Play gives
+# each profile a real instance and never modifies the game directory. See the
+# comments in repo.toml for how doorstop makes that work.
+[instance]
+kind = "doorstop"
+target = "BepInEx/core/BepInEx.Preloader.dll"
+game_files = [
+  "winhttp.dll", "doorstop_config.ini", ".doorstop_version",
+  "run_bepinex.sh", "libdoorstop.so", "libdoorstop_x64.so",
+]
+
+# Valheim mods mostly live on Thunderstore. Some also publish GitHub releases,
+# which is worth searching too because a GitHub release can be tied back to
+# readable source.
 [search]
 github_topics = ["valheim-mod", "valheim"]
+# Thunderstore is where Valheim mods and modpacks actually live, and it needs
+# no key. The slug is the one in the site's own URL:
+# thunderstore.io/c/valheim/.
+thunderstore_community = "valheim"
 
 # BepInEx rewrites every plugin's .cfg on startup and the user edits them, so
 # they belong to the profile rather than to the mod. ValheimPlus is the obvious
@@ -53,6 +69,22 @@ unpack = ["*.zip"]
 # Rules are tried in order; the first match wins. The nested-path rules come
 # first so a mod that ships a full BepInEx tree lands correctly, and the bare
 # .dll rule catches the flat zips that most authors actually publish.
+
+# BepInEx itself, which a Thunderstore modpack lists as an ordinary dependency.
+# Its core assemblies are not plugins: swept into plugins/ by the bare .dll
+# rule below they give you a game that loads nothing at all, which is the most
+# confusing way a pack can fail — everything installs, nothing happens.
+[[install]]
+match = "**/bepinex/core/**"
+into = "core"
+strip = "core/"
+
+# The doorstop shim that actually starts BepInEx, which belongs beside the game
+# executable rather than inside the BepInEx tree.
+[[install]]
+match = "**/{winhttp.dll,doorstop_config.ini,.doorstop_version,run_bepinex.sh,libdoorstop.so,libdoorstop_x64.so}"
+into = "root"
+flatten = true
 
 [[install]]
 match = "**/bepinex/patchers/**"
@@ -78,9 +110,15 @@ match = "**/*.dll"
 into = "plugins"
 flatten = true
 
+# Thunderstore packaging. Every package carries these and none of them belong
+# in a game directory.
+[[install]]
+match = "**/{manifest.json,icon.png,README.md,CHANGELOG.md,LICENSE,LICENSE.md,LICENSE.txt}"
+into = "root"
+skip = true
+
 # Loose config files sitting at the archive root. Deliberately a short list of
-# extensions rather than "anything not a .dll": Thunderstore packages carry
-# manifest.json, icon.png and README.md, and none of those belong in a game.
+# extensions rather than "anything not a .dll".
 [[install]]
 match = "*.{cfg,ini,yml,yaml,toml}"
 into = "config"

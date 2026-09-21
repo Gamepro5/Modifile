@@ -29,6 +29,33 @@ pub fn library_paths() -> Vec<PathBuf> {
     roots
 }
 
+/// Steam's own executable.
+///
+/// Needed because `steam://rungameid/…` cannot carry launch arguments, and an
+/// instanced profile is nothing but launch arguments. `steam -applaunch <id>
+/// <args>` can, and still goes through Steam — so Proton, the overlay and
+/// playtime keep working, which launching the game binary directly would lose.
+pub fn executable() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["steam.exe"]
+    } else {
+        &["steam"]
+    };
+    for root in steam_roots() {
+        for name in names {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    // On Linux, Steam is normally on PATH even when its data lives elsewhere.
+    if !cfg!(windows) {
+        return Some(PathBuf::from("steam"));
+    }
+    None
+}
+
 /// Where Steam itself might be installed.
 fn steam_roots() -> Vec<PathBuf> {
     let mut out = Vec::new();

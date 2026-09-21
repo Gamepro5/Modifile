@@ -61,12 +61,28 @@ impl Paths {
         Ok(())
     }
 
-    pub fn profile_file(&self, name: &str) -> PathBuf {
-        self.profiles.join(format!("{name}.toml"))
+    /// Where one game's profiles live.
+    ///
+    /// A directory per game, so a name only has to be unique within its own
+    /// game. See `ProfileId`.
+    pub fn profile_dir(&self, game: &str) -> PathBuf {
+        self.profiles.join(crate::engine::sanitize_name(game))
     }
 
-    pub fn lock_file(&self, name: &str) -> PathBuf {
-        self.profiles.join(format!("{name}.lock.json"))
+    pub fn profile_file(&self, id: &crate::profile::ProfileId) -> PathBuf {
+        self.profile_dir(&id.game)
+            .join(format!("{}.toml", id.name))
+    }
+
+    pub fn lock_file(&self, id: &crate::profile::ProfileId) -> PathBuf {
+        self.profile_dir(&id.game)
+            .join(format!("{}.lock.json", id.name))
+    }
+
+    /// Where an instanced profile keeps the tree the game is pointed at.
+    pub fn instance_dir(&self, id: &crate::profile::ProfileId) -> PathBuf {
+        self.profile_dir(&id.game)
+            .join(format!("{}.instance", id.name))
     }
 
     /// Deployment manifest for one (game, target) pair. Deploying a different
@@ -102,6 +118,45 @@ impl Paths {
     /// to them personally and must not travel with the app.
     pub fn curseforge_key_file(&self) -> PathBuf {
         self.home.join("curseforge-key")
+    }
+
+    /// The user's own per-game launch commands.
+    ///
+    /// Deliberately not in a pack: a pack is data from a stranger and must not
+    /// be able to name a command to run. This file is the user's own.
+    pub fn launch_file(&self) -> PathBuf {
+        self.home.join("launch.json")
+    }
+
+    /// Marker file: do not look for new versions of Modifile itself.
+    ///
+    /// Phrased as the opt-*out*, so the default with no file present is to
+    /// check. The check is one conditional request at startup and it is the
+    /// only way someone finds out a fix exists.
+    pub fn no_update_check_file(&self) -> PathBuf {
+        self.home.join("no-update-check")
+    }
+
+    /// Marker file: install updates to Modifile without asking first.
+    ///
+    /// Opt-in, because replacing the program someone is running is not
+    /// something to do on a default.
+    pub fn auto_update_file(&self) -> PathBuf {
+        self.home.join("auto-update")
+    }
+
+    /// Where an update archive is downloaded before it is installed.
+    pub fn updates(&self) -> PathBuf {
+        self.cache.join("updates")
+    }
+
+    /// Marker file: the user has turned artwork off.
+    ///
+    /// Stored the same way the other opt-outs are — a file whose presence is
+    /// the whole setting, so it is obvious and trivially undone. Phrased as
+    /// the *off* switch so that the default, with no file present, is on.
+    pub fn no_artwork_file(&self) -> PathBuf {
+        self.home.join("no-artwork")
     }
 
     pub fn http_cache(&self) -> PathBuf {

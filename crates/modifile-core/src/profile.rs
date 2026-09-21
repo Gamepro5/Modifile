@@ -12,6 +12,45 @@ fn yes() -> bool {
     true
 }
 
+/// A profile's identity: a name, scoped to the game it is for.
+///
+/// Names used to be global, because profiles were one flat directory of TOML
+/// files. That made "main" a resource you could only spend once across every
+/// game you own, which is exactly the name everybody wants first. The game is
+/// part of the identity now, so a Valheim `main` and a Minecraft `main` are
+/// two different profiles and neither has to be called `valheim-main`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProfileId {
+    pub game: String,
+    pub name: String,
+}
+
+impl ProfileId {
+    pub fn new(game: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            game: game.into(),
+            name: name.into(),
+        }
+    }
+
+    /// `game/name`, the form that is never ambiguous.
+    pub fn qualified(&self) -> String {
+        format!("{}/{}", self.game, self.name)
+    }
+}
+
+impl std::fmt::Display for ProfileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.qualified())
+    }
+}
+
+impl Profile {
+    pub fn id(&self) -> ProfileId {
+        ProfileId::new(&self.game, &self.name)
+    }
+}
+
 /// A named set of mods for one game. Profiles are cheap: they hold references
 /// into the store, never copies, so having twenty of them costs twenty small
 /// text files.
@@ -37,6 +76,14 @@ pub struct Profile {
     pub loader: Option<String>,
     #[serde(default)]
     pub mods: Vec<ModEntry>,
+    /// Obsolete, and read only so an older profile still loads.
+    ///
+    /// Play used to install into the game folder and undo it afterwards, which
+    /// meant a crash or a power cut left the install modified. Play now hands
+    /// the game a directory of its own instead, so there is nothing to revert
+    /// and nothing to lose. The field is ignored.
+    #[serde(default, skip_serializing)]
+    pub revert_on_exit: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +98,17 @@ pub struct ModEntry {
     /// Hold at an exact release tag; updates will not move it.
     #[serde(default)]
     pub pin: Option<String>,
+    /// The source's own handle for one exact file, when a tag is not enough to
+    /// name it. Today that means a CurseForge `fileID`.
+    ///
+    /// This is separate from `pin` because the two answer different questions.
+    /// `pin` is a release tag, which for CurseForge is a human display name
+    /// like `Sodium 0.5.8` — that is what the mod list should show. A modpack
+    /// pins a numeric file id, and the project's newest fifty files (all the
+    /// API will list) may no longer include it. Keeping both means a pack can
+    /// be resolved exactly while still reading like a version.
+    #[serde(default)]
+    pub file: Option<String>,
     /// Consider prereleases when resolving.
     #[serde(default)]
     pub prerelease: bool,
@@ -67,6 +125,7 @@ impl ModEntry {
             enabled: true,
             targets: None,
             pin: None,
+            file: None,
             prerelease: false,
             manual: false,
         }
@@ -92,6 +151,7 @@ impl Profile {
             game_version: None,
             loader: None,
             mods: Vec::new(),
+            revert_on_exit: false,
         }
     }
 
@@ -124,6 +184,60 @@ impl Profile {
         self.mods.retain(|m| &m.id != id);
         self.mods.len() != before
     }
+}
+
+/// Move profiles from the old flat layout into a directory per game.
+///
+/// Profiles used to live as `profiles/<name>.toml`, which made names globally
+/// unique whether you wanted that or not. They now live under
+/// `profiles/<game>/<name>.toml`. This runs at startup and is a no-op once
+/// there is nothing left at the top level.
+///
+/// No name can collide during the move: the old layout could not hold two
+/// profiles with the same name in the first place.
+pub fn migrate_flat_layout(profiles_dir: &Path) -> Vec<ProfileId> {
+    let Ok(entries) = std::fs::read_dir(profiles_dir) else {
+        return Vec::new();
+    };
+
+    let mut moved = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(profile) = Profile::load(&path) else {
+            continue;
+        };
+        let id = profile.id();
+
+        let game_dir = profiles_dir.join(crate::engine::sanitize_name(&id.game));
+        if std::fs::create_dir_all(&game_dir).is_err() {
+            continue;
+        }
+
+        // The profile, its lock and its saved settings travel together. A
+        // half-moved profile would lose its configs, so the TOML moves last:
+        // if anything fails before that, the old layout is still intact and
+        // the next start tries again.
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| id.name.clone());
+
+        let lock = profiles_dir.join(format!("{stem}.lock.json"));
+        if lock.exists() {
+            let _ = std::fs::rename(&lock, game_dir.join(format!("{stem}.lock.json")));
+        }
+        let state = profiles_dir.join(format!("{stem}.state"));
+        if state.is_dir() {
+            let _ = std::fs::rename(&state, game_dir.join(format!("{stem}.state")));
+        }
+        if std::fs::rename(&path, game_dir.join(format!("{stem}.toml"))).is_ok() {
+            moved.push(id);
+        }
+    }
+    moved
 }
 
 // ---------------------------------------------------------------------------

@@ -11,9 +11,17 @@ use std::path::{Path, PathBuf};
 use crate::error::{Context, Result};
 
 /// Where one profile keeps its state for one target.
-pub fn profile_state_dir(profiles_dir: &Path, profile: &str, target: &str) -> PathBuf {
+///
+/// Under the profile's own game directory, so two games can both have a
+/// profile called `main` without their saved settings colliding.
+pub fn profile_state_dir(
+    profiles_dir: &Path,
+    id: &crate::profile::ProfileId,
+    target: &str,
+) -> PathBuf {
     profiles_dir
-        .join(format!("{profile}.state"))
+        .join(crate::engine::sanitize_name(&id.game))
+        .join(format!("{}.state", id.name))
         .join(target)
 }
 

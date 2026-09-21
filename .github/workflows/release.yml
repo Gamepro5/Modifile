@@ -82,6 +82,24 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev
 
+      # Modifile updates itself by comparing its built-in version against the
+      # newest published tag. If the two disagree, every install believes it is
+      # out of date for ever and re-downloads the same release on every launch.
+      # That is invisible until it is shipped, so it is caught here instead.
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          # v1.1 and 1.1 are the same tag; 1.1 and 1.1.0 are the same version.
+          norm() { echo "${1#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}'; }
+          if [ "$(norm "$tag")" != "$(norm "$crate")" ]; then
+            echo "::error::Tag '$tag' does not match the version in Cargo.toml ('$crate'). Self-update compares these, so they must agree. Set workspace.package.version to ${tag#v} and commit before tagging."
+            exit 1
+          fi
+          echo "tag $tag matches crate version $crate"
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update

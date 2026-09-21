@@ -11,4 +11,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
-modifile-core = { version = "0.1.0", path = "../modifile-core" }
+# No version pin: these are path dependencies inside one workspace that is
+# always released as a unit, and pinning one meant bumping the release version
+# broke the build until three files agreed again.
+modifile-core = { path = "../modifile-core" }

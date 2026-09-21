@@ -10,6 +10,25 @@ Known limit: v1 does not resolve mod dependencies or match loader/game versions.
 It installs the release you asked for. Pin versions in your profile when a mod
 is version-sensitive, and read the mod's own requirements."""
 maintainers = ["bundled"]
+# Art is linked, never bundled: it is not ours to redistribute, and a URL costs
+# nothing in the binary. Steam-published games get theirs from Valve's CDN
+# automatically, keyed on the app id — Minecraft is not on Steam, so it says
+# where to look. Both are Mojang's own marketing assets, at the same 2:3 tile
+# and 16:9 banner shapes the Steam art uses. If either ever 404s the game falls
+# back to the generated tile, which is what it showed before.
+icon = "https://www.minecraft.net/content/dam/games/minecraft/key-art/Games_Subnav_Minecraft-300x465.jpg"
+art = "https://www.minecraft.net/content/dam/minecraftnet/games/minecraft/key-art/About-Minecraft_Featured-Image-0_570x321.jpg"
+
+# Minecraft can be instanced, because its launcher takes a `gameDir` per
+# profile: mods, config, saves and options all come from there instead of from
+# `.minecraft`. Modifile writes the launcher profile; the launcher runs the
+# game against it, so Play opens the launcher rather than starting the game
+# outright. Less seamless than a one-press launch, and honest about it.
+#
+# No `game_files`: nothing has to be planted in `.minecraft` for this to work,
+# so the vanilla install is left completely alone.
+[instance]
+kind = "minecraft-launcher"
 
 # Modrinth is the right index for Minecraft: keyless, and it publishes each
 # project's source repository, so searching here also finds the GitHub repo.
@@ -18,6 +37,12 @@ modrinth = true
 # CurseForge addresses projects by number; this is how a slug from a URL gets
 # resolved to one, and it lets CurseForge be searched when a key is set.
 curseforge_game_id = 432
+# CurseForge sorts a game's content into classes, and the numbers are per game
+# rather than universal. For Minecraft, mods are 6 and modpacks are 4471.
+# Without these a search for a mod also returns modpacks, which are a very
+# different thing to install by accident.
+curseforge_class_id = 6
+curseforge_modpack_class_id = 4471
 
 # Minecraft mods are built per loader and per game version, and a profile that
 # mixes them produces a game that will not start. Declaring this makes a profile
@@ -84,6 +109,68 @@ reject = [
 # is declared rather than sniffed from the file's magic bytes.
 unpack = ["*.zip"]
 
+# --- modpack side-specific overrides ---------------------------------------
+# A .mrpack may carry client-overrides/ and server-overrides/ as well as the
+# shared overrides/ tree. These come first because the general rules below
+# carry no target restriction: without them, `client-overrides/config/x.toml`
+# would match the plain config rule and get planted on a dedicated server,
+# which is exactly what naming the tree "client" was meant to prevent.
+[[install]]
+match = "**/client-overrides/**/*.jar"
+into = "mods"
+flatten = true
+targets = ["client"]
+
+[[install]]
+match = "**/client-overrides/config/**"
+into = "config"
+strip = "config/"
+mutable = true
+targets = ["client"]
+
+[[install]]
+match = "**/client-overrides/**"
+into = "root"
+strip = "client-overrides/"
+mutable = true
+targets = ["client"]
+
+[[install]]
+match = "**/server-overrides/**/*.jar"
+into = "mods"
+flatten = true
+targets = ["server"]
+
+[[install]]
+match = "**/server-overrides/config/**"
+into = "config"
+strip = "config/"
+mutable = true
+targets = ["server"]
+
+[[install]]
+match = "**/server-overrides/**"
+into = "root"
+strip = "server-overrides/"
+mutable = true
+targets = ["server"]
+
+# And the other half of the same point: claim each side's tree on the *other*
+# side so it stops here, rather than falling through to the untargeted rules
+# below and being installed anyway.
+[[install]]
+match = "**/client-overrides/**"
+into = "root"
+skip = true
+targets = ["server"]
+
+[[install]]
+match = "**/server-overrides/**"
+into = "root"
+skip = true
+targets = ["client"]
+
+# --- ordinary mod contents --------------------------------------------------
 [[install]]
 match = "**/*.jar"
 into = "mods"
@@ -109,6 +196,21 @@ into = "resourcepacks"
 strip = "resourcepacks/"
 flatten = true
 targets = ["client"]
+
+# Whatever is left of a modpack's shared overrides/ tree. The rules above have
+# already claimed its jars, configs, shaderpacks and resourcepacks; this is for
+# everything else a pack ships — options.txt, kubejs scripts, defaultconfigs, a
+# starter world. Last, so it never steals a file one of them should have had.
+#
+# mutable, because every one of these is a starting point the player is meant
+# to edit: it is copied rather than linked (so editing it cannot write back
+# into the shared store), only placed when nothing is already there, and left
+# alone on deactivate rather than deleted.
+[[install]]
+match = "**/overrides/**"
+into = "root"
+strip = "overrides/"
+mutable = true
 
 [[targets]]
 id = "client"

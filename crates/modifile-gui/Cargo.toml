@@ -11,5 +11,15 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
-modifile-core = { version = "0.1.0", path = "../modifile-core" }
+# No version pin: see the note in modifile-cli's manifest.
+modifile-core = { path = "../modifile-core" }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+# Artwork only. Deliberately not `egui_extras`' image loaders: those pull in
+# `ehttp`/`ureq` and a second TLS stack, and core already carries a perfectly
+# good HTTP client. PNG and JPEG are what every mod index actually serves.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Build-time only: writes the icon into the .exe's resource table. Nothing of
+# it ends up in the binary, and it is not a dependency on any other platform.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

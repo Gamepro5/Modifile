@@ -2,7 +2,7 @@
 //! it in the game directory.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -20,11 +20,23 @@ use crate::state;
 use crate::store::Store;
 use crate::trust::{self, TrustPolicy, TrustReport};
 
+/// Thunderstore's own category name for modpacks. It is the same across every
+/// community, and it is the only thing distinguishing a pack from a mod there.
+const MODPACK_CATEGORY: &str = "Modpacks";
+
 /// How many repositories to query at once. GitHub tolerates this comfortably
 /// and it turns a 40-mod update check from a minute into a couple of seconds.
 const RESOLVE_CONCURRENCY: usize = 8;
 /// Downloads are heavier, so fewer at a time.
 const DOWNLOAD_CONCURRENCY: usize = 4;
+
+/// The largest settings file Modifile will open in its own editor.
+///
+/// Configs are human-scale — the biggest a mod writes is a few hundred
+/// kilobytes. Anything past this is a cache or a database that something
+/// dropped in the config folder, and pouring it into a text box would hang the
+/// window rather than help.
+const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Knobs for a deploy. Two booleans in an argument list is a bug waiting to
 /// happen, so they get names at the call site.
@@ -46,6 +58,182 @@ pub struct SyncIssue {
     /// game version or loader yet. It stays in the profile, is skipped on
     /// activation, and picks itself up once a compatible build appears.
     pub waiting: bool,
+}
+
+/// Where a modpack archive comes from.
+#[derive(Debug, Clone)]
+pub enum ModpackSource {
+    /// A file on disk. Both stores hand you a zip, so this is the common case.
+    Path(PathBuf),
+    /// A direct link to the archive.
+    Url(String),
+    /// A CurseForge project and one of its files.
+    CurseForgeFile { project: u64, file: u64 },
+    /// A Modrinth version id, whose primary file is the `.mrpack`.
+    ModrinthVersion(String),
+    /// A Modrinth project, taking whatever its newest version is.
+    ModrinthProject(String),
+    /// A CurseForge project, taking whatever its newest file is.
+    CurseForgeProject(u64),
+    /// A Thunderstore package, at an exact version or the newest one.
+    ThunderstorePackage {
+        namespace: String,
+        name: String,
+        version: Option<String>,
+    },
+}
+
+impl ModpackSource {
+    /// Work out what the user typed.
+    ///
+    /// Guessing is safe here in a way it usually is not: a modpack arrives
+    /// either as a file you downloaded or as a link you copied, and the two
+    /// are never confusable. Anything that is not a URL is a path, and a bad
+    /// path fails immediately with the name you gave it.
+    pub fn parse(input: &str) -> Self {
+        let trimmed = input.trim();
+
+        // The ids search prints, so that what it tells you to run actually
+        // runs. `modrinth:sodium-pack`, `curseforge:123456`.
+        if let Some(rest) = trimmed.strip_prefix("modrinth:").map(str::trim) {
+            if !rest.is_empty() {
+                return ModpackSource::ModrinthProject(rest.to_string());
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("curseforge:").map(str::trim) {
+            if let Ok(id) = rest.parse::<u64>() {
+                return ModpackSource::CurseForgeProject(id);
+            }
+        }
+        // `thunderstore:Ns/Name` from search output, and Thunderstore's own
+        // `Namespace-Name-Version` spelling, which is what a pack's dependency
+        // list and its download page both use.
+        for prefix in ["thunderstore:", "ts:"] {
+            if let Some(rest) = trimmed.strip_prefix(prefix).map(str::trim) {
+                let mut parts = rest.split('/').filter(|p| !p.is_empty());
+                if let (Some(ns), Some(name)) = (parts.next(), parts.next()) {
+                    return ModpackSource::ThunderstorePackage {
+                        namespace: ns.to_string(),
+                        name: name.to_string(),
+                        version: parts.next().map(str::to_string),
+                    };
+                }
+                if let Some((ns, name, version)) =
+                    crate::source::thunderstore::split_dependency(rest)
+                {
+                    return ModpackSource::ThunderstorePackage {
+                        namespace: ns,
+                        name,
+                        version: Some(version),
+                    };
+                }
+            }
+        }
+
+        let bare = trimmed
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.");
+        // modrinth.com/modpack/<slug>/version/<id> — the page someone copies
+        // out of the address bar when they mean "this exact pack version" —
+        // and modrinth.com/modpack/<slug>, which means "the newest one".
+        if let Some(rest) = bare.strip_prefix("modrinth.com/") {
+            if let Some((_, id)) = rest.split_once("/version/") {
+                let id = id.split(['/', '?', '#']).next().unwrap_or(id);
+                if !id.is_empty() {
+                    return ModpackSource::ModrinthVersion(id.to_string());
+                }
+            }
+            let mut parts = rest.split('/').filter(|p| !p.is_empty());
+            if let (Some("modpack"), Some(slug)) = (parts.next(), parts.next()) {
+                let slug = slug.split(['?', '#']).next().unwrap_or(slug);
+                if !slug.is_empty() {
+                    return ModpackSource::ModrinthProject(slug.to_string());
+                }
+            }
+        }
+
+        // thunderstore.io/package/<ns>/<name>[/<version>]/ and the
+        // /c/<community>/p/<ns>/<name>/ form.
+        if let Some(rest) = bare.strip_prefix("thunderstore.io/") {
+            let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+            let found = match parts.as_slice() {
+                // `/package/download/<ns>/<name>/<ver>/` is a direct archive
+                // link and is better handled as a plain URL.
+                ["package", "download", ..] => None,
+                ["package", ns, name, rest @ ..] => Some((*ns, *name, rest.first().copied())),
+                ["c", _community, "p", ns, name, rest @ ..] => {
+                    Some((*ns, *name, rest.first().copied()))
+                }
+                _ => None,
+            };
+            if let Some((ns, name, version)) = found {
+                return ModpackSource::ThunderstorePackage {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    version: version
+                        .map(|v| v.split(['?', '#']).next().unwrap_or(v).to_string())
+                        .filter(|v| !v.is_empty()),
+                };
+            }
+        }
+
+        if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+            return ModpackSource::Url(trimmed.to_string());
+        }
+        ModpackSource::Path(PathBuf::from(trimmed))
+    }
+}
+
+/// A pack archive that is now in the store, and what we learned fetching it.
+#[derive(Debug, Clone)]
+struct StagedPack {
+    sha256: String,
+    size: u64,
+    /// The file name it arrived under, which is what the game pack's asset
+    /// rules match against.
+    name: String,
+    /// Thunderstore's community slug, when the pack came from there. The only
+    /// thing that says which game a Thunderstore pack is for.
+    community: Option<String>,
+}
+
+/// What importing a modpack produced.
+///
+/// Deliberately detailed. A pack is a few hundred decisions somebody else made
+/// on your behalf, and the difference between "installed 312 mods" and knowing
+/// which four could not be fetched is the difference between a game that starts
+/// and an evening of guessing.
+#[derive(Debug, Clone, Default)]
+pub struct ModpackReport {
+    /// The profile that was created, which may be a de-duplicated name.
+    pub profile: String,
+    /// The game pack it was created for. Together with `profile` this is the
+    /// profile's full identity — the name alone does not say which game.
+    pub game: String,
+    pub pack: String,
+    pub format: String,
+    pub game_version: Option<String>,
+    pub loader: Option<String>,
+    /// The loader build the pack was tested against. Modifile installs the
+    /// newest stable of that loader rather than this exact one, so it is worth
+    /// saying which was asked for.
+    pub loader_version: Option<String>,
+    /// Mods added to the profile, pinned to the pack's versions.
+    pub mods: usize,
+    /// Files the pack named that no index could attribute to a project. Taken
+    /// as direct downloads and held by hash, so they still install — but
+    /// nothing can check them for updates.
+    pub untraced: usize,
+    /// Files the pack named that could not be taken at all, and why.
+    pub skipped: Vec<(String, String)>,
+    /// Files in the pack's own overrides tree.
+    pub overrides: usize,
+    /// Things worth saying that are not failures — a loader version that will
+    /// not be pinned, a loader this game pack does not list.
+    pub notes: Vec<String>,
+    /// What the trust ladder made of the pack's overrides.
+    pub trust: Option<TrustReport>,
 }
 
 /// Where imported configs come from.
@@ -85,6 +273,13 @@ pub enum Event {
     },
     Installed { id: ModId, version: String, trust: TrustReport },
     Failed { id: ModId, error: String },
+    /// Progress that belongs to a whole modpack rather than to one mod.
+    ///
+    /// Every other variant is keyed by a `ModId`, which is right for a sync
+    /// and useless for "reading the manifest" or "matching 312 files to their
+    /// projects" — work that is neither instant nor attributable to any one
+    /// entry, and which is silent without this.
+    Pack { stage: String, detail: String },
 }
 
 pub type Reporter = Arc<dyn Fn(Event) + Send + Sync>;
@@ -98,6 +293,8 @@ pub struct Engine {
     pub store: Store,
     pub github: GitHub,
     pub modrinth: crate::source::modrinth::Modrinth,
+    /// Keyless, and the index for most BepInEx games.
+    pub thunderstore: crate::source::thunderstore::Thunderstore,
     /// GitLab, Gitea and Forgejo, including self-hosted instances.
     pub forge: crate::source::forge::Forge,
     /// Present only when the user has supplied their own CurseForge key.
@@ -106,6 +303,21 @@ pub struct Engine {
     pub pack_errors: Vec<(PathBuf, Error)>,
     pub policy: TrustPolicy,
     pub roots: crate::roots::GlobalRoots,
+}
+
+/// What one profile entry asks the resolver for.
+///
+/// Grouped rather than passed loose because the four travel together and three
+/// of them are easy to transpose at a call site.
+#[derive(Debug, Clone, Copy)]
+struct Want<'a> {
+    id: &'a ModId,
+    /// Hold at this release tag.
+    pin: Option<&'a str>,
+    /// The source's own handle for one exact artifact, where a tag is not
+    /// enough — a CurseForge `fileID`.
+    file: Option<&'a str>,
+    allow_prerelease: bool,
 }
 
 /// A mod resolved to a concrete downloadable artifact, before we have it.
@@ -140,8 +352,8 @@ impl Engine {
     pub fn open(paths: Paths, token: Option<String>) -> Result<Self> {
         paths.ensure()?;
         let http = Http::new(paths.http_cache(), token)?;
-        // Modrinth and CurseForge take no bearer token, so they get their own
-        // client without GitHub's Authorization header attached.
+        // Modrinth, Thunderstore and CurseForge take no bearer token, so they
+        // get their own client without GitHub's Authorization header attached.
         let plain = Http::new(paths.http_cache(), None)?;
         let curseforge_key = std::fs::read_to_string(paths.curseforge_key_file())
             .ok()
@@ -153,18 +365,37 @@ impl Engine {
         // Opt-in, stored as a plain marker file so it is obvious and revocable.
         let cf_direct = paths.curseforge_direct_file().exists();
 
+        // Likewise for "install mods that publish no source at all". This is
+        // read here rather than set by each front end, because it was only the
+        // GUI that honoured it — so the same profile the window would install
+        // was refused from the command line, with no way to say otherwise.
+        let policy = TrustPolicy {
+            minimum: if paths.allow_no_source_file().exists() {
+                crate::trust::TrustLevel::Blocked
+            } else {
+                TrustPolicy::default().minimum
+            },
+            ..TrustPolicy::default()
+        };
+
+        // Profiles moved from one flat directory to one per game, so that a
+        // name only has to be unique within its own game. A no-op once there
+        // is nothing left at the top level.
+        crate::profile::migrate_flat_layout(&paths.profiles);
+
         let (packs, pack_errors) = load_dir(&paths.packs);
         let roots = crate::roots::GlobalRoots::load(&paths.roots_file()).unwrap_or_default();
         Ok(Self {
             store: Store::new(paths.store.clone()),
             modrinth: crate::source::modrinth::Modrinth::new(plain.clone()),
+            thunderstore: crate::source::thunderstore::Thunderstore::new(plain.clone()),
             forge: crate::source::forge::Forge::new(plain.clone()),
             curseforge: curseforge_key
                 .map(|key| crate::source::curseforge::CurseForge::new(plain, key, cf_direct)),
             github: GitHub::new(http),
             packs,
             pack_errors,
-            policy: TrustPolicy::default(),
+            policy,
             roots,
             paths,
         })
@@ -276,6 +507,33 @@ impl Engine {
     }
 
     /// Save a GitHub token and rebuild the HTTP client that uses it.
+    /// Whether mods that publish no source at all may be installed.
+    pub fn allows_no_source(&self) -> bool {
+        self.paths.allow_no_source_file().exists()
+    }
+
+    /// Allow, or stop allowing, mods that publish no source code anywhere.
+    ///
+    /// Stored as a marker file rather than a settings key, for the same reason
+    /// the CurseForge direct-download switch is: it is trivially inspectable
+    /// and trivially undone, and a setting that weakens a safety default
+    /// should not be buried where nobody can find it again.
+    pub fn set_allow_no_source(&mut self, on: bool) -> Result<()> {
+        let path = self.paths.allow_no_source_file();
+        if on {
+            crate::paths::write_atomic(
+                &path,
+                b"Mods that publish no source code at all may be installed.\n\
+                  Delete this file to go back to refusing them.\n",
+            )?;
+            self.policy.minimum = crate::trust::TrustLevel::Blocked;
+        } else {
+            let _ = std::fs::remove_file(&path);
+            self.policy.minimum = TrustPolicy::default().minimum;
+        }
+        Ok(())
+    }
+
     pub fn set_token(&mut self, token: &str) -> Result<()> {
         let token = token.trim();
         let path = self.paths.token_file();
@@ -419,7 +677,13 @@ impl Engine {
                 let filter = filter.clone();
                 async move {
                     report(Event::Resolving(entry.id.clone()));
-                    match self.resolve_one(pack, &entry.id, entry.pin.as_deref(), entry.prerelease, &targets, &filter).await {
+                    let want = Want {
+                        id: &entry.id,
+                        pin: entry.pin.as_deref(),
+                        file: entry.file.as_deref(),
+                        allow_prerelease: entry.prerelease,
+                    };
+                    match self.resolve_one(pack, want, &targets, &filter).await {
                         Ok(res) => {
                             report(Event::Resolved {
                                 id: res.id.clone(),
@@ -521,12 +785,22 @@ impl Engine {
     }
 
     /// Fetch a mod's releases and project info from whichever source owns it.
+    /// Every release of one mod, plus whatever the source says about it.
+    ///
+    /// `file` narrows to a single exact artifact when the caller already knows
+    /// which one it wants — a modpack naming a CurseForge `fileID`. Without it
+    /// the source's ordinary listing is returned, which for CurseForge is only
+    /// the newest fifty files.
     async fn fetch(
         &self,
         id: &ModId,
         filter: &crate::source::modrinth::VersionFilter,
-        cf_game: Option<u32>,
+        pack: &CompiledPack,
+        pin: Option<&str>,
+        file: Option<&str>,
     ) -> Result<(Vec<Release>, Option<RepoInfo>)> {
+        let cf_game = pack.pack.search.curseforge_game_id;
+        let community = pack.pack.search.thunderstore_community.as_deref();
         match id.kind {
             crate::source::SourceKind::GitHub => Ok((
                 self.github.releases(id).await?,
@@ -547,6 +821,18 @@ impl Engine {
                 self.modrinth.releases(id, filter).await?,
                 self.modrinth.project(id).await.unwrap_or(None),
             )),
+            // Thunderstore's API publishes the newest version and any exact
+            // one, but no history — so a pin is resolved directly rather than
+            // by searching a list. That also keeps a modpack's several hundred
+            // pinned dependencies to one small request each, instead of the
+            // tens of megabytes its community listing would cost.
+            // One request, not two: the version record already carries the
+            // description and source link that a second `project` call would
+            // fetch, and a modpack asking twice per mod is what tips
+            // Thunderstore into rate-limiting.
+            crate::source::SourceKind::Thunderstore => {
+                self.thunderstore.resolve(id, pin, community).await
+            }
             crate::source::SourceKind::CurseForge => {
                 let Some(cf) = &self.curseforge else {
                     return Err(Error::other(format!(
@@ -554,6 +840,20 @@ impl Engine {
                          Add one in Settings, or with `modifile auth --curseforge <key>`."
                     )));
                 };
+                // A pack named one exact file. Ask for that file rather than
+                // hoping it is still among the project's newest fifty.
+                if let Some(file_id) = file.and_then(|f| f.parse::<u64>().ok()) {
+                    let project = id.repo.parse::<u64>().map_err(|_| {
+                        Error::other(format!(
+                            "{id} is pinned to CurseForge file {file_id}, but its project \
+                             id is not numeric — the pin cannot be resolved."
+                        ))
+                    })?;
+                    return Ok((
+                        vec![cf.release_for_file(project, file_id).await?],
+                        cf.project(id, cf_game).await.unwrap_or(None),
+                    ));
+                }
                 Ok((
                     cf.releases(id, filter.game_version.as_deref(), cf_game).await?,
                     cf.project(id, cf_game).await.unwrap_or(None),
@@ -565,15 +865,55 @@ impl Engine {
     async fn resolve_one(
         &self,
         pack: &CompiledPack,
-        id: &ModId,
-        pin: Option<&str>,
-        allow_prerelease: bool,
+        want: Want<'_>,
         targets: &[Target],
         filter: &crate::source::modrinth::VersionFilter,
     ) -> Result<Resolution> {
-        let (releases, repo) = self
-            .fetch(id, filter, pack.pack.search.curseforge_game_id)
+        let Want {
+            id,
+            pin,
+            file,
+            allow_prerelease,
+        } = want;
+        let (mut releases, repo) = self
+            .fetch(id, filter, pack, pin, file)
             .await?;
+
+        // The newest release we could have used had the entry not been pinned.
+        // Computed here, from the *filtered* list, and kept — so that widening
+        // the search below to honour a pin cannot turn "3.1.4 is out" into a
+        // suggestion to install a build for a different game version.
+        let newest_usable =
+            Self::newest_usable(pack, &releases, allow_prerelease, targets).map(str::to_string);
+
+        // A pin is a statement that this exact version is wanted. The version
+        // filter is there to choose among *unpinned* candidates, and must not
+        // be able to hide a release someone explicitly asked for.
+        //
+        // This is not a corner case: a modpack pins every one of its mods, and
+        // pack authors routinely ship a library whose metadata lists only the
+        // previous game version. Without this, importing a pack reports a
+        // dozen of its mods as "no build for your version yet" while the pack
+        // itself runs fine.
+        if let Some(wanted) = pin {
+            if !filter.is_empty() && !releases.iter().any(|r| r.tag == wanted) {
+                if let Ok((wide, _)) = self
+                    .fetch(
+                        id,
+                        &crate::source::modrinth::VersionFilter::default(),
+                        pack,
+                        pin,
+                        file,
+                    )
+                    .await
+                {
+                    if wide.iter().any(|r| r.tag == wanted) {
+                        releases = wide;
+                    }
+                }
+            }
+        }
+
         if releases.is_empty() {
             // "Nothing built for your version yet" is a waiting state, not a
             // broken mod, and the two must not look the same.
@@ -592,18 +932,16 @@ impl Engine {
             }));
         }
 
-        // The newest release that would have been chosen with no pin in the
-        // way. Computed first, and always, so a pinned mod can report what it
-        // is holding back from — the alternative is an update check that
-        // cheerfully reports "already newest" about a year-old version.
-        let newest_usable = Self::newest_usable(pack, &releases, allow_prerelease, targets);
+        // An exact file id already named one artifact, so there is nothing
+        // left to filter — and a pack is entitled to pin a beta if that is
+        // what its author tested against.
+        let exact = file.is_some();
 
         // Walk back through releases until one carries an asset we can use.
         // A tag with no build attached is common and should not be fatal.
-        for release in releases
-            .iter()
-            .filter(|r| pin.map(|p| r.tag == p).unwrap_or(allow_prerelease || !r.prerelease))
-        {
+        for release in releases.iter().filter(|r| {
+            exact || pin.map(|p| r.tag == p).unwrap_or(allow_prerelease || !r.prerelease)
+        }) {
             let names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
             for target in targets {
                 if let Some(idx) = pack.select_asset(&names, target) {
@@ -612,8 +950,9 @@ impl Engine {
                         release: release.clone(),
                         asset: release.assets[idx].clone(),
                         repo: repo.clone(),
-                        newer: newest_usable.filter(|tag| *tag != release.tag.as_str())
-                            .map(str::to_string),
+                        newer: newest_usable
+                            .clone()
+                            .filter(|tag| tag.as_str() != release.tag.as_str()),
                     });
                 }
             }
@@ -675,8 +1014,10 @@ impl Engine {
             loader: profile.loader.clone(),
         };
 
+        // Deliberately not narrowed to a pinned file: this is the list someone
+        // opens to move *off* whatever a modpack pinned them to.
         let (releases, _) = self
-            .fetch(id, &filter, pack.pack.search.curseforge_game_id)
+            .fetch(id, &filter, pack, None, None)
             .await?;
 
         Ok(releases
@@ -835,6 +1176,14 @@ impl Engine {
     // Deploy
     // -----------------------------------------------------------------------
 
+    /// What Activate would install: files in the game folder, where the game
+    /// finds them however it is started.
+    ///
+    /// Deliberately not instanced. Instancing is Play's mechanism, not the
+    /// program's default — a game that declares `[instance]` is saying it
+    /// *can* be pointed elsewhere, not that Activate should point it there.
+    /// Conflating the two emptied `BepInEx/plugins` on every activate and left
+    /// a Steam launch running vanilla.
     pub fn plan(
         &self,
         pack: &CompiledPack,
@@ -843,7 +1192,44 @@ impl Engine {
         target: &Target,
         root: &std::path::Path,
     ) -> Result<Plan> {
-        deploy::plan(pack, target, root, profile, lock, &self.store)
+        deploy::plan(pack, target, root, None, profile, lock, &self.store)
+    }
+
+    /// What Play would install: the profile's own tree, leaving the game
+    /// folder as close to vanilla as the loader allows.
+    pub fn plan_instanced(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        lock: &Lock,
+        target: &Target,
+        root: &std::path::Path,
+    ) -> Result<Plan> {
+        let instance = self.instance_for(pack, profile);
+        deploy::plan(
+            pack,
+            target,
+            root,
+            instance.as_deref(),
+            profile,
+            lock,
+            &self.store,
+        )
+    }
+
+    /// Where this profile's own tree goes, if it has one.
+    ///
+    /// A profile is instanced when its game can be pointed at a directory of
+    /// its own. That is a property of the game, declared in its pack — not a
+    /// per-profile choice, because a game either supports the redirection or
+    /// it does not.
+    pub fn instance_for(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+    ) -> Option<std::path::PathBuf> {
+        pack.instancing()?;
+        Some(self.paths.instance_dir(&profile.id()))
     }
 
     pub fn manifest(&self, game: &str, target: &str) -> Result<Option<Manifest>> {
@@ -930,9 +1316,10 @@ impl Engine {
         pack: &CompiledPack,
         target: &Target,
         plan: &Plan,
-        profile_name: &str,
+        profile: &crate::profile::ProfileId,
         options: DeployOptions,
     ) -> Result<DeployReport> {
+        let profile_name = profile.name.as_str();
         Self::require_closed(pack, target, &plan.root, options)?;
         let previous = self.manifest(&plan.game, &plan.target)?;
         let state_dirs = pack.state_dirs(target, &plan.root);
@@ -944,7 +1331,12 @@ impl Engine {
             .map(|m| m.profile != profile_name)
             .unwrap_or(false);
         if switching {
-            let outgoing = previous.as_ref().expect("checked above").profile.clone();
+            // The outgoing profile belongs to this same game, so its id is the
+            // manifest's name scoped to the game being deployed.
+            let outgoing = crate::profile::ProfileId::new(
+                &plan.game,
+                previous.as_ref().expect("checked above").profile.clone(),
+            );
             for (name, live) in &state_dirs {
                 let saved = state::profile_state_dir(&self.paths.profiles, &outgoing, &plan.target)
                     .join(name);
@@ -964,7 +1356,7 @@ impl Engine {
         let mut adopted = 0;
         for (name, live) in &state_dirs {
             let saved =
-                state::profile_state_dir(&self.paths.profiles, profile_name, &plan.target)
+                state::profile_state_dir(&self.paths.profiles, profile, &plan.target)
                     .join(name);
 
             if !switching && state::list_files(&saved).is_empty() {
@@ -1010,7 +1402,7 @@ impl Engine {
                 for (name, live) in pack.state_dirs(target_def, &manifest.root) {
                     let saved = state::profile_state_dir(
                         &self.paths.profiles,
-                        &manifest.profile,
+                        &crate::profile::ProfileId::new(game, &manifest.profile),
                         target,
                     )
                     .join(&name);
@@ -1047,7 +1439,7 @@ impl Engine {
     pub fn config_dirs(
         &self,
         pack: &CompiledPack,
-        profile: &str,
+        profile: &crate::profile::ProfileId,
         target: &Target,
     ) -> Vec<(String, PathBuf)> {
         pack.pack
@@ -1068,7 +1460,7 @@ impl Engine {
     pub fn saved_configs(
         &self,
         pack: &CompiledPack,
-        profile: &str,
+        profile: &crate::profile::ProfileId,
         target: &Target,
     ) -> Vec<PathBuf> {
         self.config_dirs(pack, profile, target)
@@ -1081,6 +1473,152 @@ impl Engine {
             .collect()
     }
 
+    /// Resolve one of a profile's saved settings files to a real path.
+    ///
+    /// `rel` is a display path in the form `saved_configs` returns: the state
+    /// path's own name, then the file beneath it. Both halves are checked. The
+    /// first has to be a state path this pack actually declares, and the rest
+    /// has to be plain names — no `..`, no root, no drive letter. This path is
+    /// about to be read and written, and it arrives from the UI, so it is not
+    /// taken on trust.
+    pub fn config_path(
+        &self,
+        pack: &CompiledPack,
+        profile: &crate::profile::ProfileId,
+        target: &Target,
+        rel: &std::path::Path,
+    ) -> Result<PathBuf> {
+        let mut parts = rel.components();
+        let head = match parts.next() {
+            Some(std::path::Component::Normal(head)) => head.to_string_lossy().into_owned(),
+            _ => {
+                return Err(Error::other(format!(
+                    "`{}` does not name a settings file",
+                    rel.display()
+                )));
+            }
+        };
+
+        let Some((_, dir)) = self
+            .config_dirs(pack, profile, target)
+            .into_iter()
+            .find(|(name, _)| *name == head)
+        else {
+            return Err(Error::other(format!(
+                "`{head}` is not a settings folder for {}",
+                pack.pack.game.name
+            )));
+        };
+
+        let mut path = dir;
+        let mut named_a_file = false;
+        for part in parts {
+            match part {
+                std::path::Component::Normal(name) => {
+                    path.push(name);
+                    named_a_file = true;
+                }
+                // `..`, `/`, `C:` — the ways a path climbs out of where it is
+                // supposed to be. A settings file has no use for any of them.
+                _ => {
+                    return Err(Error::other(format!(
+                        "`{}` leaves the settings folder",
+                        rel.display()
+                    )));
+                }
+            }
+        }
+        if !named_a_file {
+            return Err(Error::other(format!(
+                "`{}` names a folder, not a settings file",
+                rel.display()
+            )));
+        }
+        Ok(path)
+    }
+
+    /// Read one of a profile's settings files as text, for editing.
+    ///
+    /// Refuses anything that is not text. Mods keep settings in `.toml`,
+    /// `.json`, `.cfg` and `.properties`, but they also drop caches and
+    /// databases in the same folders, and showing one of those in a text box
+    /// would offer to save mojibake back over a working file.
+    pub fn read_config(
+        &self,
+        pack: &CompiledPack,
+        profile: &crate::profile::ProfileId,
+        target: &Target,
+        rel: &std::path::Path,
+    ) -> Result<String> {
+        let path = self.config_path(pack, profile, target, rel)?;
+        let size = std::fs::metadata(&path)
+            .ctx(format!("reading {}", path.display()))?
+            .len();
+        if size > MAX_CONFIG_BYTES {
+            return Err(Error::other(format!(
+                "{} is {}, too large to edit here — open it in a text editor",
+                rel.display(),
+                format_bytes(size)
+            )));
+        }
+        let bytes = std::fs::read(&path).ctx(format!("reading {}", path.display()))?;
+        String::from_utf8(bytes).map_err(|_| {
+            Error::other(format!("{} is not a text file", rel.display()))
+        })
+    }
+
+    /// Save an edited settings file back to the profile.
+    ///
+    /// The profile's own copy is the source of truth and is always written.
+    /// When this profile is the one currently installed, the live file is
+    /// written too, so the change is in effect without a redeploy — but only
+    /// when the game is closed, on the same rule every other write to a game
+    /// folder follows. When it is not, the profile's copy still holds the edit
+    /// and the next deploy applies it.
+    ///
+    /// Returns whether the live copy was updated, because that is the
+    /// difference between "this is in effect" and "this applies next time".
+    pub fn write_config(
+        &self,
+        pack: &CompiledPack,
+        profile: &crate::profile::ProfileId,
+        target: &Target,
+        rel: &std::path::Path,
+        text: &str,
+        root: Option<&std::path::Path>,
+    ) -> Result<bool> {
+        let path = self.config_path(pack, profile, target, rel)?;
+        crate::paths::write_atomic(&path, text.as_bytes())?;
+
+        let Some(root) = root else { return Ok(false) };
+        let deployed_here = self
+            .manifest(pack.id(), &target.id)?
+            .map(|m| m.profile == profile.name)
+            .unwrap_or(false);
+        if !deployed_here
+            || Self::require_closed(pack, target, root, DeployOptions::default()).is_err()
+        {
+            return Ok(false);
+        }
+
+        // Same split as `config_path`, against the live folder this time.
+        let mut parts = rel.components();
+        let Some(std::path::Component::Normal(head)) = parts.next() else {
+            return Ok(false);
+        };
+        let Some((_, live)) = pack
+            .state_dirs(target, root)
+            .into_iter()
+            .find(|(name, _)| std::path::Path::new(name) == std::path::Path::new(head))
+        else {
+            return Ok(false);
+        };
+        let mut live = live;
+        live.extend(parts);
+        crate::paths::write_atomic(&live, text.as_bytes())?;
+        Ok(true)
+    }
+
     /// Throw away a profile's saved configs so the next deploy re-seeds the
     /// mods' shipped defaults.
     ///
@@ -1090,7 +1628,7 @@ impl Engine {
     pub fn reset_configs(
         &self,
         pack: &CompiledPack,
-        profile: &str,
+        profile: &crate::profile::ProfileId,
         target: &Target,
         root: Option<&std::path::Path>,
     ) -> Result<usize> {
@@ -1105,7 +1643,7 @@ impl Engine {
         if let Some(root) = root {
             let deployed_here = self
                 .manifest(pack.id(), &target.id)?
-                .map(|m| m.profile == profile)
+                .map(|m| m.profile == profile.name)
                 .unwrap_or(false);
             // Only touch the live folder when we can be sure it is safe. When
             // we cannot — the game is running, or it is on another machine —
@@ -1125,7 +1663,7 @@ impl Engine {
     pub fn import_configs(
         &self,
         pack: &CompiledPack,
-        profile: &str,
+        profile: &crate::profile::ProfileId,
         target: &Target,
         source: &ConfigSource,
         root: Option<&std::path::Path>,
@@ -1133,9 +1671,14 @@ impl Engine {
         let mut copied = 0;
         for (name, dest) in self.config_dirs(pack, profile, target) {
             let from = match source {
-                ConfigSource::Profile(other) => {
-                    state::profile_state_dir(&self.paths.profiles, other, &target.id).join(&name)
-                }
+                // Copying settings between profiles only makes sense within one
+                // game, so the source is named rather than fully qualified.
+                ConfigSource::Profile(other) => state::profile_state_dir(
+                    &self.paths.profiles,
+                    &crate::profile::ProfileId::new(&profile.game, other),
+                    &target.id,
+                )
+                .join(&name),
                 ConfigSource::Game => {
                     let Some(root) = root else {
                         return Err(Error::NotFound(
@@ -1156,7 +1699,7 @@ impl Engine {
         if let (Some(root), true) = (
             root,
             self.manifest(pack.id(), &target.id)?
-                .map(|m| m.profile == profile)
+                .map(|m| m.profile == profile.name)
                 .unwrap_or(false),
         ) {
             if !matches!(source, ConfigSource::Game)
@@ -1185,13 +1728,13 @@ impl Engine {
         include_configs: bool,
         description: String,
     ) -> Result<crate::share::Bundle> {
-        let lock = Lock::load(&self.paths.lock_file(&profile.name))?;
+        let lock = Lock::load(&self.paths.lock_file(&profile.id()))?;
 
         let mut configs = std::collections::BTreeMap::new();
         if include_configs {
             for target in &pack.pack.targets {
                 let mut files = std::collections::BTreeMap::new();
-                for (name, dir) in self.config_dirs(pack, &profile.name, target) {
+                for (name, dir) in self.config_dirs(pack, &profile.id(), target) {
                     for rel in state::list_files(&dir) {
                         let display = PathBuf::from(&name)
                             .join(&rel)
@@ -1229,45 +1772,143 @@ impl Engine {
         // Never clobber an existing profile just because a friend's was named
         // the same thing.
         let wanted = name.unwrap_or(&bundle.name);
-        let mut chosen = sanitize_name(wanted);
-        let mut n = 2;
-        while self.paths.profile_file(&chosen).exists() {
-            chosen = format!("{}-{n}", sanitize_name(wanted));
-            n += 1;
-        }
+        let chosen = self.free_name(&bundle.game, wanted);
+        let id = crate::profile::ProfileId::new(&bundle.game, &chosen);
 
         let profile = bundle.to_profile(&chosen, pin_versions);
-        profile.save(&self.paths.profile_file(&chosen))?;
-        bundle.write_configs(&self.paths.profiles, &chosen)?;
+        profile.save(&self.paths.profile_file(&id))?;
+        bundle.write_configs(&self.paths.profiles, &id)?;
         Ok(chosen)
     }
 
+    /// Every profile on this machine, as `game/name`.
+    pub fn all_profiles(&self) -> Vec<crate::profile::ProfileId> {
+        let mut out = Vec::new();
+        let Ok(games) = std::fs::read_dir(&self.paths.profiles) else {
+            return out;
+        };
+        for game in games.flatten() {
+            if !game.path().is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(game.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                if let Ok(profile) = Profile::load(&path) {
+                    out.push(profile.id());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Turn what someone typed into one profile.
+    ///
+    /// Accepts `game/name`, and a bare `name` when only one game has it —
+    /// which is almost always, so the short form keeps working. When two games
+    /// both have that name the answer is to say so and list them, rather than
+    /// pick one and be wrong half the time.
+    pub fn resolve_profile(&self, spec: &str) -> Result<crate::profile::ProfileId> {
+        let spec = spec.trim();
+        if let Some((game, name)) = spec.split_once('/') {
+            let id = crate::profile::ProfileId::new(game.trim(), name.trim());
+            if self.paths.profile_file(&id).exists() {
+                return Ok(id);
+            }
+            return Err(Error::NotFound(format!("profile `{id}`")));
+        }
+
+        let matches: Vec<_> = self
+            .all_profiles()
+            .into_iter()
+            .filter(|id| id.name == spec)
+            .collect();
+
+        match matches.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(Error::NotFound(format!("a profile called `{spec}`"))),
+            many => Err(Error::other(format!(
+                "`{spec}` is a profile in {} games — say which: {}.",
+                many.len(),
+                many.iter()
+                    .map(|id| id.qualified())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// A name for this game that nothing is using yet.
+    ///
+    /// Only within the game: two games may each have a `main`, which is the
+    /// whole point of scoping names to their game.
+    pub fn free_name(&self, game: &str, wanted: &str) -> String {
+        let base = sanitize_name(wanted);
+        let base = if base.is_empty() {
+            "profile".to_string()
+        } else {
+            base
+        };
+        let mut chosen = base.clone();
+        let mut n = 2;
+        while self
+            .paths
+            .profile_file(&crate::profile::ProfileId::new(game, &chosen))
+            .exists()
+        {
+            chosen = format!("{base}-{n}");
+            n += 1;
+        }
+        chosen
+    }
+
     /// Rename a profile and everything that hangs off its name.
-    pub fn rename_profile(&self, from: &str, to: &str) -> Result<String> {
-        let to = sanitize_name(to);
-        if to.is_empty() {
+    ///
+    /// Within its own game: renaming cannot move a profile to another game,
+    /// because its mods were resolved against this one.
+    pub fn rename_profile(
+        &self,
+        from: &crate::profile::ProfileId,
+        to: &str,
+    ) -> Result<crate::profile::ProfileId> {
+        let to = crate::profile::ProfileId::new(&from.game, sanitize_name(to));
+        if to.name.is_empty() {
             return Err(Error::other("a profile needs a name"));
         }
-        if to == from {
+        if to == *from {
             return Ok(to);
         }
         if self.paths.profile_file(&to).exists() {
-            return Err(Error::other(format!("`{to}` already exists")));
+            return Err(Error::other(format!(
+                "`{}` already has a profile called `{}`",
+                from.game, to.name
+            )));
         }
 
         let mut profile = Profile::load(&self.paths.profile_file(from))?;
-        profile.name = to.clone();
+        profile.name = to.name.clone();
         profile.save(&self.paths.profile_file(&to))?;
         std::fs::remove_file(self.paths.profile_file(from)).ok();
 
-        // The lock and the saved configs are keyed by name too.
+        // The lock, the saved configs and any instance are keyed by name too.
         let old_lock = self.paths.lock_file(from);
         if old_lock.exists() {
             std::fs::rename(&old_lock, self.paths.lock_file(&to)).ok();
         }
-        let old_state = self.paths.profiles.join(format!("{from}.state"));
+        let dir = self.paths.profile_dir(&from.game);
+        let old_state = dir.join(format!("{}.state", from.name));
         if old_state.exists() {
-            std::fs::rename(&old_state, self.paths.profiles.join(format!("{to}.state"))).ok();
+            std::fs::rename(&old_state, dir.join(format!("{}.state", to.name))).ok();
+        }
+        let old_instance = self.paths.instance_dir(from);
+        if old_instance.exists() {
+            std::fs::rename(&old_instance, self.paths.instance_dir(&to)).ok();
         }
 
         // And any deployment that says it belongs to the old name, so the
@@ -1280,8 +1921,11 @@ impl Engine {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if let Ok(Some(mut manifest)) = Manifest::load(&path) {
-                        if manifest.profile == from {
-                            manifest.profile = to.clone();
+                        // A manifest names its game, so only this game's
+                        // deployments are touched — another game's `main` is
+                        // a different profile and must be left alone.
+                        if manifest.game == from.game && manifest.profile == from.name {
+                            manifest.profile = to.name.clone();
                             let _ = manifest.save(&path);
                         }
                     }
@@ -1342,23 +1986,31 @@ impl Engine {
     /// The downloads themselves are left alone. They are shared by hash with
     /// every other profile, so deciding they are garbage is `gc`'s job, not
     /// this one's.
-    pub fn delete_profile(&self, name: &str) -> Result<()> {
-        let file = self.paths.profile_file(name);
+    pub fn delete_profile(&self, id: &crate::profile::ProfileId) -> Result<()> {
+        let file = self.paths.profile_file(id);
         if !file.exists() {
-            return Err(Error::NotFound(format!("no profile called `{name}`")));
+            return Err(Error::NotFound(format!("no profile called `{id}`")));
         }
 
         let profile = Profile::load(&file)?;
-        if self.active_profiles(&profile.game).iter().any(|p| p == name) {
+        if self.active_profiles(&profile.game).contains(&id.name) {
             return Err(Error::other(format!(
-                "`{name}` is active — its mods are in the game folder right now. \
-                 Deactivate it first, so the game goes back to vanilla."
+                "`{}` is active — its mods are in the game folder right now. \
+                 Deactivate it first, so the game goes back to vanilla.",
+                id.name
             )));
         }
 
         std::fs::remove_file(&file).ctx(format!("deleting {}", file.display()))?;
-        std::fs::remove_file(self.paths.lock_file(name)).ok();
-        std::fs::remove_dir_all(self.paths.profiles.join(format!("{name}.state"))).ok();
+        std::fs::remove_file(self.paths.lock_file(id)).ok();
+        std::fs::remove_dir_all(
+            self.paths
+                .profile_dir(&id.game)
+                .join(format!("{}.state", id.name)),
+        )
+        .ok();
+        // An instance is this profile's alone and goes with it.
+        std::fs::remove_dir_all(self.paths.instance_dir(id)).ok();
 
         // A deactivated manifest hangs around to remember leftovers it could
         // not remove. One naming a profile that no longer exists is noise, so
@@ -1367,7 +2019,10 @@ impl Engine {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Ok(Some(manifest)) = Manifest::load(&path) {
-                    if manifest.profile == name && !manifest.active && manifest.files.is_empty() {
+                    if manifest.profile == id.name
+                        && !manifest.active
+                        && manifest.files.is_empty()
+                    {
                         std::fs::remove_file(&path).ok();
                     }
                 }
@@ -1453,6 +2108,1018 @@ impl Engine {
         mod_entry.manual = true;
         profile.add(mod_entry);
         Ok(entry)
+    }
+
+    // -----------------------------------------------------------------------
+    // Updating Modifile itself
+    // -----------------------------------------------------------------------
+
+    /// Whether to look for new versions of Modifile on startup.
+    pub fn checks_for_updates(&self) -> bool {
+        !self.paths.no_update_check_file().exists()
+    }
+
+    /// Whether a found update is installed without asking.
+    pub fn auto_updates(&self) -> bool {
+        self.paths.auto_update_file().exists()
+    }
+
+    pub fn set_update_checks(&self, on: bool) -> Result<()> {
+        toggle_marker(
+            &self.paths.no_update_check_file(),
+            // Inverted: the file means "do not check".
+            !on,
+            b"Modifile will not look for new versions of itself.\n\
+              Delete this file to turn the check back on.\n",
+        )
+    }
+
+    pub fn set_auto_update(&self, on: bool) -> Result<()> {
+        toggle_marker(
+            &self.paths.auto_update_file(),
+            on,
+            b"Modifile installs its own updates without asking.\n\
+              Delete this file to be asked first.\n",
+        )
+    }
+
+    /// Is there a newer Modifile?
+    pub async fn check_for_update(&self) -> Result<Option<crate::selfupdate::Available>> {
+        crate::selfupdate::check(&self.github).await
+    }
+
+    /// Download, verify and install an update.
+    ///
+    /// Returns which binaries were replaced. The running program is not
+    /// restarted — that is the caller's business, and on a desktop app it is
+    /// the user's.
+    pub async fn install_update(
+        &self,
+        available: &crate::selfupdate::Available,
+    ) -> Result<crate::selfupdate::Applied> {
+        let dir = crate::selfupdate::install_dir()?;
+
+        // Fail before downloading 12 MB rather than after.
+        let probe = dir.join(format!(".modifile-write-test-{}", crate::paths::now_millis()));
+        std::fs::write(&probe, b"x").map_err(|e| {
+            Error::other(format!(
+                "cannot write to {} ({e}), so the update cannot be installed there. \
+                 If Modifile lives somewhere privileged, download {} yourself and \
+                 unpack it over the top.",
+                dir.display(),
+                available.asset.name
+            ))
+        })?;
+        let _ = std::fs::remove_file(&probe);
+
+        let archive = crate::selfupdate::stage(
+            self.github.http(),
+            available,
+            &self.paths.updates(),
+        )
+        .await?;
+
+        let report = crate::selfupdate::apply(&archive, &dir);
+        // The archive is large and has done its job either way.
+        let _ = std::fs::remove_file(&archive);
+        report
+    }
+
+    /// Remove binaries parked aside by a previous update. Called at startup.
+    pub fn tidy_after_update(&self) -> usize {
+        crate::selfupdate::install_dir()
+            .map(|dir| crate::selfupdate::cleanup(&dir))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Playing
+    // -----------------------------------------------------------------------
+
+    /// The user's own launch commands.
+    pub fn launch_settings(&self) -> crate::launch::LaunchSettings {
+        crate::launch::LaunchSettings::load(&self.paths.launch_file())
+    }
+
+    pub fn set_launch_command(&self, game: &str, command: Option<&str>) -> Result<()> {
+        let mut settings = self.launch_settings();
+        settings.set(game, command);
+        settings.save(&self.paths.launch_file())
+    }
+
+    /// How this target would be started, without starting it.
+    ///
+    /// Used to say what Play will do before it does it, and to grey out a
+    /// button that could not work.
+    pub fn launch_method(
+        &self,
+        pack: &CompiledPack,
+        target: &Target,
+        root: &Path,
+    ) -> Option<crate::launch::LaunchMethod> {
+        let settings = self.launch_settings();
+        crate::launch::resolve(target, root, settings.get(pack.id()))
+    }
+
+    /// Start the game with this profile's instance.
+    ///
+    /// Play only exists for games that can be pointed at a directory of their
+    /// own. That is what makes it safe: the mods are in the instance, the game
+    /// folder is untouched, and quitting — or crashing, or losing power —
+    /// leaves nothing to undo. A game that cannot do that is refused here
+    /// rather than given a Play button that quietly modifies the install.
+    pub fn play(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        target: &Target,
+        root: &Path,
+    ) -> Result<crate::launch::LaunchMethod> {
+        let Some(rules) = pack.instancing() else {
+            return Err(Error::other(format!(
+                "{} cannot be launched with a profile. It reads its mods from one fixed \
+                 place inside its own folder, so there is no way to point it somewhere \
+                 else for a single run — Modifile would have to modify the install and \
+                 put it back afterwards, and an interrupted session would leave it \
+                 modified. Activate `{}` and start the game yourself instead.",
+                pack.pack.game.name, profile.name
+            )));
+        };
+
+        let manifest = self.manifest(pack.id(), &target.id)?;
+        let deployed = manifest
+            .as_ref()
+            .filter(|m| m.active && m.profile == profile.name)
+            .is_some();
+        if !deployed {
+            return Err(Error::other(format!(
+                "`{}` has not been set up for {} yet, so starting the game would start \
+                 it unmodded. Activate it first.",
+                profile.name, target.name
+            )));
+        }
+
+        let instance = self
+            .instance_for(pack, profile)
+            .ok_or_else(|| Error::other("this profile has no instance directory"))?;
+
+        let args = match rules.kind {
+            crate::pack::InstanceKind::Doorstop => {
+                let target_assembly = instance.join(
+                    rules
+                        .target
+                        .as_deref()
+                        .unwrap_or("BepInEx/core/BepInEx.Preloader.dll"),
+                );
+                if !target_assembly.is_file() {
+                    return Err(Error::other(format!(
+                        "this profile's mod loader is not installed in its own folder yet \
+                         — {} is missing. Install the loader for `{}` and try again.",
+                        target_assembly.display(),
+                        profile.name
+                    )));
+                }
+                crate::launch::LaunchArgs::doorstop(&target_assembly)
+            }
+            // Minecraft's launcher owns the process; Modifile writes a profile
+            // pointing at the instance and opens the launcher.
+            crate::pack::InstanceKind::MinecraftLauncher => {
+                crate::loader::write_game_dir_profile(root, &profile.name, &instance)?;
+                crate::launch::LaunchArgs::default()
+            }
+        };
+
+        let method = self
+            .launch_method(pack, target, root)
+            .ok_or_else(|| crate::launch::no_method(pack.id(), &target.name))?;
+        crate::launch::spawn(&method, root, &args)?;
+        Ok(method)
+    }
+
+    // -----------------------------------------------------------------------
+    // Modpacks
+    // -----------------------------------------------------------------------
+
+    /// Fetch a URL straight into the content-addressed store.
+    ///
+    /// The missing primitive: `acquire` can only be reached through a
+    /// `Resolution`, which assumes a mod resolved from a source. A modpack
+    /// needs "these exact bytes, from this exact URL" — for the pack archive
+    /// itself, and for the files inside a pack that belong to no index.
+    ///
+    /// Deliberately on the keyless client. The one that carries the GitHub
+    /// token has no business talking to a mod CDN.
+    pub async fn import_url(
+        &self,
+        url: &str,
+        name: &str,
+        unpack: bool,
+        expect_sha512: Option<&str>,
+    ) -> Result<(String, u64)> {
+        let tmp = self.paths.downloads().join(format!(
+            "url-{}-{}",
+            sanitize_name(name),
+            crate::paths::now_millis()
+        ));
+        let (size, sha256) = self.modrinth.http().download_to(url, &tmp).await?;
+
+        // A pack that publishes a hash gets checked against it. This is the
+        // only integrity claim these files carry.
+        if let Some(expected) = expect_sha512 {
+            let actual = crate::hash::sha512_file(&tmp)?;
+            if !expected.eq_ignore_ascii_case(&actual) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Integrity {
+                    name: name.to_string(),
+                    expected: expected.to_string(),
+                    actual,
+                });
+            }
+        }
+
+        let stored = self.store.insert(&sha256, &tmp, name, unpack);
+        let _ = std::fs::remove_file(&tmp);
+        stored?;
+        Ok((sha256, size))
+    }
+
+    /// Get a modpack archive into the store, whichever way it was named.
+    ///
+    /// Returns its hash, its size, the file name it arrived under, and — for a
+    /// Thunderstore package — the community that lists it, which is the only
+    /// thing saying which game the pack is for.
+    async fn stage_modpack(
+        &self,
+        source: &ModpackSource,
+        community: Option<&str>,
+    ) -> Result<StagedPack> {
+        let plain = |sha: String, size: u64, name: String| StagedPack {
+            sha256: sha,
+            size,
+            name,
+            community: None,
+        };
+        match source {
+            ModpackSource::Path(path) => {
+                if !path.is_file() {
+                    return Err(Error::NotFound(path.display().to_string()));
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "modpack.zip".to_string());
+                let sha256 = crate::hash::sha256_file(path)?;
+                let size = std::fs::metadata(path)?.len();
+                self.store.insert(&sha256, path, &name, true)?;
+                Ok(plain(sha256, size, name))
+            }
+            ModpackSource::Url(url) => {
+                let name = url
+                    .rsplit('/')
+                    .next()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("modpack.zip")
+                    .split('?')
+                    .next()
+                    .unwrap_or("modpack.zip")
+                    .to_string();
+                let (sha, size) = self.import_url(url, &name, true, None).await?;
+                Ok(plain(sha, size, name))
+            }
+            ModpackSource::CurseForgeFile { project, file } => {
+                let cf = self.curseforge.as_ref().ok_or_else(curseforge_key_needed)?;
+                let release = cf.release_for_file(*project, *file).await?;
+                let asset = release.assets.into_iter().next().ok_or_else(|| {
+                    Error::NotFound(format!("a downloadable file for CurseForge {file}"))
+                })?;
+                let (sha, size) = self
+                    .import_url(&asset.download_url, &asset.name, true, None)
+                    .await?;
+                Ok(plain(sha, size, asset.name))
+            }
+            ModpackSource::ModrinthVersion(id) => {
+                let asset = self.modrinth.version_primary_file(id).await?;
+                let (sha, size) = self
+                    .import_url(
+                        &asset.download_url,
+                        &asset.name,
+                        true,
+                        asset.sha512.as_deref(),
+                    )
+                    .await?;
+                Ok(plain(sha, size, asset.name))
+            }
+            ModpackSource::ModrinthProject(slug) => {
+                let asset = self.modrinth.newest_version_file(slug).await?;
+                let (sha, size) = self
+                    .import_url(
+                        &asset.download_url,
+                        &asset.name,
+                        true,
+                        asset.sha512.as_deref(),
+                    )
+                    .await?;
+                Ok(plain(sha, size, asset.name))
+            }
+            ModpackSource::CurseForgeProject(project) => {
+                let cf = self.curseforge.as_ref().ok_or_else(curseforge_key_needed)?;
+                let id = ModId::project(
+                    crate::source::SourceKind::CurseForge,
+                    project.to_string(),
+                );
+                let asset = cf
+                    .releases(&id, None, None)
+                    .await?
+                    .into_iter()
+                    .find_map(|r| r.assets.into_iter().next())
+                    .ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "a downloadable file for CurseForge project {project}"
+                        ))
+                    })?;
+                let (sha, size) = self
+                    .import_url(&asset.download_url, &asset.name, true, None)
+                    .await?;
+                Ok(plain(sha, size, asset.name))
+            }
+            ModpackSource::ThunderstorePackage {
+                namespace,
+                name,
+                version,
+            } => {
+                let id = ModId {
+                    kind: crate::source::SourceKind::Thunderstore,
+                    owner: namespace.clone(),
+                    repo: name.clone(),
+                    host: None,
+                };
+                // One request either way, and it carries the community that
+                // says which game this pack is for.
+                let package = self
+                    .thunderstore
+                    .package(&id, community)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::NotFound(format!("Thunderstore package {namespace}/{name}"))
+                    })?;
+                let listed_in = package.community().map(str::to_string);
+
+                let chosen = match version {
+                    Some(v) if v != &package.latest.version_number => self
+                        .thunderstore
+                        .version(&id, v)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::NotFound(format!(
+                                "Thunderstore version {v} of {namespace}/{name}"
+                            ))
+                        })?,
+                    _ => package.latest.clone(),
+                };
+
+                let asset_name = chosen.asset_name();
+                let (sha, size) = self
+                    .import_url(&chosen.download_url, &asset_name, true, None)
+                    .await?;
+                Ok(StagedPack {
+                    sha256: sha,
+                    size,
+                    name: asset_name,
+                    community: listed_in.or_else(|| community.map(str::to_string)),
+                })
+            }
+        }
+    }
+
+    /// Get a pack into the store and read its index. Shared by import and
+    /// inspect, so that looking before you leap costs nothing the second time:
+    /// the archive is content-addressed, so importing it afterwards downloads
+    /// nothing again.
+    ///
+    /// `game` is the caller's answer to "which game is this for", which only
+    /// matters for Thunderstore: a CurseForge or Modrinth pack states its game
+    /// in the format itself, and a Thunderstore pack does not state it at all.
+    async fn read_modpack(
+        &self,
+        source: &ModpackSource,
+        game: Option<&str>,
+        report: &Reporter,
+    ) -> Result<(crate::modpack::PackPlan, StagedPack, Vec<crate::store::StoredFile>)> {
+        report(Event::Pack {
+            stage: "Reading".to_string(),
+            detail: "fetching the pack archive".to_string(),
+        });
+        // When the caller named a game, its Thunderstore community is the
+        // fallback route for packages whose per-package endpoint misbehaves.
+        let community = game
+            .and_then(|id| self.pack(id))
+            .and_then(|p| p.pack.search.thunderstore_community.clone());
+        let staged = self.stage_modpack(source, community.as_deref()).await?;
+
+        let stored = self.store.files(&staged.sha256)?;
+        let rels: Vec<String> = stored.iter().map(|f| f.rel.clone()).collect();
+        let Some(index_rel) = crate::modpack::find_index(&rels) else {
+            return Err(Error::other(format!(
+                "`{}` is not a modpack — it holds no manifest.json (CurseForge or \
+                 Thunderstore) and no modrinth.index.json (.mrpack). If it is a single \
+                 mod, add it with `modifile add-file` instead.",
+                staged.name
+            )));
+        };
+        let index_path = stored
+            .iter()
+            .find(|f| f.rel == index_rel)
+            .map(|f| f.abs.clone())
+            .ok_or_else(|| Error::NotFound(index_rel.clone()))?;
+        let raw = std::fs::read(&index_path).ctx(format!("reading {index_rel}"))?;
+
+        // The file name does not settle it: CurseForge and Thunderstore both
+        // call their index manifest.json.
+        let format = crate::modpack::sniff(&index_rel, &raw).ok_or_else(|| {
+            Error::other(format!(
+                "`{index_rel}` in `{}` is not a modpack index in any format Modifile \
+                 reads — CurseForge, Modrinth `.mrpack` or Thunderstore.",
+                staged.name
+            ))
+        })?;
+
+        let plan = match format {
+            crate::modpack::ModpackFormat::CurseForge => {
+                crate::modpack::CurseForgeManifest::parse(&raw)?.to_plan()
+            }
+            crate::modpack::ModpackFormat::Modrinth => {
+                crate::modpack::ModrinthIndex::parse(&raw)?.to_plan()?
+            }
+            crate::modpack::ModpackFormat::Thunderstore => {
+                let game = self.thunderstore_game(game, staged.community.as_deref())?;
+                crate::modpack::ThunderstoreManifest::parse(&raw)?.to_plan(&game)?
+            }
+        };
+
+        Ok((plan, staged, stored))
+    }
+
+    /// How many files in the pack archive this game would actually install.
+    ///
+    /// Asked of the game pack's own install rules rather than by looking for
+    /// an `overrides/` directory, because only two of the three formats have
+    /// one. A Thunderstore package keeps its files at the archive root, and
+    /// they are installed by exactly the same rules as any other package's —
+    /// which is the whole reason a pack needs no special handling downstream.
+    fn pack_own_files(
+        &self,
+        plan: &crate::modpack::PackPlan,
+        stored: &[crate::store::StoredFile],
+    ) -> usize {
+        match self.pack(&plan.game) {
+            Some(pack) => stored
+                .iter()
+                .filter(|f| {
+                    pack.pack
+                        .targets
+                        .iter()
+                        .any(|t| pack.rule_for(&f.rel, &t.id).is_some())
+                })
+                .count(),
+            // No game pack installed to ask, so fall back to what the format
+            // itself declares.
+            None => {
+                let prefixes = override_prefixes(plan);
+                stored.iter().filter(|f| under_any(&f.rel, &prefixes)).count()
+            }
+        }
+    }
+
+    /// Which game a Thunderstore pack belongs to.
+    ///
+    /// Thunderstore packages carry no game anywhere — not in the manifest, not
+    /// in the archive. The community that lists the package is the only signal,
+    /// and a pack handed over as a plain file does not even have that. So this
+    /// takes what it can get and otherwise asks, rather than guessing and
+    /// installing a Valheim pack into Lethal Company.
+    fn thunderstore_game(&self, explicit: Option<&str>, community: Option<&str>) -> Result<String> {
+        if let Some(id) = explicit {
+            return match self.pack(id) {
+                Some(pack) => Ok(pack.id().to_string()),
+                None => Err(Error::NotFound(format!("game pack `{id}`"))),
+            };
+        }
+
+        if let Some(community) = community {
+            if let Some(pack) = self.packs.iter().find(|p| {
+                p.pack
+                    .search
+                    .thunderstore_community
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(community))
+            }) {
+                return Ok(pack.id().to_string());
+            }
+            return Err(Error::other(format!(
+                "this pack is listed under Thunderstore's `{community}` community, and no \
+                 game pack of yours claims it. Add `thunderstore_community = \"{community}\"` \
+                 to that game's [search] section, or say which game with --game."
+            )));
+        }
+
+        // A Thunderstore package in a file has nothing at all to go on.
+        let known: Vec<&str> = self
+            .packs
+            .iter()
+            .filter(|p| p.pack.search.thunderstore_community.is_some())
+            .map(|p| p.id())
+            .collect();
+        Err(Error::other(format!(
+            "this is a Thunderstore pack, and a Thunderstore package does not record which \
+             game it is for. Say which with --game. {}",
+            if known.is_empty() {
+                "No game pack of yours declares a Thunderstore community yet.".to_string()
+            } else {
+                format!("Games set up for Thunderstore: {}.", known.join(", "))
+            }
+        )))
+    }
+
+    /// Read a modpack and describe it, without creating anything.
+    ///
+    /// Needs no CurseForge key: counting what a pack asks for is reading its
+    /// index, and only fetching the files it names needs one.
+    pub async fn inspect_modpack(
+        &self,
+        source: ModpackSource,
+        game: Option<&str>,
+    ) -> Result<ModpackReport> {
+        let report = silent();
+        let (plan, _staged, stored) = self.read_modpack(&source, game, &report).await?;
+
+        Ok(ModpackReport {
+            profile: String::new(),
+            game: plan.game.clone(),
+            pack: plan.label(),
+            format: plan.format_name.clone(),
+            game_version: plan.game_version.clone(),
+            loader: plan.loader.clone(),
+            loader_version: plan.loader_version.clone(),
+            mods: plan.entries.len(),
+            untraced: 0,
+            skipped: Vec::new(),
+            overrides: self.pack_own_files(&plan, &stored),
+            notes: match self.pack(&plan.game) {
+                Some(_) => Vec::new(),
+                None => vec![format!(
+                    "you have no game pack for `{}`, so this cannot be imported yet. \
+                     Run `modifile init` to write the bundled ones.",
+                    plan.game
+                )],
+            },
+            trust: None,
+        })
+    }
+
+    /// Find modpacks, rather than mods.
+    ///
+    /// A separate entry point rather than a flag on `search`, because the two
+    /// answer different questions and returning them mixed is how someone ends
+    /// up installing a 300-mod pack believing it was one addon.
+    pub async fn search_modpacks(
+        &self,
+        pack: &CompiledPack,
+        query: &str,
+    ) -> Result<Vec<crate::source::SearchHit>> {
+        let rules = &pack.pack.search;
+        let mut hits = Vec::new();
+
+        if rules.modrinth {
+            hits.extend(
+                self.modrinth
+                    .search_type(
+                        query,
+                        &crate::source::modrinth::VersionFilter::default(),
+                        Some("modpack"),
+                    )
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        if let (Some(cf), Some(game_id), Some(class)) = (
+            &self.curseforge,
+            rules.curseforge_game_id,
+            rules.curseforge_modpack_class_id,
+        ) {
+            hits.extend(
+                cf.search(query, game_id, Some(class))
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        // Thunderstore marks packs with its own category, and this is the only
+        // one of the three that carries packs for games other than Minecraft.
+        if let Some(community) = &rules.thunderstore_community {
+            hits.extend(
+                self.thunderstore
+                    .search(community, query, Some(MODPACK_CATEGORY))
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+
+        if hits.is_empty()
+            && !rules.modrinth
+            && rules.curseforge_modpack_class_id.is_none()
+            && rules.thunderstore_community.is_none()
+        {
+            return Err(Error::other(format!(
+                "the {} pack does not say where to look for modpacks. Add `modrinth = true`, \
+                 `curseforge_modpack_class_id` or `thunderstore_community` to its [search] \
+                 section, or point `modifile pack add` straight at a file or link.",
+                pack.pack.game.name
+            )));
+        }
+        Ok(hits)
+    }
+
+    /// Read a modpack and write it out as a profile.
+    ///
+    /// A pack is a profile that somebody else assembled: a game version, a
+    /// loader, a pinned mod list and a tree of files for the game directory.
+    /// So this creates exactly that and stops. Nothing is downloaded beyond
+    /// the pack itself and whatever no index could account for — the mods are
+    /// fetched by the next `sync`, through the same resolve, verify and trust
+    /// path every other mod takes. A pack gets no shortcut past the trust
+    /// ladder just for arriving in bulk.
+    pub async fn import_modpack(
+        &self,
+        source: ModpackSource,
+        name: Option<&str>,
+        game: Option<&str>,
+        report: Option<Reporter>,
+    ) -> Result<ModpackReport> {
+        let report = report.unwrap_or_else(silent);
+        let (plan, staged, stored) = self.read_modpack(&source, game, &report).await?;
+        let (archive_sha, archive_size, archive_name) =
+            (staged.sha256.clone(), staged.size, staged.name.clone());
+
+        let pack = self.pack(&plan.game).ok_or_else(|| {
+            Error::NotFound(format!(
+                "a game pack for `{}` — this modpack is for a game you have no pack for. \
+                 Run `modifile init` to write the bundled ones.",
+                plan.game
+            ))
+        })?;
+
+        let mut out = ModpackReport {
+            pack: plan.label(),
+            format: plan.format_name.clone(),
+            game_version: plan.game_version.clone(),
+            loader: plan.loader.clone(),
+            loader_version: plan.loader_version.clone(),
+            ..Default::default()
+        };
+
+        report(Event::Pack {
+            stage: "Reading".to_string(),
+            detail: format!(
+                "{} — {} files, {} {}",
+                plan.label(),
+                plan.entries.len(),
+                plan.loader.clone().unwrap_or_else(|| "no loader".into()),
+                plan.game_version.clone().unwrap_or_default()
+            ),
+        });
+
+        // --- the profile it becomes -------------------------------------
+        let wanted = name.filter(|n| !n.trim().is_empty()).unwrap_or(&plan.name);
+        let chosen = self.free_name(pack.id(), wanted);
+        let profile_id = crate::profile::ProfileId::new(pack.id(), &chosen);
+
+        let mut profile = Profile::new(&chosen, pack.id());
+        profile.game_version = plan.game_version.clone();
+        profile.loader = plan.loader.clone();
+
+        // A loader this game pack has never heard of would fail much later,
+        // during a sync, with an error about the profile rather than the pack.
+        if let Some(loader) = &plan.loader {
+            if !pack.pack.versions.loaders.is_empty()
+                && !pack
+                    .pack
+                    .versions
+                    .loaders
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case(loader))
+            {
+                out.notes.push(format!(
+                    "the pack asks for the `{loader}` loader, which the {} pack does not \
+                     list. Known loaders: {}.",
+                    pack.pack.game.name,
+                    pack.pack.versions.loaders.join(", ")
+                ));
+            }
+        }
+        if let Some(v) = &plan.loader_version {
+            out.notes.push(format!(
+                "the pack was built against {} {v}. Modifile installs the newest stable \
+                 build of that loader rather than pinning this one.",
+                plan.loader.clone().unwrap_or_else(|| "the loader".into())
+            ));
+        }
+
+        let side_ids = |kind: crate::pack::TargetKind| -> Vec<String> {
+            pack.pack
+                .targets
+                .iter()
+                .filter(|t| t.kind == kind)
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        let client_ids = side_ids(crate::pack::TargetKind::Client);
+        let server_ids = side_ids(crate::pack::TargetKind::Server);
+
+        let mut lock = Lock {
+            profile: chosen.clone(),
+            generated_ms: crate::paths::now_millis(),
+            mods: Vec::new(),
+        };
+
+        // --- CurseForge entries -----------------------------------------
+        let cf_wanted: Vec<(u64, u64)> = plan
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::modpack::PackEntry::CurseForge { project, file, .. } => {
+                    Some((*project, *file))
+                }
+                _ => None,
+            })
+            .collect();
+
+        if !cf_wanted.is_empty() {
+            let cf = self.curseforge.as_ref().ok_or_else(curseforge_key_needed)?;
+            report(Event::Pack {
+                stage: "Resolving".to_string(),
+                detail: format!("{} CurseForge files", cf_wanted.len()),
+            });
+
+            // One batch instead of one request per mod. A 300-mod pack is
+            // otherwise 300 round trips before anything is downloaded.
+            let ids: Vec<u64> = cf_wanted.iter().map(|(_, f)| *f).collect();
+            let mut named: std::collections::BTreeMap<u64, String> = Default::default();
+            let mut sides: std::collections::BTreeMap<u64, (bool, bool)> = Default::default();
+            for wire in cf.files_by_id(&ids).await.unwrap_or_default() {
+                if !wire.display_name.is_empty() {
+                    named.insert(wire.id, wire.display_name.clone());
+                }
+                sides.insert(
+                    wire.id,
+                    crate::source::curseforge::declared_sides(&wire.game_versions),
+                );
+            }
+            let mut client_only = 0usize;
+            let mut server_only = 0usize;
+
+            for (project, file) in cf_wanted {
+                let mut entry = crate::profile::ModEntry::new(ModId::project(
+                    crate::source::SourceKind::CurseForge,
+                    project.to_string(),
+                ));
+                // The file id is what resolves it; the display name is what a
+                // person reads in the mod list.
+                entry.file = Some(file.to_string());
+                entry.pin = named.get(&file).cloned();
+
+                // Keep a client-only mod off a dedicated server. CurseForge's
+                // manifest has no side field, so this is the only signal there
+                // is — and it is only sometimes there, which is why silence
+                // means "both" rather than "client".
+                match sides.get(&file).copied().unwrap_or((true, true)) {
+                    (true, false) if !client_ids.is_empty() => {
+                        entry.targets = Some(client_ids.clone());
+                        client_only += 1;
+                    }
+                    (false, true) if !server_ids.is_empty() => {
+                        entry.targets = Some(server_ids.clone());
+                        server_only += 1;
+                    }
+                    _ => {}
+                }
+                profile.add(entry);
+                out.mods += 1;
+            }
+
+            if client_only > 0 {
+                out.notes.push(format!(
+                    "{client_only} mod(s) are marked client-only and will not be installed \
+                     on a dedicated server."
+                ));
+            }
+            if server_only > 0 {
+                out.notes.push(format!(
+                    "{server_only} mod(s) are marked server-only and will not be installed \
+                     on the client."
+                ));
+            }
+        }
+
+        // --- Thunderstore entries ----------------------------------------
+        // Each dependency already names its exact version, so there is nothing
+        // to look up: the pin resolves against Thunderstore's own
+        // single-version endpoint when the profile is synced.
+        let ts_wanted: Vec<(&String, &String, &String)> = plan
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::modpack::PackEntry::Thunderstore {
+                    namespace,
+                    name,
+                    version,
+                } => Some((namespace, name, version)),
+                _ => None,
+            })
+            .collect();
+
+        if !ts_wanted.is_empty() {
+            report(Event::Pack {
+                stage: "Resolving".to_string(),
+                detail: format!("{} Thunderstore packages", ts_wanted.len()),
+            });
+            for (namespace, name, version) in ts_wanted {
+                let mut entry = crate::profile::ModEntry::new(ModId {
+                    kind: crate::source::SourceKind::Thunderstore,
+                    owner: namespace.clone(),
+                    repo: name.clone(),
+                    host: None,
+                });
+                entry.pin = Some(version.clone());
+                profile.add(entry);
+                out.mods += 1;
+            }
+        }
+
+        // --- direct-download entries (.mrpack) ---------------------------
+        let downloads: Vec<&crate::modpack::PackEntry> = plan
+            .entries
+            .iter()
+            .filter(|e| matches!(e, crate::modpack::PackEntry::Download { .. }))
+            .collect();
+
+        if !downloads.is_empty() {
+            let hashes: Vec<String> = downloads
+                .iter()
+                .filter_map(|e| match e {
+                    crate::modpack::PackEntry::Download { sha512, .. } => sha512.clone(),
+                    _ => None,
+                })
+                .collect();
+
+            report(Event::Pack {
+                stage: "Resolving".to_string(),
+                detail: format!("matching {} files to their projects", hashes.len()),
+            });
+
+            // The index names URLs, not projects. This is what turns them back
+            // into real Modrinth mods that can be updated and audited, rather
+            // than a heap of anonymous jars.
+            let matched = self
+                .modrinth
+                .versions_by_hash(&hashes, "sha512")
+                .await
+                .unwrap_or_default();
+
+            for entry in downloads {
+                let crate::modpack::PackEntry::Download {
+                    path,
+                    urls,
+                    sha512,
+                    size,
+                    client,
+                    server,
+                    ..
+                } = entry
+                else {
+                    continue;
+                };
+
+                let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
+
+                // Which side of the game the pack says this belongs on.
+                let targets = match (client.wanted(), server.wanted()) {
+                    (false, false) => {
+                        out.skipped.push((
+                            file_name.clone(),
+                            "the pack marks it unsupported on both client and server"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    (true, true) => None,
+                    (true, false) => Some(client_ids.clone()),
+                    (false, true) => Some(server_ids.clone()),
+                };
+                if targets.as_ref().is_some_and(|t| t.is_empty()) {
+                    out.skipped.push((
+                        file_name.clone(),
+                        format!(
+                            "the pack restricts it to a side the {} pack has no target for",
+                            pack.pack.game.name
+                        ),
+                    ));
+                    continue;
+                }
+
+                match sha512.as_ref().and_then(|h| matched.get(h)) {
+                    Some(version) if !version.project_id.is_empty() => {
+                        let mut mod_entry = crate::profile::ModEntry::new(ModId::project(
+                            crate::source::SourceKind::Modrinth,
+                            version.project_id.clone(),
+                        ));
+                        mod_entry.pin = Some(version.version_number.clone())
+                            .filter(|v| !v.is_empty());
+                        mod_entry.targets = targets;
+                        profile.add(mod_entry);
+                        out.mods += 1;
+                    }
+                    // No index knows this file. It still has a URL and a hash,
+                    // so it can be fetched and held — it just cannot be checked
+                    // for updates, and the report says so.
+                    _ => {
+                        let Some(url) = urls.first() else {
+                            out.skipped.push((
+                                file_name.clone(),
+                                "the pack gives no download URL for it".to_string(),
+                            ));
+                            continue;
+                        };
+                        match self
+                            .import_url(url, &file_name, false, sha512.as_deref())
+                            .await
+                        {
+                            Ok((sha, actual_size)) => {
+                                let id = ModId::project(
+                                    crate::source::SourceKind::Local,
+                                    sanitize_name(
+                                        file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&file_name),
+                                    ),
+                                );
+                                let files = self.store.files(&sha)?;
+                                lock.mods.push(LockEntry {
+                                    id: id.clone(),
+                                    version: format!("from {}", plan.label()),
+                                    asset: file_name.clone(),
+                                    url: url.clone(),
+                                    sha256: sha,
+                                    size: if actual_size > 0 { actual_size } else { *size },
+                                    published_at: String::new(),
+                                    upstream: None,
+                                    trust: trust::assess(pack, &files, None, false),
+                                });
+                                let mut mod_entry = crate::profile::ModEntry::new(id);
+                                mod_entry.manual = true;
+                                mod_entry.targets = targets;
+                                profile.add(mod_entry);
+                                out.untraced += 1;
+                            }
+                            Err(e) => out.skipped.push((file_name.clone(), e.to_string())),
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- the pack's own files ----------------------------------------
+        // Added last on purpose: `deploy::plan` lets the later claim on a
+        // destination win, and a pack's overrides are meant to beat the
+        // defaults shipped inside its mods.
+        out.overrides = self.pack_own_files(&plan, &stored);
+
+        if out.overrides > 0 {
+            let trust = trust::assess(pack, &stored, None, false);
+            out.trust = Some(trust.clone());
+
+            let id = ModId::project(
+                crate::source::SourceKind::Local,
+                sanitize_name(&format!("{chosen}-pack-files")),
+            );
+            lock.mods.push(LockEntry {
+                id: id.clone(),
+                version: plan.label(),
+                asset: archive_name.clone(),
+                url: String::new(),
+                sha256: archive_sha.clone(),
+                size: archive_size,
+                published_at: String::new(),
+                upstream: None,
+                trust,
+            });
+            let mut mod_entry = crate::profile::ModEntry::new(id);
+            mod_entry.manual = true;
+            profile.add(mod_entry);
+        }
+
+        profile.save(&self.paths.profile_file(&profile_id))?;
+        lock.save(&self.paths.lock_file(&profile_id))?;
+
+        out.profile = chosen;
+        out.game = pack.id().to_string();
+        Ok(out)
     }
 
     /// The loader situation for every target this profile covers.
@@ -1570,7 +3237,9 @@ impl Engine {
                     .fetch(
                         &source,
                         &crate::source::modrinth::VersionFilter::default(),
-                        pack.pack.search.curseforge_game_id,
+                        pack,
+                        None,
+                        None,
                     )
                     .await?;
 
@@ -1621,16 +3290,38 @@ impl Engine {
                     .map(PathBuf::from)
                     .collect();
 
-                let dest = def.install_dir(root);
+                // An instanced profile gets its own loader, in its own folder.
+                // That is the whole mechanism: BepInEx works out where it
+                // lives from where its preloader was loaded from, so a loader
+                // inside the instance takes plugins and configs with it.
+                let instance = self.instance_for(pack, profile);
+                let dest = match &instance {
+                    Some(dir) => def.install_dir(dir),
+                    None => def.install_dir(root),
+                };
                 std::fs::create_dir_all(&dest).ok();
                 let written = crate::store::extract_over(&tmp, &dest, &preserve);
                 let _ = std::fs::remove_file(&tmp);
                 let written = written?;
 
+                // The injector is the exception and has to sit beside the
+                // executable — the game loads it on startup and will not look
+                // anywhere else. It does nothing unless Modifile launches the
+                // game with redirection switched on, so the install stays
+                // vanilla when started any other way.
+                let mut planted = 0;
+                if let (Some(dir), Some(rules)) = (&instance, pack.instancing()) {
+                    planted = plant_injector(pack, dir, root, rules)?;
+                }
+
                 Ok(format!(
-                    "{} for {} ({written} files)",
+                    "{} for {} ({written} files{})",
                     release.tag,
-                    platform.label()
+                    platform.label(),
+                    match planted {
+                        0 => String::new(),
+                        n => format!(", {n} into the game folder"),
+                    }
                 ))
             }
             crate::pack::LoaderKind::Installer => Err(Error::other(format!(
@@ -1667,7 +3358,21 @@ impl Engine {
         // CurseForge is where WoW addons actually are, so search it when the
         // user has a key — even though some results will not be installable.
         if let (Some(cf), Some(game_id)) = (&self.curseforge, rules.curseforge_game_id) {
-            hits.extend(cf.search(query, game_id).await.unwrap_or_default());
+            hits.extend(
+                cf.search(query, game_id, rules.curseforge_class_id)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        // Thunderstore is where the mods actually are for BepInEx games, and
+        // it needs no key.
+        if let Some(community) = &rules.thunderstore_community {
+            hits.extend(
+                self.thunderstore
+                    .search(community, query, None)
+                    .await
+                    .unwrap_or_default(),
+            );
         }
         if !rules.github_topics.is_empty() || !rules.github_terms.is_empty() {
             let mut found = self
@@ -1686,6 +3391,67 @@ impl Engine {
             hits.extend(found);
         }
         Ok(hits)
+    }
+
+    /// Everything a page about one mod or pack needs.
+    ///
+    /// Costs more than a search hit — a long description, a screenshot list —
+    /// so it is asked for only when someone opens the thing, never for a list.
+    pub async fn details(
+        &self,
+        pack: &CompiledPack,
+        id: &ModId,
+    ) -> Result<crate::source::Details> {
+        let rules = &pack.pack.search;
+        match id.kind {
+            crate::source::SourceKind::Modrinth => self.modrinth.details(id).await,
+            crate::source::SourceKind::Thunderstore => {
+                self.thunderstore
+                    .details(id, rules.thunderstore_community.as_deref())
+                    .await
+            }
+            crate::source::SourceKind::CurseForge => {
+                let cf = self.curseforge.as_ref().ok_or_else(curseforge_key_needed)?;
+                cf.details(
+                    id,
+                    rules.curseforge_game_id,
+                    rules.curseforge_modpack_class_id,
+                )
+                .await
+            }
+            // A git forge has no storefront page, so the repository *is* the
+            // description. That is less than the others give, and it is also
+            // the only one of them whose claims can be checked.
+            crate::source::SourceKind::GitHub
+            | crate::source::SourceKind::GitLab
+            | crate::source::SourceKind::Gitea => {
+                let info = match id.kind {
+                    crate::source::SourceKind::GitHub => self.github.repo(id).await?,
+                    _ => self.forge.repo(id).await?,
+                };
+                let info = info.unwrap_or_default();
+                Ok(crate::source::Details {
+                    id: Some(id.clone()),
+                    title: id.display(),
+                    summary: info.description,
+                    body: None,
+                    icon_url: None,
+                    gallery: Vec::new(),
+                    authors: vec![id.owner.clone()],
+                    downloads: info.stars,
+                    source_url: Some(id.web_url()),
+                    web_url: id.web_url(),
+                    license: info.license,
+                    is_pack: false,
+                })
+            }
+            crate::source::SourceKind::Local => Ok(crate::source::Details {
+                id: Some(id.clone()),
+                title: id.short().to_string(),
+                summary: "Supplied from a file on this machine.".to_string(),
+                ..Default::default()
+            }),
+        }
     }
 
     /// What is stored and who still wants it.
@@ -1709,19 +3475,43 @@ impl Engine {
     /// an unreadable file is not evidence of anything.
     pub fn gc(&self) -> Result<(usize, u64)> {
         let mut keep: HashSet<String> = HashSet::new();
-        for entry in std::fs::read_dir(&self.paths.profiles)
+        // Every lockfile, and they live one directory per game. Reading the
+        // top level alone finds none of them and concludes that the entire
+        // store is garbage — which it then deletes.
+        let mut found_any = false;
+        for game in std::fs::read_dir(&self.paths.profiles)
             .ctx(format!("reading {}", self.paths.profiles.display()))?
             .flatten()
         {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".lock.json"))
-                .unwrap_or(false)
-            {
-                keep.extend(Lock::load(&path)?.store_keys());
+            let dir = game.path();
+            if !dir.is_dir() {
+                continue;
             }
+            for entry in std::fs::read_dir(&dir)
+                .ctx(format!("reading {}", dir.display()))?
+                .flatten()
+            {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".lock.json"))
+                    .unwrap_or(false)
+                {
+                    keep.extend(Lock::load(&path)?.store_keys());
+                    found_any = true;
+                }
+            }
+        }
+
+        // A profile whose lock cannot be read is not evidence that nothing
+        // needs its downloads. Refuse rather than delete on an empty answer
+        // when there are plainly profiles present.
+        if !found_any && !self.all_profiles().is_empty() {
+            return Err(Error::other(
+                "no lockfiles could be read, but profiles exist — refusing to delete \
+                 downloads on that basis. Run an update first.",
+            ));
         }
         self.store.gc(&keep)
     }
@@ -1729,6 +3519,149 @@ impl Engine {
 
 /// A profile name becomes a filename, so it cannot contain path separators or
 /// anything Windows refuses.
+#[cfg(test)]
+mod modpack_source_tests {
+    use super::ModpackSource;
+
+    #[test]
+    fn recognises_a_modrinth_version_page() {
+        for input in [
+            "https://modrinth.com/modpack/fabulously-optimized/version/abcd1234",
+            "https://www.modrinth.com/modpack/fabulously-optimized/version/abcd1234",
+            "modrinth.com/modpack/fabulously-optimized/version/abcd1234/",
+            "https://modrinth.com/modpack/x/version/abcd1234?foo=1",
+        ] {
+            assert!(
+                matches!(ModpackSource::parse(input), ModpackSource::ModrinthVersion(id) if id == "abcd1234"),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_page_is_not_mistaken_for_a_version_id() {
+        // The slug is not a version id, and fetching it as one would 404.
+        match ModpackSource::parse("https://modrinth.com/modpack/fabulously-optimized") {
+            ModpackSource::ModrinthProject(slug) => {
+                assert_eq!(slug, "fabulously-optimized")
+            }
+            other => panic!("should be a project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognises_the_ids_that_search_prints() {
+        // `pack search` tells you to run `pack add <id>`, so the ids it prints
+        // have to be ones this accepts.
+        assert!(
+            matches!(ModpackSource::parse("modrinth:fabulously-optimized"),
+                ModpackSource::ModrinthProject(s) if s == "fabulously-optimized")
+        );
+        assert!(matches!(
+            ModpackSource::parse("curseforge:123456"),
+            ModpackSource::CurseForgeProject(123456)
+        ));
+        // A project page with no version means "the newest one".
+        assert!(matches!(
+            ModpackSource::parse("https://modrinth.com/modpack/fabulously-optimized"),
+            ModpackSource::ModrinthProject(_)
+        ));
+    }
+
+    #[test]
+    fn anything_else_is_a_path_or_a_url() {
+        assert!(matches!(
+            ModpackSource::parse("https://example.com/pack.mrpack"),
+            ModpackSource::Url(_)
+        ));
+        assert!(matches!(
+            ModpackSource::parse("  C:/Downloads/pack.mrpack  "),
+            ModpackSource::Path(_)
+        ));
+        assert!(matches!(
+            ModpackSource::parse("./pack.zip"),
+            ModpackSource::Path(_)
+        ));
+    }
+}
+
+/// The archive-relative directory prefixes holding a pack's own game files.
+fn override_prefixes(plan: &crate::modpack::PackPlan) -> Vec<String> {
+    plan.overrides
+        .iter()
+        .map(|o| format!("{}/", o.trim_end_matches('/').to_ascii_lowercase()))
+        .collect()
+}
+
+fn under_any(rel: &str, prefixes: &[String]) -> bool {
+    let lowered = rel.to_ascii_lowercase();
+    prefixes.iter().any(|p| lowered.starts_with(p.as_str()))
+}
+
+/// Move the injector out of an instance and into the real game folder.
+///
+/// The one thing an instanced profile cannot keep to itself. A doorstop shim
+/// is a DLL the game loads by name at startup, so it has to be beside the
+/// executable; everything it then loads comes from the instance.
+///
+/// It is inert on its own. Started from Steam or a shortcut, the game finds a
+/// doorstop that has not been told to do anything and runs vanilla.
+fn plant_injector(
+    pack: &CompiledPack,
+    instance: &Path,
+    game_root: &Path,
+    rules: &crate::pack::InstanceRules,
+) -> Result<usize> {
+    if rules.game_files.is_empty() {
+        return Ok(0);
+    }
+
+    let mut moved = 0;
+    let Ok(entries) = std::fs::read_dir(instance) else {
+        return Ok(0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        if !pack.belongs_in_game_dir(Path::new(name)) {
+            continue;
+        }
+        let dest = game_root.join(name);
+        // Already there and identical: leave it, so a second install does not
+        // churn a file the game may have open.
+        if std::fs::copy(&path, &dest).is_ok() {
+            let _ = std::fs::remove_file(&path);
+            moved += 1;
+        }
+    }
+    Ok(moved)
+}
+
+/// Create or delete a marker file, the way every opt-in here is stored.
+fn toggle_marker(path: &Path, on: bool, body: &[u8]) -> Result<()> {
+    if on {
+        crate::paths::write_atomic(path, body)
+    } else {
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+/// The one error message for "this needs a CurseForge key you supply yourself".
+fn curseforge_key_needed() -> Error {
+    Error::other(
+        "this modpack is built from CurseForge files, and fetching those needs an API key \
+         you obtain yourself — Overwolf issues them after a human review and forbids \
+         sharing one, so an open-source binary cannot ship a working key. Add yours in \
+         Settings, or with `modifile auth --curseforge <key>`. Modrinth `.mrpack` packs \
+         need no key at all."
+            .to_string(),
+    )
+}
+
 pub fn sanitize_name(name: &str) -> String {
     name.trim()
         .chars()
@@ -1863,26 +3796,291 @@ mod tests {
         paths
     }
 
+    fn id(game: &str, name: &str) -> crate::profile::ProfileId {
+        crate::profile::ProfileId::new(game, name)
+    }
+
     #[test]
     fn deleting_a_profile_takes_its_lock_and_settings_with_it() {
         let paths = scratch("delete");
         let engine = Engine::open(paths.clone(), None).expect("engine");
 
+        let raiding = id("wow", "raiding");
         let profile = Profile::new("raiding", "wow");
         profile
-            .save(&paths.profile_file("raiding"))
+            .save(&paths.profile_file(&raiding))
             .expect("save profile");
         Lock::default()
-            .save(&paths.lock_file("raiding"))
+            .save(&paths.lock_file(&raiding))
             .expect("save lock");
-        let state = paths.profiles.join("raiding.state");
+        let state = paths.profile_dir("wow").join("raiding.state");
         std::fs::create_dir_all(state.join("client")).expect("state dir");
 
-        engine.delete_profile("raiding").expect("delete");
+        engine.delete_profile(&raiding).expect("delete");
 
-        assert!(!paths.profile_file("raiding").exists());
-        assert!(!paths.lock_file("raiding").exists());
+        assert!(!paths.profile_file(&raiding).exists());
+        assert!(!paths.lock_file(&raiding).exists());
         assert!(!state.exists());
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    fn bundled(file: &str) -> CompiledPack {
+        let (_, body) = crate::BUNDLED_PACKS
+            .iter()
+            .find(|(n, _)| *n == file)
+            .unwrap_or_else(|| panic!("bundled pack {file}"));
+        CompiledPack::new(toml::from_str(body).expect("parses")).expect("compiles")
+    }
+
+    /// Activate installs into the game folder. Always.
+    ///
+    /// The regression this pins: a game that declares `[instance]` is saying
+    /// it *can* be redirected, which is Play's business. Deriving the deploy
+    /// base from that emptied `BepInEx/plugins` on every activate — the
+    /// manifest said the mods were installed, the game folder had none of
+    /// them, and a launch from Steam ran vanilla.
+    #[test]
+    fn activate_installs_into_the_game_folder_even_when_the_game_can_be_instanced() {
+        let paths = scratch("activate-base");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+        let pack = bundled("valheim.toml");
+        assert!(
+            pack.instancing().is_some(),
+            "valheim must declare [instance] or this test proves nothing"
+        );
+        let target = pack.target("client").expect("client target");
+
+        // One mod, one plugin file, in the store where a deploy would find it.
+        let sha = "a".repeat(64);
+        let staging = paths.home.join("staging");
+        std::fs::create_dir_all(&staging).expect("staging");
+        let jar = staging.join("ValheimPlus.dll");
+        std::fs::write(&jar, b"not really a dll").expect("write");
+        engine
+            .store
+            .insert(&sha, &jar, "ValheimPlus.dll", false)
+            .expect("store insert");
+
+        let id = ModId::project(crate::source::SourceKind::Local, "valheimplus");
+        let mut profile = Profile::new("main", "valheim");
+        profile.add(crate::profile::ModEntry::new(id.clone()));
+        let lock = Lock {
+            profile: "main".to_string(),
+            generated_ms: 0,
+            mods: vec![crate::profile::LockEntry {
+                id,
+                version: "1.0".to_string(),
+                asset: "ValheimPlus.dll".to_string(),
+                url: String::new(),
+                sha256: sha,
+                size: 16,
+                published_at: String::new(),
+                upstream: None,
+                trust: crate::trust::TrustReport {
+                    level: crate::TrustLevel::Unchecked,
+                    license: None,
+                    attested: false,
+                    readable_files: 0,
+                    data_files: 0,
+                    executable_files: 1,
+                    notes: Vec::new(),
+                },
+            }],
+        };
+
+        let root = paths.home.join("Valheim");
+        std::fs::create_dir_all(&root).expect("game dir");
+
+        let plan = engine
+            .plan(&pack, &profile, &lock, target, &root)
+            .expect("plan");
+        assert!(!plan.files.is_empty(), "the mod should have been placed");
+        for file in &plan.files {
+            assert_eq!(
+                file.base,
+                crate::deploy::Base::Game,
+                "{} went to the instance on a plain activate",
+                file.rel.display()
+            );
+        }
+
+        // Play is the one that redirects, and still does.
+        let instanced = engine
+            .plan_instanced(&pack, &profile, &lock, target, &root)
+            .expect("instanced plan");
+        assert!(
+            instanced
+                .files
+                .iter()
+                .any(|f| f.base == crate::deploy::Base::Instance),
+            "Play should still install into the profile's own tree"
+        );
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    fn minecraft_pack() -> CompiledPack {
+        let (_, body) = crate::BUNDLED_PACKS
+            .iter()
+            .find(|(n, _)| *n == "minecraft.toml")
+            .expect("bundled minecraft pack");
+        CompiledPack::new(toml::from_str(body).expect("parses")).expect("compiles")
+    }
+
+    /// The editor hands `config_path` a string that came from the UI, and the
+    /// result is written to. Everything that would climb out of the settings
+    /// folder has to be refused, not normalised.
+    #[test]
+    fn a_settings_path_cannot_leave_its_folder() {
+        let paths = scratch("config-escape");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+        let pack = minecraft_pack();
+        let target = pack.target("client").expect("client target");
+        let profile = id("minecraft", "main");
+
+        let refused = [
+            // Climbing out with `..`.
+            "config/../../../../evil.toml",
+            "config/..",
+            // Absolute, and a drive-qualified absolute.
+            "/etc/passwd",
+            r"C:\Windows\System32\drivers\etc\hosts",
+            // A folder that is not one this pack declares as state.
+            "mods/sodium.jar",
+            "../config/x.toml",
+            // Names a folder rather than a file.
+            "config",
+        ];
+        for rel in refused {
+            assert!(
+                engine
+                    .config_path(&pack, &profile, target, std::path::Path::new(rel))
+                    .is_err(),
+                "`{rel}` should have been refused"
+            );
+        }
+
+        // And the ordinary case still resolves, inside the profile's own dir.
+        let ok = engine
+            .config_path(
+                &pack,
+                &profile,
+                target,
+                std::path::Path::new("config/sodium-options.json"),
+            )
+            .expect("a plain settings path resolves");
+        assert!(ok.starts_with(&paths.profiles), "{}", ok.display());
+        assert!(ok.ends_with("config/sodium-options.json"), "{}", ok.display());
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    #[test]
+    fn editing_a_settings_file_round_trips() {
+        let paths = scratch("config-edit");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+        let pack = minecraft_pack();
+        let target = pack.target("client").expect("client target");
+        let profile = id("minecraft", "main");
+        let rel = std::path::Path::new("config/sodium-options.json");
+
+        engine
+            .write_config(&pack, &profile, target, rel, "{\"quality\":\"fast\"}", None)
+            .expect("write");
+        assert_eq!(
+            engine.read_config(&pack, &profile, target, rel).expect("read"),
+            "{\"quality\":\"fast\"}"
+        );
+
+        // It shows up as one of the profile's settings files, by the same
+        // display path the editor was given.
+        let saved = engine.saved_configs(&pack, &profile, target);
+        assert!(saved.contains(&rel.to_path_buf()), "{saved:?}");
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    /// A cache or a database in the config folder is not something to offer to
+    /// edit — saving a text box back over it would corrupt it.
+    #[test]
+    fn a_settings_file_that_is_not_text_is_refused() {
+        let paths = scratch("config-binary");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+        let pack = minecraft_pack();
+        let target = pack.target("client").expect("client target");
+        let profile = id("minecraft", "main");
+        let rel = std::path::Path::new("config/cache.bin");
+
+        let path = engine
+            .config_path(&pack, &profile, target, rel)
+            .expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("dir");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x80]).expect("write");
+
+        assert!(engine.read_config(&pack, &profile, target, rel).is_err());
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    /// The reason names are scoped to a game at all.
+    #[test]
+    fn two_games_can_both_have_a_profile_called_main() {
+        let paths = scratch("same-name");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+
+        let wow = id("wow", "main");
+        let valheim = id("valheim", "main");
+        Profile::new("main", "wow")
+            .save(&paths.profile_file(&wow))
+            .expect("save wow");
+        Profile::new("main", "valheim")
+            .save(&paths.profile_file(&valheim))
+            .expect("save valheim");
+
+        assert_ne!(paths.profile_file(&wow), paths.profile_file(&valheim));
+        assert!(paths.profile_file(&wow).exists());
+        assert!(paths.profile_file(&valheim).exists());
+
+        // And deleting one leaves the other entirely alone.
+        engine.delete_profile(&wow).expect("delete wow");
+        assert!(!paths.profile_file(&wow).exists());
+        assert!(
+            paths.profile_file(&valheim).exists(),
+            "the other game's `main` must survive"
+        );
+
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    #[test]
+    fn profiles_are_moved_out_of_the_old_flat_layout() {
+        // Existing installs keep their profiles, their locks and their saved
+        // settings when the layout changes under them.
+        let paths = scratch("migrate");
+
+        let flat = paths.profiles.join("raiding.toml");
+        Profile::new("raiding", "wow").save(&flat).expect("save");
+        Lock::default()
+            .save(&paths.profiles.join("raiding.lock.json"))
+            .expect("save lock");
+        std::fs::create_dir_all(paths.profiles.join("raiding.state").join("client"))
+            .expect("state");
+
+        let moved = crate::profile::migrate_flat_layout(&paths.profiles);
+        assert_eq!(moved, vec![id("wow", "raiding")]);
+
+        let raiding = id("wow", "raiding");
+        assert!(paths.profile_file(&raiding).exists(), "profile moved");
+        assert!(paths.lock_file(&raiding).exists(), "lock moved");
+        assert!(
+            paths
+                .profile_dir("wow")
+                .join("raiding.state")
+                .join("client")
+                .is_dir(),
+            "saved settings moved"
+        );
+        assert!(!flat.exists(), "the old copy is gone");
+
+        // Running it again finds nothing to do.
+        assert!(crate::profile::migrate_flat_layout(&paths.profiles).is_empty());
+
         std::fs::remove_dir_all(&paths.home).ok();
     }
 
@@ -1893,9 +4091,10 @@ mod tests {
         let paths = scratch("delete-active");
         let engine = Engine::open(paths.clone(), None).expect("engine");
 
+        let raiding = id("wow", "raiding");
         let profile = Profile::new("raiding", "wow");
         profile
-            .save(&paths.profile_file("raiding"))
+            .save(&paths.profile_file(&raiding))
             .expect("save profile");
 
         let manifest_path = paths.manifest_file("wow", "client");
@@ -1905,6 +4104,7 @@ mod tests {
             target: "client".into(),
             profile: "raiding".into(),
             root: paths.home.join("game"),
+            instance: None,
             mode: None,
             deployed_ms: 0,
             active: true,
@@ -1914,9 +4114,9 @@ mod tests {
         .save(&manifest_path)
         .expect("save manifest");
 
-        let err = engine.delete_profile("raiding").unwrap_err().to_string();
+        let err = engine.delete_profile(&raiding).unwrap_err().to_string();
         assert!(err.contains("Deactivate"), "{err}");
-        assert!(paths.profile_file("raiding").exists(), "profile survived");
+        assert!(paths.profile_file(&raiding).exists(), "profile survived");
         std::fs::remove_dir_all(&paths.home).ok();
     }
 }

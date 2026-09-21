@@ -45,6 +45,7 @@ kind = "client"
 flavor = "classic"
 markers = ["WowClassic.exe"]
 processes = ["WowClassic.exe"]
+launch = ["WowClassic.exe"]
 # Everything that is not vanilla.
 asset_reject = [
   "*-mainline*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",

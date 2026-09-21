@@ -92,6 +92,11 @@ struct WireSearchItem {
 #[derive(Debug, Deserialize)]
 struct WireOwner {
     login: String,
+    /// GitHub publishes no project icon, so the owner's avatar is the closest
+    /// thing to one — and it is at least recognisable, which a generated tile
+    /// is not.
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,8 +186,9 @@ impl GitHub {
                 .unwrap_or(WireSearch { items: Vec::new() });
 
             for item in wire.items {
+                let owner = item.owner;
                 let id = ModId::github(
-                    item.owner.map(|o| o.login).unwrap_or_default(),
+                    owner.as_ref().map(|o| o.login.clone()).unwrap_or_default(),
                     item.name,
                 );
                 if seen.iter().any(|h| h.id == id) {
@@ -199,6 +205,8 @@ impl GitHub {
                         .filter(|s| s != "NOASSERTION"),
                     source_url: Some(item.html_url),
                     installable: None,
+                    icon_url: owner.as_ref().and_then(|o| o.avatar_url.clone()),
+                    author: owner.map(|o| o.login),
                 });
             }
         }
@@ -213,8 +221,9 @@ impl GitHub {
             );
             if let Ok(Some(wire)) = self.http.get_json::<WireSearch>(&url).await {
                 for item in wire.items {
+                    let owner = item.owner;
                     let id = ModId::github(
-                        item.owner.map(|o| o.login).unwrap_or_default(),
+                        owner.as_ref().map(|o| o.login.clone()).unwrap_or_default(),
                         item.name,
                     );
                     if seen.iter().any(|h| h.id == id) {
@@ -231,6 +240,8 @@ impl GitHub {
                             .filter(|s| s != "NOASSERTION"),
                         source_url: Some(item.html_url),
                         installable: None,
+                        icon_url: owner.as_ref().and_then(|o| o.avatar_url.clone()),
+                        author: owner.map(|o| o.login),
                     });
                 }
             }

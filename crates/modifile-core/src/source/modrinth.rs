@@ -36,15 +36,36 @@ pub struct Modrinth {
 #[derive(Debug, Deserialize)]
 struct WireProject {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     description: String,
+    /// The long description, as Markdown.
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    gallery: Vec<WireGallery>,
+    #[serde(default)]
+    project_type: String,
     #[serde(default)]
     source_url: Option<String>,
     #[serde(default)]
     license: Option<WireLicense>,
     #[serde(default)]
     downloads: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGallery {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    featured: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +108,23 @@ struct WireFile {
 struct WireHashes {
     #[serde(default)]
     sha512: Option<String>,
+}
+
+/// A version identified by one of its files' hashes.
+///
+/// Only the fields a modpack import needs: which project owns the file, and
+/// what that version is called, so it can be pinned by name rather than by an
+/// opaque id.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HashedVersion {
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub version_number: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// Narrowing for games whose mods are version- and loader-specific.
@@ -142,6 +180,10 @@ struct WireSearch {
 struct WireHit {
     slug: String,
     #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     description: String,
@@ -162,11 +204,30 @@ impl Modrinth {
     /// most are published to both, and only Modrinth will tell you, without a
     /// key, where the source code is.
     pub async fn search(&self, query: &str, filter: &VersionFilter) -> Result<Vec<SearchHit>> {
+        self.search_type(query, filter, None).await
+    }
+
+    /// As `search`, narrowed to one kind of project — `mod`, `modpack`,
+    /// `shader`, `resourcepack`. Without it the index answers with all of
+    /// them, and a modpack listed among mods is an invitation to install a
+    /// zip full of other people's jars as though it were one addon.
+    pub async fn search_type(
+        &self,
+        query: &str,
+        filter: &VersionFilter,
+        project_type: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
         let mut facets: Vec<String> = Vec::new();
+        if let Some(t) = project_type {
+            facets.push(format!("[\"project_type:{t}\"]"));
+        }
         if let Some(v) = &filter.game_version {
             facets.push(format!("[\"versions:{v}\"]"));
         }
-        if let Some(l) = &filter.loader {
+        // A modpack is not published "for Fabric" the way a mod is — the pack
+        // *contains* its loader choice — so this facet would return nothing.
+        let searching_packs = project_type == Some("modpack");
+        if let Some(l) = filter.loader.as_ref().filter(|_| !searching_packs) {
             facets.push(format!("[\"categories:{}\"]", l.to_ascii_lowercase()));
         }
         let facet_param = if facets.is_empty() {
@@ -203,6 +264,8 @@ impl Modrinth {
                 license: hit.license,
                 source_url,
                 installable: Some(true),
+                icon_url: hit.icon_url.filter(|u| !u.is_empty()),
+                author: hit.author.filter(|a| !a.is_empty()),
             });
         }
         Ok(out)
@@ -210,6 +273,159 @@ impl Modrinth {
 
     pub fn http(&self) -> &Http {
         &self.http
+    }
+
+    /// Everything a page about one project needs, in one request.
+    ///
+    /// Modrinth is the well-behaved source here: icon, gallery, long
+    /// description and licence all come back together, so a detail page costs
+    /// exactly one call.
+    pub async fn details(&self, id: &ModId) -> Result<crate::source::Details> {
+        let url = format!("{API}/project/{}", urlencode(&id.repo));
+        let wire: WireProject = self
+            .http
+            .get_json(&url)
+            .await?
+            .ok_or_else(|| crate::error::Error::NotFound(format!("Modrinth project {id}")))?;
+
+        // Featured images first: that is the author saying which one to show.
+        let mut gallery: Vec<&WireGallery> = wire.gallery.iter().collect();
+        gallery.sort_by_key(|g| !g.featured);
+
+        let slug = if wire.slug.is_empty() { id.repo.clone() } else { wire.slug };
+        Ok(crate::source::Details {
+            id: Some(ModId::project(
+                crate::source::SourceKind::Modrinth,
+                if wire.id.is_empty() { slug.clone() } else { wire.id },
+            )),
+            title: wire.title,
+            summary: wire.description,
+            body: Some(crate::text::markdown_to_text(&wire.body))
+                .filter(|b| !b.trim().is_empty()),
+            icon_url: wire.icon_url.filter(|u| !u.is_empty()),
+            gallery: gallery
+                .into_iter()
+                .map(|g| g.url.clone())
+                .filter(|u| !u.is_empty())
+                .collect(),
+            // The search index carries an author; the project endpoint carries
+            // a team id, which is not a name. Left to the caller.
+            authors: Vec::new(),
+            downloads: wire.downloads,
+            source_url: wire.source_url.filter(|u| !u.is_empty()),
+            web_url: format!("https://modrinth.com/project/{slug}"),
+            license: wire.license.and_then(|l| l.id),
+            is_pack: wire.project_type == "modpack",
+        })
+    }
+
+    /// The downloadable file of one version, addressed by version id.
+    ///
+    /// Used to turn "install this modpack" into an archive: a `.mrpack` is the
+    /// primary file of an ordinary Modrinth version.
+    pub async fn version_primary_file(&self, version_id: &str) -> Result<Asset> {
+        let url = format!("{API}/version/{}", urlencode(version_id));
+        let wire: WireVersion = self
+            .http
+            .get_json(&url)
+            .await?
+            .ok_or_else(|| crate::error::Error::NotFound(format!("Modrinth version {version_id}")))?;
+
+        let file = wire
+            .files
+            .iter()
+            .find(|f| f.primary)
+            .or_else(|| wire.files.first())
+            .ok_or_else(|| {
+                crate::error::Error::NotFound(format!(
+                    "Modrinth version {version_id} publishes no files"
+                ))
+            })?;
+
+        Ok(Asset {
+            name: file.filename.clone(),
+            download_url: file.url.clone(),
+            size: file.size,
+            digest: None,
+            sha512: file.hashes.sha512.clone(),
+        })
+    }
+
+    /// The downloadable file of a project's newest version.
+    ///
+    /// What "install this modpack" means when someone names the pack rather
+    /// than one of its versions.
+    pub async fn newest_version_file(&self, slug: &str) -> Result<Asset> {
+        let url = format!("{API}/project/{}/version", urlencode(slug));
+        let versions: Vec<WireVersion> = self
+            .http
+            .get_json(&url)
+            .await?
+            .ok_or_else(|| crate::error::Error::NotFound(format!("Modrinth project {slug}")))?;
+
+        // A release beats a beta, but a project that has only ever published
+        // betas should still install rather than report nothing.
+        let chosen = versions
+            .iter()
+            .find(|v| v.version_type == "release")
+            .or_else(|| versions.first())
+            .ok_or_else(|| {
+                crate::error::Error::NotFound(format!("any published version of {slug}"))
+            })?;
+
+        let file = chosen
+            .files
+            .iter()
+            .find(|f| f.primary)
+            .or_else(|| chosen.files.first())
+            .ok_or_else(|| {
+                crate::error::Error::NotFound(format!("a file in the newest version of {slug}"))
+            })?;
+
+        Ok(Asset {
+            name: file.filename.clone(),
+            download_url: file.url.clone(),
+            size: file.size,
+            digest: None,
+            sha512: file.hashes.sha512.clone(),
+        })
+    }
+
+    /// Which project and version each of these file hashes belongs to.
+    ///
+    /// This is what makes `.mrpack` import honest. The index gives a path, a
+    /// URL and a hash but never says which project published the file — so
+    /// without this a pack would import as a heap of anonymous downloads, with
+    /// no update path and nothing for the trust ladder to look up. One POST
+    /// turns the whole list back into real Modrinth projects pinned to real
+    /// versions.
+    ///
+    /// Hashes that belong to no Modrinth project are simply absent from the
+    /// result, which is the answer for a jar the pack pulled from GitHub.
+    pub async fn versions_by_hash(
+        &self,
+        hashes: &[String],
+        algorithm: &str,
+    ) -> Result<std::collections::BTreeMap<String, HashedVersion>> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            hashes: &'a [String],
+            algorithm: &'a str,
+        }
+
+        let mut out = std::collections::BTreeMap::new();
+        // Chunked for the same reason the CurseForge batches are: a 300-file
+        // pack should not turn into one enormous request body.
+        for chunk in hashes.chunks(100) {
+            let url = format!("{API}/version_files");
+            let found: std::collections::BTreeMap<String, HashedVersion> = self
+                .http
+                .post_json_with(&url, &Body { hashes: chunk, algorithm }, &[])
+                .await?
+                .unwrap_or_default();
+            out.extend(found);
+        }
+        Ok(out)
     }
 
     /// Versions newest first, filtered to what this profile can actually run.

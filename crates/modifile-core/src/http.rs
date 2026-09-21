@@ -101,6 +101,18 @@ impl Http {
     }
 
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
+        // GitHub's headers go to GitHub and nowhere else. Two reasons, and
+        // both bit us:
+        //
+        //  - `Accept: application/vnd.github+json` is a GitHub media type.
+        //    Thunderstore's API answers a request carrying it with 406.
+        //  - The token is a *GitHub* credential. Sending it to a mod CDN
+        //    because the same client happened to be reused hands someone
+        //    else's server a secret it has no business seeing.
+        if !is_github(url) {
+            return self.client.get(url).header("Accept", "application/json");
+        }
+
         let mut req = self
             .client
             .get(url)
@@ -110,6 +122,62 @@ impl Http {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
         req
+    }
+
+    /// Send a request, waiting and trying again if the server says to.
+    ///
+    /// Not every index is as forgiving as GitHub. Thunderstore answers `429
+    /// Too Many Requests` well within the concurrency this resolves mods at,
+    /// and a modpack is the worst case: ninety pinned dependencies resolved at
+    /// once is exactly the shape that trips it. Without this, a pack imports
+    /// with eight or nine mods randomly missing and a different eight or nine
+    /// missing the next time — which reads as a broken pack rather than as
+    /// backpressure.
+    ///
+    /// `Retry-After` is honoured when the server sends it; otherwise the wait
+    /// doubles each attempt. Bounded, because a request that is never going to
+    /// succeed should fail while someone is still watching.
+    async fn send_with_backoff(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<reqwest::Response> {
+        const ATTEMPTS: u32 = 5;
+
+        let mut wait = std::time::Duration::from_millis(500);
+        for attempt in 1..=ATTEMPTS {
+            let Some(attempt_req) = req.try_clone() else {
+                // A streaming body cannot be replayed. Nothing here has one.
+                return req.send().await.ctx(format!("GET {url}"));
+            };
+
+            let resp = attempt_req.send().await.ctx(format!("GET {url}"))?;
+            let status = resp.status();
+            // 502 and 504 belong here too: a CDN in front of a busy origin
+            // returns them for a moment under exactly the load a modpack puts
+            // on it, and they are not a statement about the file.
+            let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                || status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::GATEWAY_TIMEOUT;
+
+            if !retryable || attempt == ATTEMPTS {
+                return Ok(resp);
+            }
+
+            // The server's own number wins over our guess.
+            let after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
+            let delay = after.unwrap_or(wait).min(std::time::Duration::from_secs(10));
+
+            tokio::time::sleep(delay).await;
+            wait *= 2;
+        }
+        unreachable!("the loop returns on its last attempt")
     }
 
     /// GET a JSON document, revalidating a cached copy when we have one.
@@ -141,7 +209,7 @@ impl Http {
             }
         }
 
-        let resp = req.send().await.ctx(format!("GET {url}"))?;
+        let resp = self.send_with_backoff(req, url).await?;
         self.record_limits(resp.headers());
         let status = resp.status();
 
@@ -188,6 +256,83 @@ impl Http {
         Ok(Some(value))
     }
 
+    /// POST a JSON body and read a JSON reply.
+    ///
+    /// Deliberately uncached: a POST has no etag to revalidate against, and the
+    /// only reason this exists is the batch endpoints. CurseForge will hand
+    /// back 300 file records for one request, and Modrinth will map 300 hashes
+    /// to their versions — the difference between importing a modpack in one
+    /// round trip and being rate-limited out of it.
+    pub async fn post_json_with<T: DeserializeOwned, B: serde::Serialize>(
+        &self,
+        url: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> Result<Option<T>> {
+        let mut req = self.client.post(url).json(body);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+
+        let resp = self.send_with_backoff(req, url).await?;
+        self.record_limits(resp.headers());
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            let limits = self.rate_limit();
+            if limits.remaining == 0 {
+                return Err(Error::RateLimited {
+                    remaining: limits.remaining,
+                    reset: format_epoch(limits.reset_epoch),
+                });
+            }
+        }
+        if !status.is_success() {
+            return Err(Error::other(format!("POST {url} returned {status}")));
+        }
+
+        let body = resp.text().await?;
+        serde_json::from_str::<T>(&body)
+            .map(Some)
+            .map_err(|e| Error::other(format!("POST {url}: unexpected response shape: {e}")))
+    }
+
+    /// Fetch a small file into memory.
+    ///
+    /// For artwork, which is a few tens of kilobytes and wanted as bytes rather
+    /// than as a file on a path. `Ok(None)` for a 404, because a project
+    /// whose icon has gone is normal and not worth an error.
+    ///
+    /// Capped, because this holds the whole body in memory and a URL from a
+    /// mod index is not something to trust about its own size.
+    pub async fn get_bytes(&self, url: &str) -> Result<Option<Vec<u8>>> {
+        const MAX: u64 = 16 * 1024 * 1024;
+
+        let req = self.client.get(url).header("Accept", "image/*");
+        let resp = self.send_with_backoff(req, url).await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(Error::other(format!("GET {url} returned {status}")));
+        }
+        if resp.content_length().is_some_and(|len| len > MAX) {
+            return Err(Error::other(format!("{url} is larger than expected")));
+        }
+
+        let bytes = resp.bytes().await?;
+        if bytes.len() as u64 > MAX {
+            return Err(Error::other(format!("{url} is larger than expected")));
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
     /// Stream a download to disk, hashing as it goes so we never hold a 200 MB
     /// modpack in memory and never hash the file a second time.
     pub async fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<(u64, String)> {
@@ -200,10 +345,18 @@ impl Http {
         }
 
         let mut req = self.client.get(url).header("Accept", "application/octet-stream");
-        if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+        // Same rule as `request`: the token is GitHub's. Every source's
+        // downloads used to go out through this one client, so a Modrinth or
+        // CurseForge CDN was handed the user's GitHub token with every mod.
+        if is_github(url) {
+            if let Some(token) = &self.token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
         }
-        let resp = req.send().await.ctx(format!("downloading {url}"))?;
+        // Downloads get the same backpressure handling as API calls: a CDN
+        // under load answers 502 or 429 for a moment, and a modpack pulling a
+        // hundred files will meet that at least once.
+        let resp = self.send_with_backoff(req, url).await?;
         self.record_limits(resp.headers());
         if !resp.status().is_success() {
             return Err(Error::other(format!(
@@ -227,8 +380,72 @@ impl Http {
     }
 }
 
+/// Is this URL GitHub's, and therefore entitled to a GitHub credential?
+///
+/// Host-matched rather than substring-matched, so that a URL merely *mentioning*
+/// github — `https://evil.test/?to=api.github.com` — is not treated as GitHub.
+fn is_github(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    // Authority ends at the first `/`, `?` or `#`; userinfo ends at `@`.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    // Strip any port.
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+
+    host == "github.com"
+        || host == "githubusercontent.com"
+        || host.ends_with(".github.com")
+        || host.ends_with(".githubusercontent.com")
+}
+
 fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_github;
+
+    #[test]
+    fn recognises_githubs_own_hosts() {
+        for url in [
+            "https://api.github.com/repos/a/b/releases",
+            "https://github.com/a/b/releases/download/v1/x.zip",
+            "https://objects.githubusercontent.com/some/signed/url",
+            "https://GITHUB.COM/a/b",
+            "https://api.github.com:443/repos/a/b",
+        ] {
+            assert!(is_github(url), "should be GitHub: {url}");
+        }
+    }
+
+    #[test]
+    fn never_hands_the_token_to_anyone_else() {
+        for url in [
+            "https://api.modrinth.com/v2/search",
+            "https://thunderstore.io/api/experimental/package/A/B/",
+            "https://api.curseforge.com/v1/mods/search",
+            "https://edge.forgecdn.net/files/1/2/mod.jar",
+            "https://cdn.modrinth.com/data/AAA/versions/x/mod.jar",
+            // Lookalikes: the host is what counts, not the spelling.
+            "https://evil.test/?redirect=https://api.github.com",
+            "https://github.com.evil.test/a/b",
+            "https://notgithub.com/a/b",
+            "https://user@evil.test/api.github.com",
+        ] {
+            assert!(!is_github(url), "must not be treated as GitHub: {url}");
+        }
+    }
 }
 
 fn format_epoch(epoch: u64) -> String {
