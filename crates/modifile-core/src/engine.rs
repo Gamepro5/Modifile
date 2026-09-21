@@ -1291,6 +1291,46 @@ impl Engine {
         Ok(to)
     }
 
+    /// Re-checksum everything this profile has in the store.
+    ///
+    /// Reads every stored byte, so it is an explicit action rather than
+    /// something that happens on the way to somewhere else.
+    pub fn store_health(&self, lock: &Lock) -> Vec<(ModId, crate::store::EntryHealth)> {
+        lock.mods
+            .iter()
+            .map(|entry| (entry.id.clone(), self.store.check(&entry.sha256)))
+            .collect()
+    }
+
+    /// Throw away stored copies whose bytes no longer match what was
+    /// downloaded, so the next sync fetches them again.
+    ///
+    /// This is the only cure for a store entry that a deployed hard link was
+    /// written through: the bytes are gone, and no amount of re-linking them
+    /// into the game folder brings the mod back.
+    pub fn discard_damaged(&self, lock: &Lock) -> Result<Vec<ModId>> {
+        let mut discarded = Vec::new();
+        for (id, health) in self.store_health(lock) {
+            if let crate::store::EntryHealth::Damaged { .. } = health {
+                if let Some(entry) = lock.get(&id) {
+                    self.store.discard(&entry.sha256)?;
+                    discarded.push(id);
+                }
+            }
+        }
+        Ok(discarded)
+    }
+
+    /// Remove this target's deployed files that have been changed since we
+    /// placed them, so the next activate restores them.
+    pub fn drop_tampered(&self, game: &str, target: &str) -> Result<(usize, Vec<PathBuf>)> {
+        let path = self.paths.manifest_file(game, target);
+        let Some(manifest) = Manifest::load(&path)? else {
+            return Ok((0, Vec::new()));
+        };
+        Ok(crate::deploy::drop_modified(&manifest))
+    }
+
     /// Delete a profile: its mod list, its lock, and the settings it was
     /// keeping for you.
     ///

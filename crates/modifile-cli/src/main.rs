@@ -206,6 +206,13 @@ enum Command {
     /// Check a deployment is still intact — this is how you find out a game
     /// patch clobbered your mods.
     Verify { profile: String },
+    /// Put changed or missing files back to what the lockfile says.
+    ///
+    /// Checksums every stored copy first, because a deployed file is a hard
+    /// link to the stored one: whatever damaged the game's copy in place
+    /// damaged the store's copy too. Anything failing its checksum is thrown
+    /// away and downloaded again.
+    Repair { profile: String },
     /// Inspect, reset, or import a profile's config files.
     Config {
         #[command(subcommand)]
@@ -436,6 +443,7 @@ fn run() -> Result<()> {
             },
         ),
         Command::Verify { profile } => cmd_verify(&engine, &profile),
+        Command::Repair { profile } => runtime.block_on(cmd_repair(&engine, &profile)),
         Command::Config { action } => cmd_config(&engine, action),
         Command::Packs { refresh } => cmd_packs(&paths, refresh),
         Command::Search { query, profile } => {
@@ -1413,11 +1421,80 @@ fn cmd_verify(engine: &Engine, name: &str) -> Result<()> {
         // Only say this when files *we placed* went wrong — a hand-installed
         // mod is not a game update clobbering anything.
         println!();
+        // Not `activate`: that deliberately leaves a changed file alone, so
+        // sending someone there was advice that quietly did nothing.
         println!(
             "Files Modifile installed have changed or gone. A game update is the usual cause; \
-             re-run `modifile activate {name}` to put them back."
+             `modifile repair {name}` checksums the stored copies, re-downloads anything \
+             damaged, and puts the recorded versions back."
         );
     }
+    Ok(())
+}
+
+/// Put a disturbed install back to exactly what the lockfile says.
+async fn cmd_repair(engine: &Engine, name: &str) -> Result<()> {
+    let profile = load_profile(engine, name)?;
+    let lock_path = engine.paths.lock_file(name);
+    let lock = Lock::load(&lock_path)?;
+
+    // The store first. A deployed file is a hard link to the stored one, so
+    // anything that wrote to it in place wrote through to the store, and
+    // re-linking a damaged entry would only reinstall the damage.
+    println!("Checking stored copies against their checksums...");
+    let mut unrecorded = 0;
+    for (id, health) in engine.store_health(&lock) {
+        match health {
+            modifile_core::store::EntryHealth::Good => {}
+            modifile_core::store::EntryHealth::Damaged { files } => {
+                println!("  DAMAGED  {id}: {} file(s) no longer match", files.len());
+                for rel in files.iter().take(5) {
+                    println!("           {rel}");
+                }
+            }
+            modifile_core::store::EntryHealth::Missing => {
+                println!("  missing  {id}: not in the store")
+            }
+            modifile_core::store::EntryHealth::Unrecorded => unrecorded += 1,
+        }
+    }
+    if unrecorded > 0 {
+        println!(
+            "  {unrecorded} entr(ies) predate checksums and cannot be checked. They get a \
+             record the next time they are downloaded."
+        );
+    }
+
+    let discarded = engine.discard_damaged(&lock)?;
+    if !discarded.is_empty() {
+        println!("Discarded {} damaged download(s).", discarded.len());
+    }
+
+    println!();
+    println!("Fetching anything missing...");
+    let pack = engine.pack_for(&profile)?;
+    let previous = Lock::load(&lock_path)?;
+    let (fresh, failures) = engine.sync(pack, &profile, &previous, None).await?;
+    fresh.save(&lock_path)?;
+    for issue in failures.iter().filter(|f| !f.waiting) {
+        eprintln!("  {}: {}", issue.id, issue.message);
+    }
+
+    println!();
+    let mut dropped = 0;
+    for (target, root) in engine.targets(pack, &profile) {
+        if root.is_none() {
+            continue;
+        }
+        let (count, failed) = engine.drop_tampered(&profile.game, &target.id)?;
+        dropped += count;
+        for rel in failed {
+            eprintln!("  could not replace {}", display(&rel));
+        }
+    }
+    println!("Cleared {dropped} changed file(s).");
+    println!();
+    println!("Next: modifile activate {name}");
     Ok(())
 }
 

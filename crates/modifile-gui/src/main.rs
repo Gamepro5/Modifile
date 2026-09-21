@@ -49,6 +49,9 @@ enum Msg {
     Found(Vec<modifile_core::source::SearchHit>),
     /// One mod's release list arrived, for the version picker.
     Versions(ModId, Vec<VersionOption>),
+    /// A repair finished its checksum, re-download and cleanup pass; what is
+    /// left is an ordinary install of the files that are now missing.
+    Repaired,
     /// Background work finished with nothing to report but its completion.
     /// Distinct from `Synced` so it does not wipe the update panel.
     Done,
@@ -576,6 +579,25 @@ impl App {
             });
         }
         self.profile = Some(profile);
+
+        // Look at the game folder without being asked. This used to wait for
+        // the Refresh button, which meant a profile whose files had been
+        // deleted or overwritten looked perfectly installed until someone
+        // thought to check. It is a stat of each file, no hashing, so it is
+        // cheap enough to do on every selection.
+        if self.is_active_selection() {
+            self.do_scan();
+        }
+    }
+
+    /// Is the profile we just loaded actually deployed anywhere? Scanning a
+    /// profile that was never activated would only ever report the game's own
+    /// files as foreign.
+    fn is_active_selection(&self) -> bool {
+        self.selected
+            .as_deref()
+            .map(|name| self.is_active(name))
+            .unwrap_or(false)
     }
 
     fn refresh(&mut self) {
@@ -878,11 +900,12 @@ impl App {
             self.show_loader_install = true;
         }
 
-        // Keep the folder panel honest: if the user was looking at a scan, show
-        // them the state after the change rather than a stale one.
+        // Keep the folder panel honest: show the state after the change rather
+        // than a stale one. `refresh` rescans an active profile by itself, so
+        // this only has to cover the case where it did not.
         let had_scan = !self.scans.is_empty();
         self.refresh();
-        if had_scan {
+        if had_scan && self.scans.is_empty() {
             self.do_scan();
         }
     }
@@ -1838,6 +1861,15 @@ impl eframe::App for App {
                     self.busy = false;
                     self.refresh();
                 }
+                Msg::Repaired => {
+                    self.busy = false;
+                    self.refresh();
+                    // Deliberately not forced: everything we mean to replace
+                    // has been deleted already, so anything still in the way
+                    // is a file we did not install and must not touch.
+                    self.do_deploy(false);
+                    self.do_scan();
+                }
                 Msg::Versions(id, versions) => {
                     // The window may have been closed, or moved to another
                     // mod, while the request was in flight.
@@ -1915,6 +1947,22 @@ impl App {
                     ui.label(
                         egui::RichText::new("universal mod manager").color(theme::MUTED),
                     );
+
+                    // These all act on the selected profile, so they belong to
+                    // the profile page. Sitting there greyed over Settings or
+                    // Games & folders, they only raise the question of which
+                    // profile they would have applied to.
+                    if self.view != View::Profile || self.profile.is_none() {
+                        if self.busy {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Spinner::new());
+                                },
+                            );
+                        }
+                        return;
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let ready = self.profile.is_some() && !self.busy;
@@ -2189,13 +2237,38 @@ impl App {
                         } else {
                             "Not active"
                         });
-                        if ui
+                        let row = ui
                             .selectable_label(selected, &entry.name)
-                            .on_hover_text(format!("{} mod(s)", entry.mods))
-                            .clicked()
-                        {
+                            .on_hover_text(format!("{} mod(s)", entry.mods));
+                        if row.clicked() {
                             self.select(&entry.name);
                         }
+                        // Right-click is where people look for "delete this
+                        // one", and it is the only place that names which
+                        // profile it means before you commit to anything.
+                        row.context_menu(|ui| {
+                            ui.label(
+                                egui::RichText::new(&entry.name).small().color(theme::MUTED),
+                            );
+                            ui.separator();
+                            if ui.button("Rename…").clicked() {
+                                self.select(&entry.name);
+                                self.open_rename();
+                                ui.close();
+                            }
+                            if ui
+                                .button(egui::RichText::new("Delete…").color(theme::BAD))
+                                .clicked()
+                            {
+                                // Select it first: the dialog reports whether
+                                // it is active and which game is running, and
+                                // both come from the selected profile.
+                                self.select(&entry.name);
+                                self.delete_input.clear();
+                                self.show_delete = true;
+                                ui.close();
+                            }
+                        });
                     });
                 }
 
@@ -2849,6 +2922,7 @@ impl App {
     /// line rather than a panel of zeroes.
     fn folder_section(&mut self, ui: &mut egui::Ui) {
         let mut rescan = false;
+        let mut repair = false;
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("GAME FOLDER").small().color(theme::MUTED));
@@ -2955,8 +3029,8 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{} file(s) we installed have changed since — edited by hand, or \
-                                 overwritten by a game update. Activate will not remove or \
-                                 replace them.",
+                                 overwritten by a game update. Activate leaves them alone, \
+                                 because it cannot tell a deliberate edit from damage.",
                                 scan.modified.len()
                             ))
                             .color(theme::WARN),
@@ -2974,11 +3048,34 @@ impl App {
                     if !scan.missing.is_empty() {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} installed file(s) have gone missing. Activate puts them back.",
+                                "{} installed file(s) have gone missing.",
                                 scan.missing.len()
                             ))
                             .color(theme::WARN),
                         );
+                    }
+
+                    // One button for "make it what it says it is", covering
+                    // both. Splitting restore across Activate and a force
+                    // toggle is what let a tampered install look installed.
+                    if !scan.modified.is_empty() || !scan.missing.is_empty() {
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(
+                                !self.busy,
+                                egui::Button::new("Put these files back")
+                                    .fill(theme::ACCENT_DIM),
+                            )
+                            .on_hover_text(
+                                "Checksums this profile's stored copies, re-downloads any that \
+                                 no longer match, and installs the recorded version of every \
+                                 changed or missing file. Files Modifile did not install are \
+                                 not touched.",
+                            )
+                            .clicked()
+                        {
+                            repair = true;
+                        }
                     }
                 });
             ui.add_space(4.0);
@@ -2987,9 +3084,102 @@ impl App {
         if rescan {
             self.do_scan();
         }
+        if repair {
+            let ctx = ui.ctx().clone();
+            self.do_repair(&ctx);
+        }
         if std::mem::take(&mut self.pending_force_deploy) {
             self.do_deploy(true);
         }
+    }
+
+    /// Put tampered and missing files back the way they were installed.
+    ///
+    /// Three things in order, because doing any one of them alone leaves a
+    /// case unfixed: checksum the stored copies, because a hard link written
+    /// through has damaged the store itself and re-linking it would reinstall
+    /// the damage; re-download whatever failed; then delete the changed files
+    /// so a normal activate can place the recorded version.
+    fn do_repair(&mut self, ctx: &egui::Context) {
+        let (Some(profile), Some(_)) = (self.profile.clone(), self.engine()) else {
+            return;
+        };
+        let lock = self.lock.clone();
+        let paths = self.paths.clone();
+        let tx = self.tx.clone();
+        let log = self.log.clone();
+        let ctx_clone = ctx.clone();
+        let game = profile.game.clone();
+        let targets: Vec<String> = self.targets.iter().map(|t| t.target.id.clone()).collect();
+        self.busy = true;
+        self.log_line("Checking the stored copies against their checksums…");
+
+        let handle = self.runtime.handle().clone();
+        std::thread::spawn(move || {
+            let push = move |line: String| {
+                if let Ok(mut log) = log.lock() {
+                    log.push(line);
+                }
+                ctx_clone.request_repaint();
+            };
+
+            let result = handle.block_on(async {
+                let engine = Engine::open(paths.clone(), load_token(&paths))?;
+
+                for (id, health) in engine.store_health(&lock) {
+                    match health {
+                        modifile_core::store::EntryHealth::Damaged { files } => push(format!(
+                            "{id}: stored copy is damaged ({} file(s)) — will re-download",
+                            files.len()
+                        )),
+                        modifile_core::store::EntryHealth::Missing => {
+                            push(format!("{id}: not in the store — will download"))
+                        }
+                        modifile_core::store::EntryHealth::Unrecorded => push(format!(
+                            "{id}: stored before checksums were kept, so it cannot be checked"
+                        )),
+                        modifile_core::store::EntryHealth::Good => {}
+                    }
+                }
+
+                let discarded = engine.discard_damaged(&lock)?;
+                if !discarded.is_empty() {
+                    push(format!(
+                        "Discarded {} damaged download(s); fetching them again…",
+                        discarded.len()
+                    ));
+                }
+
+                // Re-fetch whatever is now absent, damaged entries included.
+                let pack = engine.pack_for(&profile)?;
+                let lock_path = paths.lock_file(&profile.name);
+                let previous = modifile_core::Lock::load(&lock_path)?;
+                let (fresh, _) = engine.sync(pack, &profile, &previous, None).await?;
+                fresh.save(&lock_path)?;
+
+                let mut dropped = 0;
+                for target in &targets {
+                    let (count, failed) = engine.drop_tampered(&game, target)?;
+                    dropped += count;
+                    for rel in failed {
+                        push(format!("could not replace {}", rel.display()));
+                    }
+                }
+                Ok::<_, modifile_core::Error>(dropped)
+            });
+
+            match result {
+                Ok(dropped) => {
+                    push(format!(
+                        "{dropped} changed file(s) cleared. Installing the recorded versions…"
+                    ));
+                    let _ = tx.send(Msg::Repaired);
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e.to_string()));
+                }
+            }
+        });
     }
 
     /// Re-read every target's game folder.

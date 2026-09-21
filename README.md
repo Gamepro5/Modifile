@@ -99,6 +99,7 @@ token you get 5000/hour and revalidations become free.
 | `modifile import <file>` | create a profile from one someone sent you |
 | `modifile root <profile> <target> <path>` | point a target at a directory autodetection missed |
 | `modifile verify <profile>` | check the deployment is intact — finds files a game patch clobbered |
+| `modifile repair <profile>` | checksum the stored copies and put changed or missing files back |
 | `modifile undeploy <game> <target>` | remove everything, leaving a clean game directory |
 | `modifile storage` | what is downloaded and which profiles still want it |
 | `modifile storage --clean` | delete downloads nothing references |
@@ -333,6 +334,31 @@ A foreign file that sits exactly where one of your profile's mods goes is marked
 file — so the mod silently would not install. Either delete the old file, or use
 **Replace them and activate** / `modifile activate <profile> --force` to let
 Modifile take it over.
+
+The GUI runs this check whenever you open an active profile, not only when you
+press **Refresh**. A profile whose files a game patch ate should not look
+perfectly installed until someone thinks to ask.
+
+### Putting a damaged install back
+
+**Put these files back**, or `modifile repair <profile>`, restores every changed
+or missing file to the version in the lockfile. Foreign files are never touched.
+
+It checksums the store first, and that order matters. A deployed file is a hard
+link to the stored one — the same bytes under two names — so a tool that writes
+to the game's copy in place has written through into the store as well. Linking
+that entry back into the game folder would only reinstall the damage. Anything
+that fails its checksum is deleted and downloaded again; everything else is
+restored from the copy you already have, with no download at all.
+
+Store files are kept read-only for the same reason, so the common version of
+this — something overwriting a mod file in place — fails at the write instead of
+quietly corrupting the only good copy. Config files are exempt: they are seeded
+as real copies and belong to the profile, because the game is supposed to
+rewrite them.
+
+Entries downloaded before checksums existed report as *unrecorded* rather than
+damaged, and get a record the next time they are fetched.
 
 ## Mod loaders
 
@@ -569,5 +595,5 @@ crates/modifile-gui/   egui desktop app (no webview, no Electron)
 packs/                 bundled game packs
 ```
 
-`cargo test` runs 92 tests, including ones that exercise the bundled packs
+`cargo test` runs 97 tests, including ones that exercise the bundled packs
 directly — flavor selection, client/server routing, and zip-slip rejection.

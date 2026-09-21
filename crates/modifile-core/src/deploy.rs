@@ -324,6 +324,37 @@ fn link_file(mode: LinkMode, src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Give a file write permission back.
+///
+/// Store files are read-only so that a tool writing to a deployed hard link
+/// fails instead of silently rewriting the store. Two places have to undo
+/// that: a seeded config, which the game is supposed to own and rewrite, and
+/// any deployed file we are about to delete — Windows will not unlink a
+/// read-only file, and a hard link carries the attribute of the inode it
+/// shares.
+fn make_writable(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.is_symlink() {
+            return;
+        }
+        if meta.permissions().readonly() {
+            crate::store::set_readonly(path, false);
+        }
+    }
+}
+
+/// Delete a deployed file, clearing the read-only bit first if it has one.
+fn remove_deployed(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_writable(path);
+            std::fs::remove_file(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn mtime_ms(path: &Path) -> u64 {
     std::fs::symlink_metadata(path)
         .and_then(|m| m.modified())
@@ -404,6 +435,10 @@ pub fn apply(
                         .skipped
                         .push((planned.rel.clone(), format!("could not seed default: {e}")));
                 } else {
+                    // The store copy is read-only and `copy` brings that with
+                    // it. This file belongs to the profile now and the game
+                    // has to be able to write it.
+                    make_writable(&dst);
                     report.seeded += 1;
                 }
             }
@@ -418,7 +453,7 @@ pub fn apply(
                 ));
                 continue;
             }
-            std::fs::remove_file(&dst).ctx(format!("replacing {}", dst.display()))?;
+            remove_deployed(&dst).ctx(format!("replacing {}", dst.display()))?;
         }
 
         if let Err(e) = link_file(mode, &planned.src, &dst) {
@@ -479,7 +514,7 @@ pub fn revert(manifest: &Manifest, report: &mut DeployReport, force: bool) -> Re
             ));
             continue;
         }
-        match std::fs::remove_file(&path) {
+        match remove_deployed(&path) {
             Ok(()) => removed += 1,
             Err(e) => report
                 .skipped
@@ -493,6 +528,32 @@ pub fn revert(manifest: &Manifest, report: &mut DeployReport, force: bool) -> Re
     }
 
     Ok(removed)
+}
+
+/// Delete the files we placed that have since been changed, so that the next
+/// apply puts the recorded version back.
+///
+/// Deliberately separate from `apply`, which leaves a changed file alone on
+/// purpose — it may be a build someone dropped in by hand. This is the
+/// explicit "no, I want what was installed" path, and it only ever touches
+/// paths the manifest already claims.
+pub fn drop_modified(manifest: &Manifest) -> (usize, Vec<PathBuf>) {
+    let mut dropped = 0;
+    let mut failed = Vec::new();
+    for record in &manifest.files {
+        let path = manifest.root.join(&record.rel);
+        if !path.exists() {
+            continue;
+        }
+        if still_ours(&path, record) {
+            continue;
+        }
+        match remove_deployed(&path) {
+            Ok(()) => dropped += 1,
+            Err(_) => failed.push(record.rel.clone()),
+        }
+    }
+    (dropped, failed)
 }
 
 // ---------------------------------------------------------------------------
