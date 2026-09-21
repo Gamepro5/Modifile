@@ -4,13 +4,31 @@
 //! running window's icon is a separate thing that the program sets for itself
 //! at startup — see `icon()` in `main.rs` — and both are needed: neither one
 //! covers the other's case.
+//!
+//! Two different notions of "windows" are in play here, and conflating them is
+//! what broke the Linux build:
+//!
+//! * `winresource` is a build-dependency declared under `cfg(windows)`. For
+//!   build-dependencies Cargo resolves that against the **host**, so on a
+//!   Linux runner the crate is simply absent. A `if target_os == "windows"`
+//!   check does not help — that runs after this file has already been
+//!   compiled, and compiling it needs the crate to exist. Hence `#[cfg]` on
+//!   the function itself, which is evaluated for the host and so agrees with
+//!   the manifest.
+//! * `CARGO_CFG_TARGET_OS` is the **target**, and is checked below so that
+//!   cross-compiling from Windows to Linux does not hand a Windows resource
+//!   to a Linux linker.
+//!
+//! Release builds both artifacts natively — Windows on a Windows runner, Linux
+//! on a Linux one — so nothing is lost by keying the icon to the host.
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/modifile.ico");
+    embed_icon();
+}
 
-    // The *target's* OS, not the host's. A build script runs on the host, so
-    // `cfg!(windows)` here would answer the wrong question when cross
-    // compiling.
+#[cfg(windows)]
+fn embed_icon() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -25,3 +43,8 @@ fn main() {
         println!("cargo:warning=could not embed the application icon: {error}");
     }
 }
+
+/// Nothing to do: an ELF binary has no resource table, and the window icon is
+/// set at runtime from the bundled PNG.
+#[cfg(not(windows))]
+fn embed_icon() {}
