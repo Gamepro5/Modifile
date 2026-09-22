@@ -192,10 +192,10 @@ enum Command {
     /// Write a profile to a file you can send to a friend.
     Export {
         profile: String,
-        /// Defaults to <profile>.modifile.json in the current directory.
+        /// Defaults to <profile>.mfpack in the current directory.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Leave your config files out of the bundle.
+        /// Leave your config files out of the pack.
         #[arg(long)]
         no_configs: bool,
         /// A line describing the setup, shown on import.
@@ -642,10 +642,10 @@ fn cmd_export(
 ) -> Result<()> {
     let profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
-    let bundle = engine.export_profile(pack, &profile, include_configs, note)?;
 
-    let path = out.unwrap_or_else(|| PathBuf::from(format!("{name}.modifile.json")));
-    bundle.save(&path)?;
+    let path = out
+        .unwrap_or_else(|| PathBuf::from(format!("{name}.{}", modifile_core::mfpack::EXTENSION)));
+    let bundle = engine.export_mfpack(pack, &profile, include_configs, note, &path)?;
 
     println!(
         "Wrote {} — {} mod(s), {} config file(s).",
@@ -653,6 +653,27 @@ fn cmd_export(
         bundle.mod_count(),
         bundle.config_count()
     );
+
+    // A bundle carries the configs the *profile* owns, and it owns them from
+    // the moment it is activated. Someone who tuned their mods in the game
+    // folder and never activated would otherwise get a settings-less file
+    // without being told why.
+    if include_configs && bundle.config_count() == 0 {
+        let live: usize = engine
+            .targets(pack, &profile)
+            .iter()
+            .filter_map(|(target, root)| Some((target, root.as_ref()?)))
+            .flat_map(|(target, root)| pack.state_dirs(target, root))
+            .map(|(_, dir)| modifile_core::state::list_files(&dir).len())
+            .sum();
+        if live > 0 {
+            println!(
+                "  None were included: {live} settings file(s) are in the game folder but \
+                 do not belong to `{name}` yet. Run `modifile config import {name} \
+                 --from-game` (or activate the profile) and export again."
+            );
+        }
+    }
     println!("Send that file to anyone; they run `modifile import <file>`.");
     Ok(())
 }
@@ -1023,7 +1044,8 @@ fn cmd_import(
     name: Option<&str>,
     pin_versions: bool,
 ) -> Result<()> {
-    let bundle = modifile_core::share::Bundle::load(file)?;
+    // Either format: a `.mfpack` or one of the older JSON bundles.
+    let bundle = engine.read_shared(file)?;
     let game = engine
         .pack(&bundle.game)
         .map(|p| p.pack.game.name.clone())

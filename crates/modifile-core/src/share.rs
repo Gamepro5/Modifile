@@ -1,14 +1,19 @@
-//! Shareable profiles.
+//! What a shared setup consists of.
 //!
-//! A bundle is one JSON file you can put in Discord. It holds the mod list, the
-//! exact versions you are running, and (optionally) your tuned config files.
+//! A [`Bundle`] is the mod list, the exact versions, the loader and game
+//! version, and (optionally) the tuned config files. It is the *contents* of a
+//! shared pack; [`crate::mfpack`] is the file those contents travel in.
 //!
-//! What it deliberately does **not** hold is the mods themselves, or their
-//! hashes presented as trustworthy. Your friend's copy resolves every mod from
-//! GitHub on their own machine, verifies the download against GitHub's own
-//! published digest, and runs the trust ladder locally. So a bundle from a
-//! stranger can waste your time, but it cannot hand you a binary that nobody
-//! else can see.
+//! The two are separate because the contents outlived a format once already.
+//! Bundles used to be written as a single JSON document, which this build no
+//! longer reads or writes — see `mfpack` for why a zip replaced it.
+//!
+//! What a bundle deliberately does **not** hold is the mods themselves, or
+//! their hashes presented as trustworthy. Your friend's copy resolves every
+//! mod from its own source on their machine, verifies the download against
+//! that source's published digest, and runs the trust ladder locally. So a
+//! pack from a stranger can waste your time, but it cannot hand you a binary
+//! that nobody else can see.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,18 +25,29 @@ use crate::paths::write_atomic;
 use crate::profile::{Lock, ModEntry, Profile};
 use crate::source::ModId;
 
-pub const BUNDLE_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
-    /// Format version, so a future field cannot silently corrupt an old reader.
-    pub modifile_profile: u32,
+    /// Format version, so a future field cannot silently corrupt an old
+    /// reader. Named for the format it appears in: this is what sits at the
+    /// top of a `.mfpack`'s index.
+    pub mfpack: u32,
     pub name: String,
     pub game: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub targets: Vec<String>,
+    /// What the mods were built against. Minecraft mods are published per game
+    /// version and per loader, so a pack that does not carry these resolves to
+    /// whatever happens to be newest and hands the importer a set of mods that
+    /// will not load together.
+    ///
+    /// `serde(default)` because bundles written before this existed have
+    /// neither, and must still open.
+    #[serde(default)]
+    pub game_version: Option<String>,
+    #[serde(default)]
+    pub loader: Option<String>,
     pub mods: Vec<BundleMod>,
     /// target id -> relative path -> file contents.
     #[serde(default)]
@@ -85,7 +101,18 @@ impl ConfigFile {
         })
     }
 
-    fn bytes(&self) -> Result<Vec<u8>> {
+    /// Classify bytes that came from somewhere other than a file on disk —
+    /// an entry inside a `.mfpack`, for instance.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        match String::from_utf8(bytes) {
+            Ok(text) => ConfigFile::Text { text },
+            Err(e) => ConfigFile::Binary {
+                base64: base64_encode(e.as_bytes()),
+            },
+        }
+    }
+
+    pub fn bytes(&self) -> Result<Vec<u8>> {
         Ok(match self {
             ConfigFile::Text { text } => text.as_bytes().to_vec(),
             ConfigFile::Binary { base64 } => base64_decode(base64)?,
@@ -161,11 +188,13 @@ impl Bundle {
         description: String,
     ) -> Self {
         Self {
-            modifile_profile: BUNDLE_VERSION,
+            mfpack: crate::mfpack::MFPACK_VERSION,
             name: profile.name.clone(),
             game: profile.game.clone(),
             description,
             targets: profile.targets.clone(),
+            game_version: profile.game_version.clone(),
+            loader: profile.loader.clone(),
             mods: profile
                 .mods
                 .iter()
@@ -187,23 +216,6 @@ impl Bundle {
         }
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read(path).ctx(format!("reading {}", path.display()))?;
-        let bundle: Bundle = serde_json::from_slice(&raw)
-            .map_err(|e| Error::other(format!("{} is not a Modifile profile: {e}", path.display())))?;
-        if bundle.modifile_profile > BUNDLE_VERSION {
-            return Err(Error::other(format!(
-                "this profile was made by a newer Modifile (format {}, this build understands {BUNDLE_VERSION})",
-                bundle.modifile_profile
-            )));
-        }
-        Ok(bundle)
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &serde_json::to_vec_pretty(self)?)
-    }
-
     /// Turn a bundle back into a profile.
     ///
     /// `pin_versions` keeps the exporter's exact releases — the usual choice,
@@ -211,6 +223,11 @@ impl Bundle {
     pub fn to_profile(&self, name: &str, pin_versions: bool) -> Profile {
         let mut profile = Profile::new(name, &self.game);
         profile.targets = self.targets.clone();
+        // Carried through rather than left to resolve: these decide which
+        // build of each mod is correct, and guessing produces a profile whose
+        // mods refuse to load together.
+        profile.game_version = self.game_version.clone();
+        profile.loader = self.loader.clone();
         profile.mods = self
             .mods
             .iter()
@@ -267,7 +284,7 @@ impl Bundle {
 
 /// A bundle is a file from someone else, so its paths get the same treatment
 /// as an archive's: no absolute paths, no `..`, no drive letters.
-fn safe_relative(name: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn safe_relative(name: &str) -> Option<std::path::PathBuf> {
     let normalized = name.replace('\\', "/");
     let mut out = std::path::PathBuf::new();
     for component in normalized.split('/') {
@@ -308,14 +325,86 @@ mod tests {
         assert!(safe_relative("config/valheim_plus.cfg").is_some());
     }
 
+    /// The point of carrying configs at all: a tuned profile has to arrive
+    /// tuned. Text stays text so a bundle is still readable and diffable, and
+    /// a config that is not valid UTF-8 survives rather than being mangled
+    /// into replacement characters.
+    #[test]
+    fn configs_survive_a_round_trip() {
+        let dir = std::env::temp_dir().join(format!("modifile-share-{}", crate::paths::now_millis()));
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("scratch");
+
+        let text = state.join("valheim_plus.cfg");
+        std::fs::write(&text, "[Server]\nenabled = true\n").expect("write text");
+        let binary = state.join("cache.dat");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x80]).expect("write binary");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "config/valheim_plus.cfg".to_string(),
+            ConfigFile::read(&text).expect("read text"),
+        );
+        files.insert(
+            "config/cache.dat".to_string(),
+            ConfigFile::read(&binary).expect("read binary"),
+        );
+        assert!(matches!(
+            files["config/valheim_plus.cfg"],
+            ConfigFile::Text { .. }
+        ));
+        assert!(matches!(
+            files["config/cache.dat"],
+            ConfigFile::Binary { .. }
+        ));
+
+        let mut configs = BTreeMap::new();
+        configs.insert("client".to_string(), files);
+        let bundle = Bundle {
+            mfpack: crate::mfpack::MFPACK_VERSION,
+            name: "raiding".into(),
+            game: "valheim".into(),
+            description: String::new(),
+            targets: vec!["client".into()],
+            game_version: None,
+            loader: None,
+            mods: Vec::new(),
+            configs,
+            exported_by: String::new(),
+        };
+        assert_eq!(bundle.config_count(), 2);
+
+        // Through the file, as it would actually travel.
+        let path = dir.join("raiding.mfpack");
+        crate::mfpack::write(&path, &bundle).expect("write pack");
+        let reopened = crate::mfpack::read(&path).expect("read pack");
+
+        let profiles = dir.join("profiles");
+        let id = crate::profile::ProfileId::new("valheim", "theirs");
+        assert_eq!(reopened.write_configs(&profiles, &id).expect("write"), 2);
+
+        let landed = crate::state::profile_state_dir(&profiles, &id, "client");
+        assert_eq!(
+            std::fs::read_to_string(landed.join("config/valheim_plus.cfg")).expect("text back"),
+            "[Server]\nenabled = true\n"
+        );
+        assert_eq!(
+            std::fs::read(landed.join("config/cache.dat")).expect("binary back"),
+            vec![0xff, 0xfe, 0x00, 0x80]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn importing_pins_the_exporters_versions() {
         let bundle = Bundle {
-            modifile_profile: 1,
+            mfpack: crate::mfpack::MFPACK_VERSION,
             name: "raiding".into(),
             game: "valheim".into(),
             description: String::new(),
             targets: vec!["server".into()],
+            game_version: Some("0.217.46".into()),
+            loader: None,
             mods: vec![BundleMod {
                 id: ModId::github("Grantapher", "ValheimPlus"),
                 enabled: true,
@@ -337,19 +426,4 @@ mod tests {
         assert!(latest.mods[0].pin.is_none());
     }
 
-    #[test]
-    fn a_newer_format_is_refused_rather_than_misread() {
-        let dir = std::env::temp_dir().join(format!("modifile-bundle-{}", crate::paths::now_millis()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("future.json");
-        std::fs::write(
-            &path,
-            br#"{"modifile_profile":99,"name":"x","game":"valheim","mods":[]}"#,
-        )
-        .unwrap();
-
-        let err = Bundle::load(&path).unwrap_err().to_string();
-        assert!(err.contains("newer Modifile"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

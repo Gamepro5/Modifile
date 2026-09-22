@@ -819,7 +819,10 @@ impl App {
                 self.new_profile_game = game.to_string();
                 self.open_new_profile();
             }
-            ui.menu_button("Import a modpack…", |ui| {
+            // Named for whose format it reads. The other menu also imports
+            // modpacks — Modifile's own — so "a modpack" alone does not tell
+            // anyone which of the two they want.
+            ui.menu_button("From CurseForge, Modrinth or Thunderstore…", |ui| {
                 ui.label(
                     egui::RichText::new(
                         "A modpack becomes a profile: its mod list, its game version \
@@ -840,7 +843,16 @@ impl App {
                     ui.close();
                 }
             });
-            ui.menu_button("Import a shared profile…", |ui| {
+            ui.menu_button("Open a .mfpack…", |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Modifile's own pack, and the profiles people shared before \
+                         it existed.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.separator();
                 if ui
                     .button("Exactly as they had it")
                     .on_hover_text("Holds every mod at the version the sender was running.")

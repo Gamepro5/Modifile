@@ -1755,6 +1755,48 @@ impl Engine {
         Ok(crate::share::Bundle::build(profile, &lock, configs, description))
     }
 
+    /// Write a profile out as a `.mfpack`.
+    pub fn export_mfpack(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        include_configs: bool,
+        description: String,
+        path: &std::path::Path,
+    ) -> Result<crate::share::Bundle> {
+        let bundle = self.export_profile(pack, profile, include_configs, description)?;
+        crate::mfpack::write(path, &bundle)?;
+        Ok(bundle)
+    }
+
+    /// Open a `.mfpack`.
+    ///
+    /// Decided by what the file *is* rather than what it is called, so a pack
+    /// that lost its extension on the way through a chat client still opens.
+    ///
+    /// The single-file JSON bundle that came before is not read. It is still
+    /// *recognised*, because refusing it by name is the difference between an
+    /// answer and a zip parse error — but recognising a format is not
+    /// supporting it, and nothing here will open one.
+    pub fn read_shared(&self, path: &std::path::Path) -> Result<crate::share::Bundle> {
+        if crate::mfpack::looks_like_pack(path) {
+            return crate::mfpack::read(path);
+        }
+        if looks_like_old_bundle(path) {
+            return Err(Error::other(format!(
+                "`{}` is the old single-file profile, which Modifile no longer reads. \
+                 Ask whoever sent it to export again — the current format is a .mfpack, \
+                 and it carries the loader and game version that one could not.",
+                path.display()
+            )));
+        }
+        Err(Error::other(format!(
+            "`{}` is not a Modifile pack. A .mfpack is a zip holding {}.",
+            path.display(),
+            crate::mfpack::INDEX_NAME
+        )))
+    }
+
     /// Create a profile from a shared bundle. Returns the name actually used.
     pub fn import_profile(
         &self,
@@ -2519,6 +2561,16 @@ impl Engine {
         let stored = self.store.files(&staged.sha256)?;
         let rels: Vec<String> = stored.iter().map(|f| f.rel.clone()).collect();
         let Some(index_rel) = crate::modpack::find_index(&rels) else {
+            // One of ours, opened by the wrong door. Saying "not a modpack"
+            // about a Modifile pack is both wrong and a dead end.
+            if rels.iter().any(|rel| rel == crate::mfpack::INDEX_NAME) {
+                return Err(Error::other(format!(
+                    "`{}` is a Modifile pack, which this route does not read — it is for \
+                     CurseForge, Modrinth and Thunderstore packs. Open it with \
+                     `modifile import` instead.",
+                    staged.name
+                )));
+            }
             return Err(Error::other(format!(
                 "`{}` is not a modpack — it holds no manifest.json (CurseForge or \
                  Thunderstore) and no modrinth.index.json (.mrpack). If it is a single \
@@ -3651,6 +3703,23 @@ fn toggle_marker(path: &Path, on: bool, body: &[u8]) -> Result<()> {
 }
 
 /// The one error message for "this needs a CurseForge key you supply yourself".
+/// Whether a file is one of the single-file JSON profiles Modifile used to
+/// write, so it can be turned away by name instead of by parse error.
+///
+/// Sniffed rather than trusted from the extension, and only far enough to tell
+/// what it is: a JSON object carrying the marker key that format led with.
+fn looks_like_old_bundle(path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    // Only the head: these were small, but a hostile file need not be.
+    let head = &bytes[..bytes.len().min(4096)];
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    text.trim_start().starts_with('{') && text.contains("\"modifile_profile\"")
+}
+
 fn curseforge_key_needed() -> Error {
     Error::other(
         "this modpack is built from CurseForge files, and fetching those needs an API key \
@@ -3821,6 +3890,97 @@ mod tests {
         assert!(!paths.profile_file(&raiding).exists());
         assert!(!paths.lock_file(&raiding).exists());
         assert!(!state.exists());
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    /// Export to a `.mfpack` and import it back, through the engine.
+    ///
+    /// The part that matters is what survives: the loader and game version
+    /// decide which build of every mod is correct, and a pack that loses them
+    /// hands the importer a set of mods that will not load together.
+    #[test]
+    fn a_profile_round_trips_through_an_mfpack() {
+        let paths = scratch("mfpack");
+        // Importing resolves the pack by id, so the game has to be installed
+        // here as it would be on a real machine.
+        crate::install_bundled_packs(&paths).expect("packs");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+        let pack = bundled("minecraft.toml");
+        let target = pack.target("client").expect("client");
+
+        let mine = id("minecraft", "hardcore");
+        let mut profile = Profile::new("hardcore", "minecraft");
+        profile.game_version = Some("1.20.1".to_string());
+        profile.loader = Some("fabric".to_string());
+        profile.save(&paths.profile_file(&mine)).expect("save");
+
+        // A config the profile owns, as activating would have produced.
+        let config = engine
+            .config_path(&pack, &mine, target, std::path::Path::new("config/sodium.json"))
+            .expect("config path");
+        std::fs::create_dir_all(config.parent().unwrap()).expect("dir");
+        std::fs::write(&config, "{\"quality\":\"fast\"}").expect("write config");
+
+        let out = paths.home.join("hardcore.mfpack");
+        let exported = engine
+            .export_mfpack(&pack, &profile, true, "my pack".into(), &out)
+            .expect("export");
+        assert_eq!(exported.config_count(), 1);
+        assert!(crate::mfpack::looks_like_pack(&out), "must be a zip");
+
+        // Back in, as a different profile, exactly as a friend would.
+        let reopened = engine.read_shared(&out).expect("read back");
+        let name = engine
+            .import_profile(&reopened, Some("theirs"), true)
+            .expect("import");
+        assert_eq!(name, "theirs");
+
+        let theirs = Profile::load(&paths.profile_file(&id("minecraft", "theirs")))
+            .expect("load imported");
+        assert_eq!(theirs.game_version.as_deref(), Some("1.20.1"));
+        assert_eq!(theirs.loader.as_deref(), Some("fabric"));
+
+        // And their configs arrived, so the pack plays as its author tuned it.
+        let landed = engine
+            .read_config(
+                &pack,
+                &id("minecraft", "theirs"),
+                target,
+                std::path::Path::new("config/sodium.json"),
+            )
+            .expect("their config");
+        assert_eq!(landed, "{\"quality\":\"fast\"}");
+        std::fs::remove_dir_all(&paths.home).ok();
+    }
+
+    /// The single-file JSON profile is not read any more. It is still
+    /// recognised, so someone holding one is told what it is and what to do —
+    /// which is not the same as supporting it, and is much better than the
+    /// "not a zip" error they would otherwise get.
+    #[test]
+    fn the_old_json_profile_is_refused_by_name() {
+        let paths = scratch("legacy-json");
+        let engine = Engine::open(paths.clone(), None).expect("engine");
+
+        let old = paths.home.join("raiding.modifile.json");
+        std::fs::write(
+            &old,
+            br#"{"modifile_profile":1,"name":"raiding","game":"valheim","mods":[]}"#,
+        )
+        .expect("write");
+
+        let error = engine.read_shared(&old).expect_err("must refuse").to_string();
+        assert!(
+            error.contains("no longer reads") && error.contains(".mfpack"),
+            "should say what it is and what to do instead: {error}"
+        );
+
+        // And something that is neither gets its own answer rather than being
+        // blamed on the old format.
+        let junk = paths.home.join("holiday.png");
+        std::fs::write(&junk, [0x89, b'P', b'N', b'G']).expect("write");
+        let error = engine.read_shared(&junk).expect_err("must refuse").to_string();
+        assert!(error.contains("not a Modifile pack"), "{error}");
         std::fs::remove_dir_all(&paths.home).ok();
     }
 

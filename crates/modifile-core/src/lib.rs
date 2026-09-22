@@ -18,6 +18,9 @@ pub mod hash;
 pub mod http;
 pub mod launch;
 pub mod loader;
+/// Modifile's own modpack format, `.mfpack`.
+pub mod mfpack;
+/// Reading other people's modpack formats: CurseForge, Modrinth, Thunderstore.
 pub mod modpack;
 pub mod pack;
 pub mod paths;

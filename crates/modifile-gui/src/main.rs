@@ -2379,59 +2379,75 @@ impl App {
         let Ok(pack) = engine.pack_for(&profile) else {
             return;
         };
-        let bundle = match engine.export_profile(pack, &profile, include_configs, String::new()) {
-            Ok(b) => b,
-            Err(e) => {
-                self.log_line(e.to_string());
-                return;
-            }
-        };
-
-        let suggested = format!("{}.modifile.json", profile.name);
+        let suggested = format!("{}.{}", profile.name, modifile_core::mfpack::EXTENSION);
         let picked = rfd::FileDialog::new()
-            .set_title("Save shared profile")
+            .set_title("Save modpack")
             .set_file_name(&suggested)
-            .add_filter("Modifile profile", &["json"])
+            .add_filter("Modifile pack", &[modifile_core::mfpack::EXTENSION])
             .save_file();
 
         // Without a portal there is no dialog, so fall back to the data folder
         // rather than doing nothing.
         let path = picked.unwrap_or_else(|| self.paths.home.join(&suggested));
-        match bundle.save(&path) {
-            Ok(()) => {
-                self.log_line(format!(
-                    "Exported {} mod(s) and {} config file(s) to {}",
-                    bundle.mod_count(),
-                    bundle.config_count(),
-                    display_path(&path)
-                ));
-                self.log_line("  Send that file to anyone — they use Import a shared profile.");
+
+        let bundle = match engine.export_mfpack(
+            pack,
+            &profile,
+            include_configs,
+            String::new(),
+            &path,
+        ) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                self.log_line(e.to_string());
+                return;
             }
-            Err(e) => self.log_line(e.to_string()),
+        };
+
+        self.log_line(format!(
+            "Exported {} mod(s) and {} config file(s) to {}",
+            bundle.mod_count(),
+            bundle.config_count(),
+            display_path(&path)
+        ));
+                // Asking for settings and getting none is worth explaining.
+                // A bundle only carries configs the *profile* owns, and a
+                // profile owns them from the moment it is activated — so
+                // someone who tuned their mods in the game folder and never
+        // activated would otherwise send a settings-less file having
+        // explicitly chosen to include them.
+        if include_configs && bundle.config_count() == 0 && self.live_config_files > 0 {
+            self.log_line(format!(
+                "  None were included: {} settings file(s) are in the game folder \
+                 but do not belong to this profile yet. Activate it, or use \
+                 Import from → This game's current folder, then export again.",
+                self.live_config_files
+            ));
         }
+        self.log_line("  Send that file to anyone — they use Import a shared profile.");
     }
 
     fn do_import_bundle(&mut self, pin_versions: bool) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open a shared profile")
-            .add_filter("Modifile profile", &["json"])
+            .set_title("Open a Modifile pack")
+            .add_filter("Modifile pack", &[modifile_core::mfpack::EXTENSION])
             .pick_file()
         else {
             self.log_line(
-                "No file chosen. If the dialog did not open, copy the .modifile.json into the \
+                "No file chosen. If the dialog did not open, copy the .mfpack into the \
                  data folder and use the CLI: modifile import <file>",
             );
             return;
         };
 
-        let bundle = match modifile_core::share::Bundle::load(&path) {
+        let Some(engine) = self.engine() else { return };
+        let bundle = match engine.read_shared(&path) {
             Ok(b) => b,
             Err(e) => {
                 self.log_line(e.to_string());
                 return;
             }
         };
-        let Some(engine) = self.engine() else { return };
         let game = bundle.game.clone();
         match engine.import_profile(&bundle, None, pin_versions) {
             Ok(name) => {
@@ -2555,8 +2571,11 @@ impl App {
 
     fn pick_modpack_file(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open a modpack")
-            .add_filter("Modpack", &["mrpack", "zip"])
+            .set_title("Open a CurseForge, Modrinth or Thunderstore modpack")
+            // `.mfpack` is listed so choosing one gets the message that says
+            // which menu opens it, rather than being greyed out with no
+            // explanation at all.
+            .add_filter("Modpack", &["mrpack", "zip", "mfpack"])
             .pick_file()
         else {
             self.log_line(
@@ -3149,15 +3168,20 @@ impl App {
                                 ui.close();
                             }
                             if ui
-                                .button("Export to a file…")
-                                .on_hover_text("Mod list, versions and your settings")
+                                .button("Save as a modpack…")
+                                .on_hover_text(
+                                    "A .mfpack: the mod list, the versions, the loader \
+                                     and your config files. Send it to anyone — it \
+                                     carries no mods, so they fetch and verify every one \
+                                     on their own machine.",
+                                )
                                 .clicked()
                             {
                                 self.do_export_bundle(true);
                                 ui.close();
                             }
                             if ui
-                                .button("Export without my settings…")
+                                .button("Save as a modpack, without my settings…")
                                 .on_hover_text("Mod list and versions only")
                                 .clicked()
                             {
