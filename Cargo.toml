@@ -7,11 +7,16 @@ members = [
 ]
 
 [workspace.package]
-# This must match the release tag it ships under. Modifile decides whether it
-# is out of date by comparing this against the newest published tag, so a
-# binary built from 0.1.0 and released as v1.1 believes it is a year behind
-# itself and offers the same update for ever. The release workflow refuses to
-# build a tag that disagrees with this line.
+# A released build does not use this number: the release workflow stamps the
+# tag over it before building, so the tag is the version and the two cannot
+# disagree. That matters because Modifile decides whether it is out of date by
+# comparing its built-in version against the newest published tag — a binary
+# reporting less than its own tag believes it is behind itself and offers the
+# same update for ever.
+#
+# So this line is what a build *from source* reports, and the last released
+# version is the sane thing for it to say. Nothing breaks if it lags; it is not
+# the source of truth for a release.
 version = "1.1.1"
 edition = "2021"
 license = "MIT"
