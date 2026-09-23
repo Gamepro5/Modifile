@@ -3316,6 +3316,20 @@ impl App {
                                 log.clear();
                             }
                         }
+                        // The whole log in one press. Selecting it by hand
+                        // works, but the reason anyone wants this text is to
+                        // paste it somewhere, and a long log is a long drag
+                        // through a scrolling panel.
+                        if ui
+                            .add_enabled(count > 0, egui::Button::new("copy").small())
+                            .on_hover_text("Copy every line to the clipboard")
+                            .on_disabled_hover_text("Nothing to copy yet")
+                            .clicked()
+                        {
+                            if let Ok(log) = self.log.lock() {
+                                ui.ctx().copy_text(log.join("\n"));
+                            }
+                        }
                     });
                 });
                 ui.add_space(2.0);
@@ -3338,7 +3352,28 @@ impl App {
                                 } else {
                                     theme::TEXT
                                 };
-                                ui.label(egui::RichText::new(line).monospace().color(color));
+                                // Selectable, unlike every other label in the
+                                // app. This is the one place whose text is
+                                // meant to leave the window — an error someone
+                                // wants to paste into an issue or a search.
+                                //
+                                // Per-widget rather than by turning the global
+                                // back on: selectable labels swallow clicks
+                                // meant for the card around them, which is the
+                                // bug that turned the setting off. Nothing
+                                // here is inside a clickable card.
+                                //
+                                // egui carries a selection across adjacent
+                                // labels, so dragging down the panel selects
+                                // whole lines and Ctrl+C takes them — while
+                                // each line keeps its own colour, which a
+                                // read-only text box would have flattened.
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line).monospace().color(color),
+                                    )
+                                    .selectable(true),
+                                );
                             }
                         }
                     });

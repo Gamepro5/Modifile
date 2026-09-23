@@ -452,6 +452,34 @@ mod tests {
         }
     }
 
+    /// A label can opt back in, which is how the activity log stays
+    /// copyable while everything else keeps its clicks.
+    ///
+    /// Checked through the cursor because that is the observable difference:
+    /// selectable text asks for an I-beam, and `pointer_cursor` only ever
+    /// upgrades the plain arrow, so the I-beam appearing means the widget
+    /// really did override the global.
+    #[test]
+    fn a_label_can_opt_back_into_being_selectable() {
+        let plain = cursor_at(egui::pos2(30.0, 20.0), |ui| {
+            ui.label("error: something went wrong");
+        });
+        assert_eq!(
+            plain,
+            egui::CursorIcon::Default,
+            "an ordinary label must stay inert"
+        );
+
+        let selectable = cursor_at(egui::pos2(30.0, 20.0), |ui| {
+            ui.add(egui::Label::new("error: something went wrong").selectable(true));
+        });
+        assert_eq!(
+            selectable,
+            egui::CursorIcon::Text,
+            "a label asking to be selectable must be, whatever the global says"
+        );
+    }
+
     /// The bug behind "clicking the text on a profile does nothing": a label
     /// inside a clickable card ate the click and showed an I-beam.
     #[test]
