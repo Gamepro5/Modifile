@@ -6310,6 +6310,25 @@ impl App {
                                 chosen = Some(Some(version.tag.clone()));
                             }
 
+                            // Say why, in the row. A greyed line with the
+                            // reason hidden behind a hover reads as a bug in
+                            // Modifile rather than as a fact about the
+                            // release — and nobody hovers a control that
+                            // looks broken to find out why it is broken.
+                            if !usable {
+                                ui.label(
+                                    egui::RichText::new("no file to install")
+                                        .small()
+                                        .color(theme::WARN),
+                                )
+                                .on_hover_text(
+                                    "The release exists but publishes no file this \
+                                     game's pack can use. GitHub's own source-code \
+                                     archives do not count — a mod has to upload its \
+                                     build.",
+                                );
+                            }
+
                             if version.tag == picker.current {
                                 ui.label(
                                     egui::RichText::new("installed")

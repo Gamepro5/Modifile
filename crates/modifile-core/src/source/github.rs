@@ -23,6 +23,8 @@ pub struct GitHub {
 
 #[derive(Debug, Deserialize)]
 struct WireRelease {
+    #[serde(default)]
+    id: u64,
     tag_name: String,
     #[serde(default)]
     name: Option<String>,
@@ -114,13 +116,60 @@ impl GitHub {
         &self.http
     }
 
+    /// How many asset-less releases to double-check per listing.
+    ///
+    /// Only the newest few matter — the question this answers is "is there an
+    /// update?", and nobody is offered a jump to a five-year-old tag. A repo
+    /// that tags without uploading binaries would otherwise cost one request
+    /// per release, every time.
+    const CONFIRM_LIMIT: usize = 3;
+
+    /// Re-read the assets of releases the listing claims are empty.
+    ///
+    /// GitHub's `/releases` response embeds an `assets` array that can lag
+    /// behind reality: a file uploaded to an existing release shows on the web
+    /// page and from `/releases/{id}/assets` while the listing still says the
+    /// release has nothing. Worse, the stale listing keeps its ETag, so
+    /// revalidating returns 304 and the wrong answer sticks rather than
+    /// ageing out.
+    ///
+    /// The visible cost of believing it is severe and silent: Modifile decides
+    /// the newest release carries nothing installable, greys it out, and tells
+    /// the author their week-old version is "already newest" — about a release
+    /// they just published a binary to.
+    ///
+    /// So an empty list is not taken as an answer, it is confirmed. A release
+    /// that really has no assets costs one extra request and still ends up
+    /// empty; one that has them gets them. Failures leave the release as the
+    /// listing described it, because a missing confirmation is not evidence.
+    async fn confirm_empty_assets(&self, id: &ModId, releases: &mut [WireRelease]) {
+        let stale: Vec<usize> = releases
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.draft && r.assets.is_empty() && r.id != 0)
+            .map(|(i, _)| i)
+            .take(Self::CONFIRM_LIMIT)
+            .collect();
+
+        for i in stale {
+            let url = format!(
+                "{API}/repos/{}/{}/releases/{}/assets",
+                id.owner, id.repo, releases[i].id
+            );
+            if let Ok(Some(assets)) = self.http.get_json::<Vec<WireAsset>>(&url).await {
+                releases[i].assets = assets;
+            }
+        }
+    }
+
     /// Recent releases, newest first, drafts removed.
     pub async fn releases(&self, id: &ModId) -> Result<Vec<Release>> {
         let url = format!(
             "{API}/repos/{}/{}/releases?per_page={RELEASE_WINDOW}",
             id.owner, id.repo
         );
-        let wire: Vec<WireRelease> = self.http.get_json(&url).await?.unwrap_or_default();
+        let mut wire: Vec<WireRelease> = self.http.get_json(&url).await?.unwrap_or_default();
+        self.confirm_empty_assets(id, &mut wire).await;
         Ok(wire
             .into_iter()
             .filter(|r| !r.draft)
@@ -301,5 +350,55 @@ impl GitHub {
             // the mod does not reach the top rung.
             Err(_) => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The listing's `assets` array is the field that goes stale, and `id` is
+    /// what makes re-reading it possible. Both have to survive parsing, or the
+    /// confirmation step silently cannot run.
+    #[test]
+    fn a_release_listing_keeps_the_id_needed_to_re_read_its_assets() {
+        let listing = r#"[
+            {"id": 394466396, "tag_name": "1.4.0", "draft": false, "assets": []},
+            {"id": 392911824, "tag_name": "1.3.0", "draft": false,
+             "assets": [{"name": "Mod.dll", "browser_download_url": "https://x/Mod.dll",
+                         "size": 50688}]}
+        ]"#;
+        let wire: Vec<WireRelease> = serde_json::from_str(listing).expect("parses");
+
+        assert_eq!(wire[0].id, 394466396);
+        assert!(
+            wire[0].assets.is_empty(),
+            "this is the shape that must trigger a re-read"
+        );
+        assert_eq!(wire[1].assets.len(), 1);
+    }
+
+    /// The assets endpoint returns a bare array, not the release object, so it
+    /// has to deserialize into the same asset type the listing embeds.
+    #[test]
+    fn the_assets_endpoint_parses_into_the_same_shape() {
+        let assets = r#"[
+            {"name": "BetterCharacterController.dll",
+             "browser_download_url": "https://x/BetterCharacterController.dll",
+             "size": 52224, "state": "uploaded",
+             "digest": "sha256:3b5b57d59c686f82b0000000000000000000000000000000000000000000000"}
+        ]"#;
+        let parsed: Vec<WireAsset> = serde_json::from_str(assets).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "BetterCharacterController.dll");
+        assert_eq!(parsed[0].size, 52224);
+    }
+
+    /// Only the newest few are worth a second request. A repo that tags
+    /// without uploading binaries must not cost one request per release on
+    /// every check.
+    #[test]
+    fn only_the_newest_empty_releases_are_confirmed() {
+        assert_eq!(GitHub::CONFIRM_LIMIT, 3);
     }
 }
