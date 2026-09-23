@@ -161,11 +161,36 @@ jobs:
           sed -i '0,/^version = ".*"/s//version = "'"$version"'"/' Cargo.toml
 
           # Cargo.lock records the workspace crates' versions too, and the
-          # build runs --locked. `--offline` because this touches nothing but
-          # those three entries and must not reach for the network.
-          cargo update --workspace --offline
+          # build runs --locked, so it has to say the same thing.
+          #
+          # Edited as text rather than with `cargo update`, which needs the
+          # crates.io index to re-resolve. On a fresh runner that index is not
+          # there yet — the registry cache is restored in the *next* step — so
+          # `--offline` failed outright and going online would download the
+          # whole index to change three numbers. Nothing here needs resolving:
+          # the dependency graph is unchanged, only the workspace crates'
+          # own versions move.
+          awk -v v="$version" '
+            /^name = "modifile-(cli|core|gui)"$/ { print; want = 1; next }
+            want && /^version = "/               { print "version = \"" v "\""; want = 0; next }
+                                                 { print }
+          ' Cargo.lock > Cargo.lock.stamped
+          mv Cargo.lock.stamped Cargo.lock
 
-          echo "building $tag as $(grep -m1 '^version = ' Cargo.toml)"
+          # Confirm all three landed. Without this a silent miss becomes a
+          # confusing `--locked` failure in the next step, or worse a binary
+          # that reports the wrong version.
+          stamped=$(awk -v want_line="version = \"$version\"" '
+            /^name = "modifile-(cli|core|gui)"$/ { seen = 1; next }
+            seen                                 { if ($0 == want_line) n++; seen = 0 }
+            END                                  { print n + 0 }
+          ' Cargo.lock)
+          if [ "$stamped" != "3" ]; then
+            echo "::error::Stamped $stamped of 3 workspace entries in Cargo.lock. The lock's layout must have changed; the build would fail --locked anyway."
+            exit 1
+          fi
+
+          echo "building $tag as $(grep -m1 '^version = ' Cargo.toml), $stamped lock entries stamped"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
