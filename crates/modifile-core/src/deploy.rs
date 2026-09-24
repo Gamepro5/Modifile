@@ -469,14 +469,28 @@ pub fn apply(
 ) -> Result<(Manifest, DeployReport)> {
     let mut report = DeployReport::default();
 
+    // Whatever revert left on disk — changed since we placed it, or refused
+    // to delete — is still ours. It stays in the new manifest unless the plan
+    // replaces it, so it keeps showing as changed with a way to put it back.
+    // Forgetting it is what turned an edited mod file into a "foreign" one
+    // that blocked its own mod from ever being reinstalled.
+    let mut left: BTreeMap<PathBuf, ManifestFile> = BTreeMap::new();
+    let mut created_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     if let Some(previous) = previous {
         report.removed = revert(previous, &mut report, force)?;
+        for record in &previous.files {
+            let path = previous.path_of(record);
+            if std::fs::symlink_metadata(&path).is_ok() {
+                left.insert(path, record.clone());
+            }
+        }
+        // Directories revert could not empty are still ours to unwind later.
+        created_dirs.extend(previous.created_dirs.iter().filter(|d| d.exists()).cloned());
     }
 
     let mode = probe_mode(store_root, &plan.root);
     report.mode = Some(mode);
 
-    let mut created_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut files = Vec::with_capacity(plan.files.len());
 
     for planned in &plan.files {
@@ -521,12 +535,28 @@ pub fn apply(
         }
 
         if dst.exists() {
-            if !force {
-                report.skipped.push((
-                    planned.rel.clone(),
-                    "a file is already there and we did not put it there".to_string(),
-                ));
-                continue;
+            match left.remove(&dst) {
+                // Ours, and the plan wants a different build here: the mod was
+                // updated or switched version. Whatever was done to the old
+                // file, the new version supersedes it.
+                Some(record) if record.store_sha != planned.store_sha => {
+                    report.skipped.retain(|(rel, _)| rel != &planned.rel);
+                }
+                // Ours, same build. Leave it — revert has already said why —
+                // but keep tracking it.
+                Some(record) if !force => {
+                    files.push(record);
+                    continue;
+                }
+                Some(_) => {}
+                None if !force => {
+                    report.skipped.push((
+                        planned.rel.clone(),
+                        "a file is already there and we did not put it there".to_string(),
+                    ));
+                    continue;
+                }
+                None => {}
             }
             remove_deployed(&dst).ctx(format!("replacing {}", dst.display()))?;
         }
@@ -549,6 +579,10 @@ pub fn apply(
             mod_id: planned.mod_id.clone(),
         });
     }
+
+    // Left behind and not part of this plan at all: still tracked, so a later
+    // "put back" or deactivate can finish the job.
+    files.extend(left.into_values());
 
     let mut created_dirs: Vec<PathBuf> = created_dirs.into_iter().collect();
     // Deepest first, so unwinding removes children before parents.
@@ -988,6 +1022,115 @@ mod tests {
         let mut forced = DeployReport::default();
         revert(&manifest, &mut forced, true).unwrap();
         assert!(!theirs.exists(), "force removes it");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reapplying_keeps_an_edited_file_tracked_and_an_update_replaces_it() {
+        let root = std::env::temp_dir().join(format!("modifile-reapply-{}", crate::paths::now_millis()));
+        let store = root.join("store");
+        let game = root.join("game");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&game).unwrap();
+        let v1 = store.join("v1.dll");
+        let v2 = store.join("v2.dll");
+        std::fs::write(&v1, b"version one").unwrap();
+        std::fs::write(&v2, b"version two, longer").unwrap();
+
+        let rel = PathBuf::from("BepInEx/plugins/Mod.dll");
+        let plan_for = |src: &Path, sha: &str| Plan {
+            game: "t".into(),
+            target: "client".into(),
+            root: game.clone(),
+            instance: None,
+            files: vec![PlannedFile {
+                rel: rel.clone(),
+                base: Base::Game,
+                src: src.to_path_buf(),
+                size: std::fs::metadata(src).unwrap().len(),
+                mod_id: "github:test/mod".into(),
+                store_sha: sha.into(),
+                mutable: false,
+            }],
+            conflicts: vec![],
+            empty_mods: vec![],
+            missing_loader: None,
+        };
+
+        let (first, _) = apply(&plan_for(&v1, "one"), None, &store, "main", false).unwrap();
+        let installed = game.join(&rel);
+        // Break the link before editing so the store copy is not written through.
+        std::fs::remove_file(&installed).unwrap();
+        std::fs::write(&installed, b"edited by hand").unwrap();
+
+        // Same build again: the edit is left alone, but still ours.
+        let (again, _) = apply(&plan_for(&v1, "one"), Some(&first), &store, "main", false).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), b"edited by hand");
+        assert_eq!(again.files.len(), 1, "the edited file must stay in the manifest");
+        assert!(!verify(&again).is_clean(), "and still show as changed");
+
+        // A new version of the mod: the old file, edited or not, is replaced.
+        let (updated, report) =
+            apply(&plan_for(&v2, "two"), Some(&again), &store, "main", false).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), b"version two, longer");
+        assert!(verify(&updated).is_clean());
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_edited_config_is_never_flagged_or_put_back() {
+        // A mod's shipped config is seeded once and then belongs to the
+        // profile. Editing it is the whole point; it must not show as a
+        // changed install, and nothing that restores installs may touch it.
+        let root = std::env::temp_dir().join(format!("modifile-cfg-{}", crate::paths::now_millis()));
+        let store = root.join("store");
+        let game = root.join("game");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&game).unwrap();
+        let dll = store.join("Mod.dll");
+        let cfg = store.join("Mod.cfg");
+        std::fs::write(&dll, b"code").unwrap();
+        std::fs::write(&cfg, b"volume=5").unwrap();
+
+        let planned = |rel: &str, src: &Path, mutable: bool| PlannedFile {
+            rel: PathBuf::from(rel),
+            base: Base::Game,
+            src: src.to_path_buf(),
+            size: std::fs::metadata(src).unwrap().len(),
+            mod_id: "github:test/mod".into(),
+            store_sha: "one".into(),
+            mutable,
+        };
+        let plan = Plan {
+            game: "scantest".into(),
+            target: "client".into(),
+            root: game.clone(),
+            instance: None,
+            files: vec![
+                planned("BepInEx/plugins/Mod.dll", &dll, false),
+                planned("BepInEx/config/Mod.cfg", &cfg, true),
+            ],
+            conflicts: vec![],
+            empty_mods: vec![],
+            missing_loader: None,
+        };
+
+        let (manifest, _) = apply(&plan, None, &store, "main", false).unwrap();
+        let live = game.join("BepInEx/config/Mod.cfg");
+        std::fs::write(&live, b"volume=9").unwrap();
+
+        let pack = scan_pack();
+        let found = scan(&pack, pack.target("client").unwrap(), &game, Some(&manifest), &BTreeSet::new());
+        assert!(found.is_clean(), "{found:?}");
+        assert!(verify(&manifest).is_clean());
+        assert_eq!(drop_modified(&manifest).0, 0);
+
+        let (again, _) = apply(&plan, Some(&manifest), &store, "main", false).unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"volume=9");
+        assert!(verify(&again).is_clean());
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -261,7 +261,17 @@ struct ConfigEditor {
     filter: String,
     /// What happened to the last save or open, shown in the window.
     note: Option<(String, egui::Color32)>,
+    /// The file changed on disk while it had unsaved edits here: what is on
+    /// disk now. Saving is held until the user picks which one to keep.
+    conflict: Option<String>,
+    /// When the file was last compared against the disk.
+    checked: std::time::Instant,
 }
+
+/// How often an open settings file is compared against the disk. Fast enough
+/// that a change made by the game or another editor shows up while you look,
+/// and cheap: one file's timestamp, and its bytes only when that moved.
+const CONFIG_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl ConfigEditor {
     fn changed(&self) -> bool {
@@ -795,6 +805,11 @@ impl App {
                     }
                 }
                 for (target, root) in engine.targets(pack, &profile) {
+                    // Before listing: the live folder may hold changes the
+                    // saved copy has not seen, and the editor reads that copy.
+                    if let Some(root) = &root {
+                        let _ = engine.pull_live_configs(pack, id, &target, root);
+                    }
                     configs.extend(
                         engine
                             .saved_configs(pack, id, &target)
@@ -961,7 +976,13 @@ impl App {
 
     // --- actions ----------------------------------------------------------
 
-    fn do_sync(&mut self, ctx: &egui::Context) {
+    /// Fetch this profile's mods, then carry the result into the game folder
+    /// if the profile is the one installed there.
+    ///
+    /// `update` asks every source for its newest release (Check for updates).
+    /// Without it only what is missing is fetched — a new mod, a version just
+    /// picked, a download that went away — and nothing else moves (Download).
+    fn do_sync(&mut self, ctx: &egui::Context, update: bool) {
         let Some(profile) = self.current_profile() else {
             return;
         };
@@ -970,8 +991,16 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         let allow_no_source = self.allow_no_source;
+        let options = modifile_core::engine::DeployOptions {
+            force: false,
+            assume_stopped: self.assume_stopped,
+        };
         self.busy = true;
-        self.log_line(format!("Checking {} for updates…", profile.name));
+        self.log_line(if update {
+            format!("Checking {} for updates…", profile.name)
+        } else {
+            format!("Downloading {}…", profile.name)
+        });
 
         let handle = self.runtime.handle().clone();
         std::thread::spawn(move || {
@@ -1039,15 +1068,28 @@ impl App {
                     })
                 };
 
-                let (lock, failures) =
-                    engine.sync(pack, &profile, &previous, Some(reporter)).await?;
+                let (lock, failures) = if update {
+                    engine.sync(pack, &profile, &previous, Some(reporter)).await?
+                } else {
+                    engine.download(pack, &profile, &previous, Some(reporter)).await?
+                };
                 lock.save(&lock_path)?;
+
+                // Active means "this is what is in the game". Carry the new
+                // lock through now rather than after a deactivate/activate.
+                for line in reapply_lines(engine.reapply_if_active(pack, &profile, &lock, options))
+                {
+                    push(line);
+                }
 
                 // Diff old against new so the UI can say what actually moved,
                 // rather than leaving the user to reconstruct it from a log.
+                // A mod that failed keeps its old entry in the lock; its
+                // failure row says what happened, so it gets no second row.
                 let mut outcomes: Vec<SyncOutcome> = lock
                     .mods
                     .iter()
+                    .filter(|now| !failures.iter().any(|f| !f.waiting && f.id == now.id))
                     .map(|now| {
                         let before = previous.get(&now.id).map(|l| l.version.clone());
                         // A pin that something newer has passed is its own
@@ -1667,6 +1709,10 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         let allow_no_source = self.allow_no_source;
+        let options = modifile_core::engine::DeployOptions {
+            force: false,
+            assume_stopped: self.assume_stopped,
+        };
         self.busy = true;
         self.log_open = true;
         self.log_line(format!(
@@ -1703,7 +1749,19 @@ impl App {
                         let (lock, issues) =
                             engine.sync(pack, &profile, &previous, None).await?;
                         lock.save(&lock_path)?;
-                        Ok::<_, modifile_core::Error>((lock.mods.len(), issues.len()))
+                        for line in
+                            reapply_lines(engine.reapply_if_active(pack, &profile, &lock, options))
+                        {
+                            push(format!("   {line}"));
+                        }
+                        // A failed mod keeps its old entry in the lock; it is
+                        // not "ready" just because it is still there.
+                        let ready = lock
+                            .mods
+                            .iter()
+                            .filter(|m| !issues.iter().any(|i| !i.waiting && i.id == m.id))
+                            .count();
+                        Ok::<_, modifile_core::Error>((ready, issues.len()))
                     }
                     .await;
 
@@ -1723,7 +1781,7 @@ impl App {
                 }
             });
 
-            push("Done. Activate whichever profiles you want in the game.".into());
+            push("Done. Active profiles were updated in the game folder.".into());
             let _ = tx.send(Msg::Done);
             ctx.request_repaint();
         });
@@ -1801,7 +1859,7 @@ impl App {
                 if profile.add(ModEntry::new(id.clone())) {
                     match profile.save(&path) {
                         Ok(()) => self.log_line(format!(
-                            "Added {id} to `{name}`. Press Check for updates to download it."
+                            "Added {id} to `{name}`. Press Download to fetch it."
                         )),
                         Err(e) => self.log_line(format!("Could not save `{name}`: {e}")),
                     }
@@ -1874,7 +1932,7 @@ impl App {
                     if profile.add(ModEntry::new(id.clone())) {
                         let _ = profile.save(&path);
                         self.log_line(format!(
-                            "Added {id}. Press Check for updates to download it."
+                            "Added {id}. Press Download to fetch it."
                         ));
                     } else {
                         self.log_line(format!("{id} is already in this profile."));
@@ -2203,7 +2261,7 @@ impl App {
         self.select(&id);
         self.view = View::Profile;
         self.log_line(format!(
-            "Created `{name}`. Add mods below, then press Check for updates."
+            "Created `{name}`. Add mods below, then press Download."
         ));
     }
 
@@ -2292,7 +2350,7 @@ impl App {
             "{cleared} mod(s) released from their held versions — checking for updates…"
         ));
         self.refresh();
-        self.do_sync(ctx);
+        self.do_sync(ctx, true);
     }
 
     /// Delete the selected profile, taking its mods out of the game first if
@@ -2475,7 +2533,7 @@ impl App {
                     );
                     self.log_line("  Press Download these versions to fetch them, then Activate.");
                 } else {
-                    self.log_line("  Press Check for updates to download them, then Activate.");
+                    self.log_line("  Press Download to fetch them, then Activate.");
                 }
                 self.reload_profiles();
                 self.select(&ProfileId::new(&game, &name));
@@ -2555,7 +2613,7 @@ impl App {
                     for (name, why) in &report.skipped {
                         push(format!("  not taken — {name}: {why}"));
                     }
-                    push("  Press Check for updates to download the mods, then Activate.".into());
+                    push("  Press Download to fetch the mods, then Activate.".into());
                     let _ = tx.send(Msg::Imported(ProfileId::new(
                         report.game.clone(),
                         report.profile.clone(),
@@ -2616,6 +2674,34 @@ fn load_token(paths: &Paths) -> Option<String> {
 
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Log lines for carrying an update into the game folder of an active profile.
+fn reapply_lines(
+    results: Vec<(
+        modifile_core::pack::Target,
+        modifile_core::Result<(modifile_core::deploy::Plan, modifile_core::deploy::DeployReport)>,
+    )>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (target, result) in results {
+        match result {
+            Ok((_, report)) => {
+                lines.push(format!(
+                    "{}: game folder updated — {} file(s) linked, {} removed",
+                    target.name, report.linked, report.removed
+                ));
+                for (path, reason) in &report.skipped {
+                    lines.push(format!("  skipped {}: {reason}", display_path(path)));
+                }
+            }
+            Err(e) => lines.push(format!(
+                "{}: downloaded, but the game folder was not updated: {e}",
+                target.name
+            )),
+        }
+    }
+    lines
 }
 
 /// Draw the active/inactive dot.
@@ -3092,43 +3178,75 @@ impl App {
                                 Some(found) => format!(
                                     "The game is running ({found}).\nClose it before changing mods."
                                 ),
-                                None => "Check for updates first, to download the mods".to_string(),
+                                None => "Press Download first, to fetch the mods".to_string(),
                             })
                             .clicked()
                         {
                             self.do_deploy(false);
                         }
 
-                        // A profile where every mod is pinned cannot be updated
-                        // by pressing this, so it must not say it updates. It
-                        // downloads the versions the profile asks for — which
-                        // is a real and useful thing, just not that thing.
                         let pinned = self.rows.iter().filter(|r| r.enabled && r.pinned).count();
                         let enabled_mods = self.rows.iter().filter(|r| r.enabled).count();
                         let all_pinned = enabled_mods > 0 && pinned == enabled_mods;
 
+                        // Two jobs, two buttons. Download fetches what the
+                        // profile asks for and moves nothing else; Check for
+                        // updates goes looking for newer releases. Folding them
+                        // together meant picking a version to stay on needed a
+                        // button that says it updates.
+                        let missing = self
+                            .profile
+                            .iter()
+                            .flat_map(|p| p.mods.iter())
+                            .filter(|m| {
+                                m.enabled
+                                    && !m.manual
+                                    && self.lock.get(&m.id).is_none_or(|locked| {
+                                        m.pin.as_deref().is_some_and(|pin| pin != locked.version)
+                                    })
+                            })
+                            .count();
+                        let then = if active {
+                            " and put it into the game folder"
+                        } else {
+                            ""
+                        };
                         if ui
                             .add_enabled(
                                 ready && has_mods,
-                                egui::Button::new(if all_pinned {
-                                    "Download these versions"
-                                } else {
-                                    "Check for updates"
+                                egui::Button::new(match missing {
+                                    0 => "Download".to_string(),
+                                    n => format!("Download ({n})"),
                                 }),
                             )
+                            .on_hover_text(format!(
+                                "Fetch any mod not downloaded yet, at the version the profile \
+                                 asks for{then}. Nothing else is changed or updated."
+                            ))
+                            .on_disabled_hover_text("Add a mod first")
+                            .clicked()
+                        {
+                            let ctx = ui.ctx().clone();
+                            self.do_sync(&ctx, false);
+                        }
+
+                        if ui
+                            .add_enabled(ready && has_mods, egui::Button::new("Check for updates"))
                             .on_hover_text(if all_pinned {
-                                "Every mod here is held at a chosen version, so there is nothing \
-                                 to update to. This downloads exactly those versions, and tells \
-                                 you which ones newer releases have passed."
+                                "Every mod here is held at a chosen version, so nothing will \
+                                 move. This tells you which ones newer releases have passed."
+                                    .to_string()
                             } else {
-                                "Ask each mod's source for its newest version and download \
-                                 anything missing. Does not touch the game folder."
+                                format!(
+                                    "Ask each mod's source for its newest version and download \
+                                     it{then}. Mods held at a version stay where they are."
+                                )
                             })
                             .on_disabled_hover_text("Add a mod first")
                             .clicked()
                         {
                             let ctx = ui.ctx().clone();
-                            self.do_sync(&ctx);
+                            self.do_sync(&ctx, true);
                         }
 
                         ui.add_space(6.0);
@@ -4025,7 +4143,8 @@ impl App {
                             egui::RichText::new(format!(
                                 "{} file(s) we installed have changed since — edited by hand, or \
                                  overwritten by a game update. Activate leaves them alone, \
-                                 because it cannot tell a deliberate edit from damage.",
+                                 because it cannot tell a deliberate edit from damage; a new \
+                                 version of the mod replaces them.",
                                 scan.modified.len()
                             ))
                             .color(theme::WARN),
@@ -4106,6 +4225,10 @@ impl App {
         let ctx_clone = ctx.clone();
         let game = profile.game.clone();
         let targets: Vec<String> = self.targets.iter().map(|t| t.target.id.clone()).collect();
+        let options = modifile_core::engine::DeployOptions {
+            force: false,
+            assume_stopped: self.assume_stopped,
+        };
         self.busy = true;
         self.log_line("Checking the stored copies against their checksums…");
 
@@ -4146,15 +4269,21 @@ impl App {
                 }
 
                 // Re-fetch whatever is now absent, damaged entries included.
+                // A download, not an update: this puts back the versions that
+                // were installed, and asks no source about a mod whose stored
+                // copy is fine — so a flaky network cannot stop the put-back.
                 let pack = engine.pack_for(&profile)?;
                 let lock_path = paths.lock_file(&profile.id());
                 let previous = modifile_core::Lock::load(&lock_path)?;
-                let (fresh, _) = engine.sync(pack, &profile, &previous, None).await?;
+                let (fresh, failures) = engine.download(pack, &profile, &previous, None).await?;
                 fresh.save(&lock_path)?;
+                for issue in failures.iter().filter(|f| !f.waiting) {
+                    push(format!("could not fetch {}: {}", issue.id, issue.message));
+                }
 
                 let mut dropped = 0;
                 for target in &targets {
-                    let (count, failed) = engine.drop_tampered(&game, target)?;
+                    let (count, failed) = engine.drop_tampered(&game, target, options)?;
                     dropped += count;
                     for rel in failed {
                         push(format!("could not replace {}", rel.display()));
@@ -4362,7 +4491,8 @@ impl App {
             return;
         };
 
-        match engine.read_config(pack, &profile.id(), &row.target, rel) {
+        match engine.read_current_config(pack, &profile.id(), &row.target, rel, row.root.as_deref())
+        {
             Ok(text) => {
                 self.config_editor = Some(ConfigEditor {
                     target: target.to_string(),
@@ -4371,6 +4501,8 @@ impl App {
                     text,
                     filter,
                     note: None,
+                    conflict: None,
+                    checked: std::time::Instant::now(),
                 });
             }
             Err(e) => {
@@ -4385,7 +4517,67 @@ impl App {
         }
     }
 
-    fn save_config(&mut self) {
+    /// The open settings file as it is on disk right now, or `None` when it
+    /// cannot be read (gone, or no longer text).
+    fn config_on_disk(&self) -> Option<String> {
+        let editor = self.config_editor.as_ref()?;
+        let (profile, engine) = (self.current_profile()?, self.engine()?);
+        let pack = engine.pack_for(&profile).ok()?;
+        let row = self.targets.iter().find(|r| r.target.id == editor.target)?;
+        engine
+            .read_current_config(pack, &profile.id(), &row.target, &editor.rel, row.root.as_deref())
+            .ok()
+    }
+
+    /// Compare the open file against the disk.
+    ///
+    /// With no unsaved edits, a change on disk is simply taken: the editor
+    /// shows the file, not a snapshot of it. With unsaved edits, neither side
+    /// is thrown away; the conflict is raised and the user picks.
+    fn poll_config(&mut self) {
+        let due = self
+            .config_editor
+            .as_ref()
+            .is_some_and(|e| e.checked.elapsed() >= CONFIG_POLL);
+        if !due {
+            return;
+        }
+        let disk = self.config_on_disk();
+        let Some(editor) = self.config_editor.as_mut() else {
+            return;
+        };
+        editor.checked = std::time::Instant::now();
+        let Some(disk) = disk else { return };
+        if disk == editor.original {
+            // Changed and changed back: nothing to choose between any more.
+            editor.conflict = None;
+            return;
+        }
+        if editor.changed() {
+            editor.conflict = Some(disk);
+        } else {
+            editor.text = disk.clone();
+            editor.original = disk;
+            editor.conflict = None;
+            editor.note = Some(("Reloaded: the file changed on disk.".to_string(), theme::MUTED));
+        }
+    }
+
+    /// Save the open file. Unless `overwrite`, it is first checked against
+    /// the disk, and a change made outside the editor since it was opened
+    /// stops the save rather than being written over.
+    fn save_config(&mut self, overwrite: bool) {
+        if !overwrite {
+            let disk = self.config_on_disk();
+            if let Some(editor) = self.config_editor.as_mut() {
+                editor.checked = std::time::Instant::now();
+                if let Some(disk) = disk.filter(|d| *d != editor.original) {
+                    editor.conflict = Some(disk);
+                    return;
+                }
+            }
+        }
+
         let Some(editor) = self.config_editor.as_ref() else {
             return;
         };
@@ -4429,6 +4621,7 @@ impl App {
             // so a failed save leaves the file still showing as changed.
             if saved_cleanly {
                 editor.original = editor.text.clone();
+                editor.conflict = None;
             }
             editor.note = Some(note);
         }
@@ -4437,9 +4630,15 @@ impl App {
 
     /// The settings editor: the file list on the left, the file on the right.
     fn config_window(&mut self, ctx: &egui::Context) {
+        self.poll_config();
+        // Keep polling while the window just sits there, not only on input.
+        ctx.request_repaint_after(CONFIG_POLL);
+
         let mut open = true;
         let mut pick: Option<(String, PathBuf)> = None;
         let mut save = false;
+        let mut overwrite = false;
+        let mut reload = false;
         let mut revert = false;
 
         let files = self.config_files.clone();
@@ -4531,6 +4730,48 @@ impl App {
                         });
                         ui.add_space(4.0);
 
+                        // Changed on disk under unsaved edits. Nothing is
+                        // written over and nothing is thrown away until the
+                        // user says which one to keep.
+                        if editor.conflict.is_some() {
+                            egui::Frame::NONE
+                                .fill(theme::CARD)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "This file changed outside Modifile while you were \
+                                             editing it — the game, or another program.",
+                                        )
+                                        .color(theme::WARN),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button("Reload from disk")
+                                            .on_hover_text(
+                                                "Show the file as it is now. Your unsaved edits \
+                                                 here are discarded.",
+                                            )
+                                            .clicked()
+                                        {
+                                            reload = true;
+                                        }
+                                        if ui
+                                            .button("Overwrite with mine")
+                                            .on_hover_text(
+                                                "Save what is in this editor, replacing the \
+                                                 change made on disk.",
+                                            )
+                                            .clicked()
+                                        {
+                                            overwrite = true;
+                                        }
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+
                         egui::ScrollArea::vertical()
                             .id_salt("config-text")
                             .auto_shrink([false, false])
@@ -4576,8 +4817,17 @@ impl App {
                 editor.note = None;
             }
         }
-        if save {
-            self.save_config();
+        if reload {
+            if let Some(editor) = self.config_editor.as_mut() {
+                if let Some(disk) = editor.conflict.take() {
+                    editor.text = disk.clone();
+                    editor.original = disk;
+                    editor.note = None;
+                }
+            }
+        }
+        if save || overwrite {
+            self.save_config(overwrite);
         }
         if let Some((target, rel)) = pick {
             self.open_config(&target, &rel);
@@ -4666,7 +4916,7 @@ impl App {
                 for (step, text) in [
                     ("1", "Make a profile and pick which game it is for."),
                     ("2", "Add mods by pasting a GitHub repo, like WeakAuras/WeakAuras2."),
-                    ("3", "Press Check for updates to download them, then Activate."),
+                    ("3", "Press Download to fetch them, then Activate."),
                     ("4", "Launch the game however you normally do."),
                 ] {
                     ui.horizontal(|ui| {
@@ -5188,7 +5438,7 @@ impl App {
                                             (
                                                 "not downloaded",
                                                 theme::WARN,
-                                                "Press Check for updates to fetch it",
+                                                "Press Download to fetch it",
                                             )
                                         } else if row.installed {
                                             (
@@ -5249,14 +5499,17 @@ impl App {
                 Some(v) => format!("{id} held at {v}."),
                 None => format!("{id} will take the newest release."),
             });
-            self.log_line(format!(
-                "  Press {} to fetch it.",
-                if pin.is_some() {
-                    "Download these versions"
+            // Holding at the version already installed needs nothing fetched.
+            // Taking the newest does, so do it rather than leave a note
+            // asking for another press.
+            if pin.is_none() {
+                if self.busy {
+                    self.log_line("  Press Check for updates when the current job finishes.");
                 } else {
-                    "Check for updates"
+                    let ctx = ui.ctx().clone();
+                    self.do_sync(&ctx, true);
                 }
-            ));
+            }
         }
         if let Some((id, pre)) = set_prerelease {
             self.edit_entry(&id, |entry| entry.prerelease = pre);
@@ -6399,13 +6652,20 @@ impl App {
 
         if let Some(pin) = chosen {
             self.edit_entry(&id, |entry| entry.pin = pin.clone());
-            match &pin {
-                Some(tag) => self.log_line(format!(
-                    "{id} set to {tag}. Press Download these versions to fetch it."
-                )),
-                None => self.log_line(format!(
-                    "{id} will take the newest release. Press Check for updates to fetch it."
-                )),
+            // Picking a version is asking for it, so go and get it — and, for
+            // an active profile, put it in the game. Only a specific version
+            // is a plain download; "take the newest" has to ask for updates.
+            if self.busy {
+                self.log_line(format!(
+                    "{id} set to {}. Press Download when the current job finishes.",
+                    pin.as_deref().unwrap_or("the newest release")
+                ));
+            } else {
+                match &pin {
+                    Some(tag) => self.log_line(format!("{id} set to {tag}.")),
+                    None => self.log_line(format!("{id} will take the newest release.")),
+                }
+                self.do_sync(ctx, pin.is_none());
             }
             self.picker = None;
         } else if !open {

@@ -1767,9 +1767,14 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
     let waiting: Vec<_> = failures.iter().filter(|f| f.waiting).collect();
     let broken: Vec<_> = failures.iter().filter(|f| !f.waiting).collect();
 
+    // A mod that failed to check keeps its previous download in the lock, so
+    // it is counted as failed rather than ready.
     println!(
         "{} mod(s) ready{}{}.",
-        lock.mods.len(),
+        lock.mods
+            .iter()
+            .filter(|m| !broken.iter().any(|b| b.id == m.id))
+            .count(),
         if waiting.is_empty() {
             String::new()
         } else {
@@ -2099,7 +2104,8 @@ async fn cmd_repair(engine: &Engine, name: &str) -> Result<()> {
     println!("Fetching anything missing...");
     let pack = engine.pack_for(&profile)?;
     let previous = Lock::load(&lock_path)?;
-    let (fresh, failures) = engine.sync(pack, &profile, &previous, None).await?;
+    // Download, not update: this puts back the versions that were installed.
+    let (fresh, failures) = engine.download(pack, &profile, &previous, None).await?;
     fresh.save(&lock_path)?;
     for issue in failures.iter().filter(|f| !f.waiting) {
         eprintln!("  {}: {}", issue.id, issue.message);
@@ -2111,7 +2117,8 @@ async fn cmd_repair(engine: &Engine, name: &str) -> Result<()> {
         if root.is_none() {
             continue;
         }
-        let (count, failed) = engine.drop_tampered(&profile.game, &target.id)?;
+        let (count, failed) =
+            engine.drop_tampered(&profile.game, &target.id, DeployOptions::default())?;
         dropped += count;
         for rel in failed {
             eprintln!("  could not replace {}", display(&rel));

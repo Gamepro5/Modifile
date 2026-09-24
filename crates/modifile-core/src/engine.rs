@@ -566,6 +566,35 @@ impl Engine {
         previous: &Lock,
         report: Option<Reporter>,
     ) -> Result<(Lock, Vec<SyncIssue>)> {
+        self.sync_inner(pack, profile, previous, report, true).await
+    }
+
+    /// Get the store to match the profile without moving anything to a newer
+    /// release.
+    ///
+    /// A mod that is already downloaded at the version the profile asks for
+    /// is kept exactly as it is, with no request to its source. Only mods that
+    /// are new, whose chosen version changed, or whose download has gone are
+    /// resolved and fetched. This is what picking a version and "put these
+    /// files back" want: the thing asked for, not an update on the side.
+    pub async fn download(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        previous: &Lock,
+        report: Option<Reporter>,
+    ) -> Result<(Lock, Vec<SyncIssue>)> {
+        self.sync_inner(pack, profile, previous, report, false).await
+    }
+
+    async fn sync_inner(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        previous: &Lock,
+        report: Option<Reporter>,
+        update: bool,
+    ) -> Result<(Lock, Vec<SyncIssue>)> {
         let report = report.unwrap_or_else(silent);
         let mut failures: Vec<SyncIssue> = Vec::new();
 
@@ -622,11 +651,26 @@ impl Engine {
             }
         }
 
-        let enabled: Vec<_> = profile
-            .mods
-            .iter()
-            .filter(|m| m.enabled && !m.manual)
-            .collect();
+        // Without `update`, a mod already downloaded at the version it asks
+        // for is not the source's business: keep it and skip the request.
+        let mut enabled = Vec::new();
+        for entry in profile.mods.iter().filter(|m| m.enabled && !m.manual) {
+            let settled = previous.get(&entry.id).filter(|locked| {
+                !update
+                    && self.store.contains(&locked.sha256)
+                    && entry.pin.as_deref().is_none_or(|pin| pin == locked.version)
+            });
+            match settled {
+                Some(locked) => {
+                    report(Event::Cached {
+                        id: entry.id.clone(),
+                        version: locked.version.clone(),
+                    });
+                    carried.push(locked.clone());
+                }
+                None => enabled.push(entry),
+            }
+        }
 
         // --- resolve, concurrently -----------------------------------------
         // Asset choice is per target: a profile covering retail and Classic
@@ -762,6 +806,23 @@ impl Engine {
             match outcome {
                 Ok(entry) => mods.push(entry),
                 Err(f) => failures.push(f),
+            }
+        }
+
+        // A mod that could not be checked this time — rate limit, network,
+        // a source having a bad day — keeps what it already had. Dropping it
+        // from the lock would let the tidy-up delete its download and the next
+        // activate take it out of the game, all because of one failed request.
+        // "No build for this game version" is different: the old build is
+        // for something else now, so it is not kept.
+        for issue in failures.iter().filter(|f| !f.waiting) {
+            if mods.iter().any(|m| m.id == issue.id) {
+                continue;
+            }
+            if let Some(locked) = previous.get(&issue.id) {
+                if self.store.contains(&locked.sha256) {
+                    mods.push(locked.clone());
+                }
             }
         }
 
@@ -1352,6 +1413,14 @@ impl Engine {
         // nothing saved. Those files are adopted rather than ignored —
         // otherwise a profile looks like it has no configs while the game is
         // plainly full of them.
+        //
+        // Re-applying the profile that is already installed is different
+        // again: the live folder has been in use since activation, so it is
+        // reconciled with the saved copy, newer file winning, rather than
+        // overwritten by it.
+        let reapplying = previous
+            .as_ref()
+            .is_some_and(|m| m.active && m.profile == profile_name);
         let mut restored = 0;
         let mut adopted = 0;
         for (name, live) in &state_dirs {
@@ -1359,6 +1428,10 @@ impl Engine {
                 state::profile_state_dir(&self.paths.profiles, profile, &plan.target)
                     .join(name);
 
+            if reapplying {
+                restored += state::reconcile(live, &saved)?.files;
+                continue;
+            }
             if !switching && state::list_files(&saved).is_empty() {
                 adopted += state::capture(live, &saved)?.files;
             }
@@ -1378,6 +1451,41 @@ impl Engine {
 
         manifest.save(&self.paths.manifest_file(&plan.game, &plan.target))?;
         Ok(report)
+    }
+
+    /// Bring the game folder in line with a freshly updated lock, for each
+    /// target where this profile is the one installed.
+    ///
+    /// An update that only changed the store left the game running the old
+    /// files until someone deactivated and activated again. An active profile
+    /// is a promise about what is in the game folder, so a change to it is
+    /// carried through. Targets where the profile is not installed, or only
+    /// as a Play instance, are left alone. Returns one result per target it
+    /// touched.
+    pub fn reapply_if_active(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+        lock: &Lock,
+        options: DeployOptions,
+    ) -> Vec<(Target, Result<(Plan, DeployReport)>)> {
+        let mut out = Vec::new();
+        for target in &pack.pack.targets {
+            let Ok(Some(manifest)) = self.manifest(pack.id(), &target.id) else {
+                continue;
+            };
+            if !manifest.active || manifest.profile != profile.name || manifest.instance.is_some() {
+                continue;
+            }
+            let result = self
+                .plan(pack, profile, lock, target, &manifest.root)
+                .and_then(|plan| {
+                    let report = self.deploy(pack, target, &plan, &profile.id(), options)?;
+                    Ok((plan, report))
+                });
+            out.push((target.clone(), result));
+        }
+        out
     }
 
     /// Remove a deployment entirely, leaving a clean game directory.
@@ -1454,6 +1562,35 @@ impl Engine {
                 )
             })
             .collect()
+    }
+
+    /// Copy settings the game or the user changed in the live folder into the
+    /// profile's saved copy, when this profile is the one installed there.
+    ///
+    /// The editor and the settings list read the saved copy. Without this, a
+    /// change made in game showed the old value, and saving from the editor
+    /// wrote that old value back over the change. Only ever reads the game
+    /// folder, so it is safe while the game runs.
+    pub fn pull_live_configs(
+        &self,
+        pack: &CompiledPack,
+        profile: &crate::profile::ProfileId,
+        target: &Target,
+        root: &std::path::Path,
+    ) -> Result<usize> {
+        let installed_here = self
+            .manifest(pack.id(), &target.id)?
+            .is_some_and(|m| m.active && m.profile == profile.name && m.instance.is_none());
+        if !installed_here {
+            return Ok(0);
+        }
+        let mut pulled = 0;
+        for (name, live) in pack.state_dirs(target, root) {
+            let saved =
+                state::profile_state_dir(&self.paths.profiles, profile, &target.id).join(name);
+            pulled += state::pull(&live, &saved)?.files;
+        }
+        Ok(pulled)
     }
 
     /// Config files this profile has saved, as display paths.
@@ -1601,22 +1738,61 @@ impl Engine {
             return Ok(false);
         }
 
-        // Same split as `config_path`, against the live folder this time.
-        let mut parts = rel.components();
-        let Some(std::path::Component::Normal(head)) = parts.next() else {
+        let Some(live) = Self::live_config_path(pack, target, root, rel) else {
             return Ok(false);
         };
-        let Some((_, live)) = pack
-            .state_dirs(target, root)
-            .into_iter()
-            .find(|(name, _)| std::path::Path::new(name) == std::path::Path::new(head))
-        else {
-            return Ok(false);
-        };
-        let mut live = live;
-        live.extend(parts);
         crate::paths::write_atomic(&live, text.as_bytes())?;
         Ok(true)
+    }
+
+    /// Where one of a profile's settings files sits in the game folder. Same
+    /// split as `config_path`, against the live folder this time, and only
+    /// called with a `rel` that `config_path` has already accepted.
+    fn live_config_path(
+        pack: &CompiledPack,
+        target: &Target,
+        root: &std::path::Path,
+        rel: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let mut parts = rel.components();
+        let Some(std::path::Component::Normal(head)) = parts.next() else {
+            return None;
+        };
+        let (_, mut live) = pack
+            .state_dirs(target, root)
+            .into_iter()
+            .find(|(name, _)| std::path::Path::new(name) == std::path::Path::new(head))?;
+        live.extend(parts);
+        Some(live)
+    }
+
+    /// Read a settings file as it is right now.
+    ///
+    /// For the profile that is installed, the game folder copy is the one in
+    /// use, so a newer one there is pulled into the profile's copy first —
+    /// whatever changed it, the game or another editor. Otherwise the profile's
+    /// own copy is the only one there is. This is what the editor reads, both
+    /// when opening a file and when checking it has not changed under it.
+    pub fn read_current_config(
+        &self,
+        pack: &CompiledPack,
+        profile: &crate::profile::ProfileId,
+        target: &Target,
+        rel: &std::path::Path,
+        root: Option<&std::path::Path>,
+    ) -> Result<String> {
+        let saved = self.config_path(pack, profile, target, rel)?;
+        if let Some(root) = root {
+            let installed_here = self
+                .manifest(pack.id(), &target.id)?
+                .is_some_and(|m| m.active && m.profile == profile.name && m.instance.is_none());
+            if installed_here {
+                if let Some(live) = Self::live_config_path(pack, target, root, rel) {
+                    state::pull_file(&live, &saved)?;
+                }
+            }
+        }
+        self.read_config(pack, profile, target, rel)
     }
 
     /// Throw away a profile's saved configs so the next deploy re-seeds the
@@ -2009,11 +2185,24 @@ impl Engine {
 
     /// Remove this target's deployed files that have been changed since we
     /// placed them, so the next activate restores them.
-    pub fn drop_tampered(&self, game: &str, target: &str) -> Result<(usize, Vec<PathBuf>)> {
+    ///
+    /// Held to the same running-game rule as activate. Deleting first and
+    /// only then being refused the reinstall would leave the mod half gone.
+    pub fn drop_tampered(
+        &self,
+        game: &str,
+        target: &str,
+        options: DeployOptions,
+    ) -> Result<(usize, Vec<PathBuf>)> {
         let path = self.paths.manifest_file(game, target);
         let Some(manifest) = Manifest::load(&path)? else {
             return Ok((0, Vec::new()));
         };
+        if let Some(pack) = self.pack(game) {
+            if let Some(target_def) = pack.target(target) {
+                Self::require_closed(pack, target_def, &manifest.root, options)?;
+            }
+        }
         Ok(crate::deploy::drop_modified(&manifest))
     }
 
