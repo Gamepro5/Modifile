@@ -268,7 +268,9 @@ jobs:
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" dist/* \
-              --title "Modifile $TAG" \
+              # Just the version. The repo name is already all over the page, so repeating
+              # it in every release title only pushes the part you are scanning for to the right.
+              --title "$TAG" \
               --generate-notes \
               --draft
           fi
