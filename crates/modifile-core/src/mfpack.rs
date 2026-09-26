@@ -233,6 +233,7 @@ mod tests {
             targets: vec!["client".into()],
             game_version: Some("0.217.46".into()),
             loader: Some("bepinex".into()),
+            loader_version: Some("v5.4.23.2".into()),
             mods: Vec::new(),
             configs,
             exported_by: "modifile test".into(),
@@ -254,6 +255,7 @@ mod tests {
         // The reason the format carries these at all.
         assert_eq!(back.game_version.as_deref(), Some("0.217.46"));
         assert_eq!(back.loader.as_deref(), Some("bepinex"));
+        assert_eq!(back.loader_version.as_deref(), Some("v5.4.23.2"));
         assert_eq!(back.config_count(), 2);
 
         let client = &back.configs["client"];

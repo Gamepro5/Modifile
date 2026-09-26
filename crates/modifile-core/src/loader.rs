@@ -30,6 +30,10 @@ pub enum LoaderState {
     Installed { version: String },
     /// Installed, but built for a different game version.
     WrongVersion { version: String },
+    /// Installed, but not the version the profile holds the loader at. Two
+    /// players on different loader builds is exactly what a shared pack's
+    /// pinned loader exists to prevent.
+    OtherVersion { installed: String, wanted: String },
     NotInstalled,
     /// We cannot install this one; the user runs its installer.
     Manual { page: String },
@@ -48,8 +52,61 @@ struct MetaLoader {
 }
 
 /// The `versions/` entry id both Fabric and Quilt use.
-fn version_id(prefix: &str, loader: &str, game_version: &str) -> String {
+pub fn version_id(prefix: &str, loader: &str, game_version: &str) -> String {
     format!("{prefix}-loader-{loader}-{game_version}")
+}
+
+/// What an archive loader's installed version is shown as when nothing
+/// recorded it: laid over the game by hand, by another manager, or by a
+/// Modifile from before the stamp existed.
+pub const UNKNOWN_VERSION: &str = "(unknown version)";
+
+/// The file an archive loader install leaves beside itself, saying which
+/// release it was.
+///
+/// An archive has no version of its own that can be read back reliably —
+/// BepInEx's assembly version does not match its release tag — so the only
+/// way to know later is to write it down now.
+pub const STAMP_FILE: &str = ".modifile-loader.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stamp {
+    /// The loader's id in its game pack, e.g. `bepinex`.
+    pub loader: String,
+    /// The release tag it was installed from.
+    pub version: String,
+}
+
+pub fn write_stamp(dir: &Path, loader: &str, version: &str) -> Result<()> {
+    let stamp = Stamp {
+        loader: loader.to_string(),
+        version: version.to_string(),
+    };
+    write_atomic(&dir.join(STAMP_FILE), &serde_json::to_vec_pretty(&stamp)?)
+}
+
+pub fn read_stamp(dir: &Path) -> Option<Stamp> {
+    let raw = std::fs::read(dir.join(STAMP_FILE)).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Every loader build published for one game version, newest first, with
+/// whether each is marked stable.
+pub async fn meta_loader_versions(
+    http: &Http,
+    meta_base: &str,
+    display_name: &str,
+    game_version: &str,
+) -> Result<Vec<(String, bool)>> {
+    let url = format!("{meta_base}/versions/loader/{game_version}");
+    let entries: Vec<MetaLoaderEntry> = http
+        .get_json(&url)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("{display_name} builds for {game_version}")))?;
+    Ok(entries
+        .into_iter()
+        .map(|e| (e.loader.version, e.loader.stable))
+        .collect())
 }
 
 // --- launcher_profiles.json ----------------------------------------------
@@ -145,22 +202,32 @@ pub async fn install_meta_loader(
     display_name: &str,
     mc_dir: &Path,
     game_version: &str,
+    // The loader version the profile holds, if any. `None` takes the newest
+    // stable build.
+    pin: Option<&str>,
 ) -> Result<String> {
-    let url = format!("{meta_base}/versions/loader/{game_version}");
-    let entries: Vec<MetaLoaderEntry> = http
-        .get_json(&url)
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("{display_name} builds for {game_version}")))?;
+    let entries = meta_loader_versions(http, meta_base, display_name, game_version).await?;
 
-    // Prefer a stable loader; the list is newest first either way.
-    let loader = entries
-        .iter()
-        .find(|e| e.loader.stable)
-        .or_else(|| entries.first())
-        .map(|e| e.loader.version.clone())
-        .ok_or_else(|| {
-            Error::NotFound(format!("a {display_name} build for Minecraft {game_version}"))
-        })?;
+    let loader = match pin {
+        Some(pin) => entries
+            .iter()
+            .find(|(version, _)| version == pin)
+            .map(|(version, _)| version.clone())
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "{display_name} {pin} for Minecraft {game_version}"
+                ))
+            })?,
+        // Prefer a stable loader; the list is newest first either way.
+        None => entries
+            .iter()
+            .find(|(_, stable)| *stable)
+            .or_else(|| entries.first())
+            .map(|(version, _)| version.clone())
+            .ok_or_else(|| {
+                Error::NotFound(format!("a {display_name} build for Minecraft {game_version}"))
+            })?,
+    };
 
     let profile_url = format!("{meta_base}/versions/loader/{game_version}/{loader}/profile/json");
     let profile: serde_json::Value = http
@@ -273,7 +340,9 @@ pub fn detect(
         // no per-game-version identity to be wrong about.
         return if markers_present(install_dir, markers) {
             LoaderState::Installed {
-                version: "installed".to_string(),
+                version: read_stamp(install_dir)
+                    .map(|s| s.version)
+                    .unwrap_or_else(|| UNKNOWN_VERSION.to_string()),
             }
         } else {
             LoaderState::NotInstalled
@@ -324,6 +393,47 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("versions")).unwrap();
         dir
+    }
+
+    #[test]
+    fn an_archive_loader_reports_the_release_it_was_stamped_with() {
+        let dir = temp("stamp");
+        std::fs::create_dir_all(dir.join("BepInEx/core")).unwrap();
+        std::fs::write(dir.join("BepInEx/core/BepInEx.dll"), b"").unwrap();
+        let markers = vec!["BepInEx/core/BepInEx.dll".to_string()];
+        let state = || detect(LoaderKind::Archive, "", "", &markers, &dir, &dir, None);
+
+        // Laid down by something that did not say which build it was.
+        assert_eq!(
+            state(),
+            LoaderState::Installed {
+                version: UNKNOWN_VERSION.to_string()
+            }
+        );
+
+        write_stamp(&dir, "bepinex", "v5.4.23.2").unwrap();
+        assert_eq!(
+            state(),
+            LoaderState::Installed {
+                version: "v5.4.23.2".to_string()
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_doorstop_shim_alone_is_not_an_installed_loader() {
+        // The state a Play-only install left the game folder in: a shim
+        // pointing at a BepInEx that is not there.
+        let dir = temp("shim");
+        std::fs::write(dir.join("winhttp.dll"), b"").unwrap();
+        std::fs::write(dir.join("doorstop_config.ini"), b"").unwrap();
+        let markers = vec!["BepInEx/core/BepInEx.dll".to_string()];
+        assert_eq!(
+            detect(LoaderKind::Archive, "", "", &markers, &dir, &dir, None),
+            LoaderState::NotInstalled
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

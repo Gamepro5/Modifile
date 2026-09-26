@@ -145,12 +145,21 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Install or check this profile's mod loader (Fabric, Quilt, …).
+    /// Install or check this profile's mod loader (BepInEx, Fabric, …).
     Loader {
         profile: String,
         /// Install it rather than only reporting what is there.
         #[arg(long)]
         install: bool,
+        /// List every build of the loader that can be installed.
+        #[arg(long)]
+        list: bool,
+        /// Hold the loader at this build, and install it.
+        #[arg(long, value_name = "TAG", conflicts_with = "latest")]
+        version: Option<String>,
+        /// Stop holding a build and install the newest one.
+        #[arg(long)]
+        latest: bool,
     },
     /// Rename a profile, keeping its mods, lock and configs.
     Rename { from: String, to: String },
@@ -517,8 +526,21 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Loader { profile, install } => {
-            runtime.block_on(cmd_loader(&engine, &profile, install))
+        Command::Loader {
+            profile,
+            install,
+            list,
+            version,
+            latest,
+        } => {
+            // Choosing a build is asking for it, so it installs as well.
+            let hold = match (version, latest) {
+                (Some(tag), _) => Some(Some(tag)),
+                (None, true) => Some(None),
+                (None, false) => None,
+            };
+            let install = install || hold.is_some();
+            runtime.block_on(cmd_loader(&engine, &profile, install, list, hold))
         }
         Command::Rename { from, to } => {
             let name = engine.rename_profile(&resolve(&engine, &from)?, &to)?;
@@ -1576,11 +1598,58 @@ fn cmd_hold(
     Ok(())
 }
 
-async fn cmd_loader(engine: &Engine, name: &str, install: bool) -> Result<()> {
+async fn cmd_loader(
+    engine: &Engine,
+    name: &str,
+    install: bool,
+    list: bool,
+    // `Some(Some(tag))` holds a build, `Some(None)` releases the hold.
+    hold: Option<Option<String>>,
+) -> Result<()> {
     use modifile_core::loader::LoaderState;
 
-    let profile = load_profile(engine, name)?;
+    let mut profile = load_profile(engine, name)?;
     let pack = engine.pack_for(&profile)?;
+
+    if let Some(hold) = &hold {
+        profile.loader_version = hold.clone();
+        profile.save(&engine.paths.profile_file(&profile.id()))?;
+        match &profile.loader_version {
+            Some(tag) => println!("`{}` now holds its loader at {tag}.", profile.name),
+            None => println!("`{}` now takes the newest loader build.", profile.name),
+        }
+    }
+
+    if list {
+        let versions = engine.loader_versions(pack, &profile).await?;
+        let held = profile.loader_version.as_deref();
+        let installed = engine.installed_loader_version(pack, &profile);
+        for v in &versions {
+            let mut notes = Vec::new();
+            if held == Some(v.tag.as_str()) {
+                notes.push("held");
+            }
+            if installed.as_deref() == Some(v.tag.as_str()) {
+                notes.push("installed");
+            }
+            if v.prerelease {
+                notes.push("prerelease");
+            }
+            if v.asset.is_none() {
+                notes.push("no build for this game");
+            }
+            let date = v.published_at.split('T').next().unwrap_or_default();
+            println!(
+                "  {:<20} {date:<10} {}",
+                v.tag,
+                notes.join(", ")
+            );
+        }
+        if versions.is_empty() {
+            println!("No builds were published.");
+        }
+        println!();
+    }
 
     for (target, root) in engine.targets(pack, &profile) {
         let Some(root) = root else { continue };
@@ -1599,6 +1668,10 @@ async fn cmd_loader(engine: &Engine, name: &str, install: bool) -> Result<()> {
                 def.name,
                 profile.game_version.as_deref().unwrap_or("?")
             ),
+            LoaderState::OtherVersion { installed, wanted } => println!(
+                "{}: {} {installed} is installed, but this profile holds {wanted}.",
+                target.name, def.name
+            ),
             LoaderState::NotInstalled => {
                 println!("{}: {} is not installed.", target.name, def.name)
             }
@@ -1608,11 +1681,20 @@ async fn cmd_loader(engine: &Engine, name: &str, install: bool) -> Result<()> {
             ),
         }
 
-        if install && !matches!(state, LoaderState::Installed { .. }) {
+        // A build that was just chosen is reinstalled even when something is
+        // already there: "newest" has to go and look.
+        let wanted = match &state {
+            LoaderState::Installed { .. } => hold.is_some(),
+            LoaderState::Manual { .. } => false,
+            _ => true,
+        };
+        if install && wanted {
             match engine.install_loader(pack, &profile, &root).await {
                 Ok(version) => {
                     println!("  installed {} {version}", def.name);
-                    println!("  it now appears in the Minecraft launcher's version list");
+                    if def.kind == modifile_core::pack::LoaderKind::FabricMeta {
+                        println!("  it now appears in the Minecraft launcher's version list");
+                    }
                 }
                 Err(e) => println!("  {e}"),
             }
@@ -1621,7 +1703,10 @@ async fn cmd_loader(engine: &Engine, name: &str, install: bool) -> Result<()> {
 
     if !install {
         println!();
-        println!("Add --install to install or update it.");
+        println!(
+            "Add --install to install it, --list to see every build, --version <tag> to \
+             hold one, or --latest to follow the newest."
+        );
     }
     Ok(())
 }
@@ -1821,6 +1906,38 @@ async fn cmd_sync(engine: &Engine, name: &str) -> Result<()> {
             );
         }
         println!("  Take one: modifile hold {name} <mod> --latest, then update again.");
+    }
+
+    // Reported, never taken: a loader update changes what every mod runs on,
+    // and everyone in a lobby wants the same build.
+    match engine.loader_update(pack, &profile).await {
+        Ok(Some(found)) => {
+            println!();
+            let have = found
+                .held
+                .as_deref()
+                .or(found.installed.as_deref())
+                .unwrap_or(modifile_core::loader::UNKNOWN_VERSION);
+            match &found.held {
+                Some(_) => {
+                    println!(
+                        "{} is held at {have}; {} is out. Not updated.",
+                        found.name, found.newest
+                    );
+                    println!("  Take it: modifile loader {name} --latest");
+                }
+                None => {
+                    println!(
+                        "{} {} is out (you have {have}). Not updated — everyone you play \
+                         with should be on the same build.",
+                        found.name, found.newest
+                    );
+                    println!("  Take it: modifile loader {name} --latest");
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("note: could not check the mod loader for updates: {e}"),
     }
     // A mod refused by the trust policy is not broken — it is a decision, and
     // the same decision every time. Printing ninety identical paragraphs

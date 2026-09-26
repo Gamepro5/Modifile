@@ -348,6 +348,20 @@ pub struct VersionOption {
     pub size: u64,
 }
 
+/// A newer mod loader build than the one a profile is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderUpdate {
+    /// The loader's display name, e.g. `BepInEx`.
+    pub name: String,
+    /// What is installed now. `None` when that was never recorded.
+    pub installed: Option<String>,
+    /// The newest stable build that has a file for this game.
+    pub newest: String,
+    /// The build the profile holds the loader at, if any. A held loader is
+    /// reported but not offered — the hold is the answer until released.
+    pub held: Option<String>,
+}
+
 impl Engine {
     pub fn open(paths: Paths, token: Option<String>) -> Result<Self> {
         paths.ensure()?;
@@ -1928,7 +1942,13 @@ impl Engine {
             }
         }
 
-        Ok(crate::share::Bundle::build(profile, &lock, configs, description))
+        let mut bundle = crate::share::Bundle::build(profile, &lock, configs, description);
+        // No hold means "whatever is installed", which is the build the
+        // exporter has actually been playing on — so that is what to share.
+        if bundle.loader_version.is_none() {
+            bundle.loader_version = self.installed_loader_version(pack, profile);
+        }
+        Ok(bundle)
     }
 
     /// Write a profile out as a `.mfpack`.
@@ -3410,31 +3430,237 @@ impl Engine {
             root,
             profile.game_version.as_deref(),
         );
+        let state = match (state, profile.loader_version.as_deref()) {
+            (crate::loader::LoaderState::Installed { version }, Some(wanted))
+                if version != wanted =>
+            {
+                // Fabric and Quilt keep every installed build side by side,
+                // and detection reports the first it finds. The held one may
+                // be there too.
+                let held_present = def.kind == crate::pack::LoaderKind::FabricMeta
+                    && profile.game_version.as_deref().is_some_and(|gv| {
+                        root.join("versions")
+                            .join(crate::loader::version_id(&def.prefix, wanted, gv))
+                            .is_dir()
+                    });
+                if held_present {
+                    crate::loader::LoaderState::Installed {
+                        version: wanted.to_string(),
+                    }
+                } else {
+                    crate::loader::LoaderState::OtherVersion {
+                        installed: version,
+                        wanted: wanted.to_string(),
+                    }
+                }
+            }
+            (state, _) => state,
+        };
         Some((def, state))
+    }
+
+    /// The loader build installed for this profile's first target that has
+    /// one, when it is known. `None` for a loader laid down by something that
+    /// did not record its version.
+    pub fn installed_loader_version(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+    ) -> Option<String> {
+        self.loader_states(pack, profile)
+            .into_iter()
+            .find_map(|(_, _, _, state)| match state {
+                crate::loader::LoaderState::Installed { version }
+                | crate::loader::LoaderState::OtherVersion {
+                    installed: version, ..
+                } if version != crate::loader::UNKNOWN_VERSION => Some(version),
+                _ => None,
+            })
+    }
+
+    /// Whether a newer build of the loader exists than the one installed.
+    ///
+    /// Only ever reported, never acted on: a loader update changes what every
+    /// mod runs on, and everyone in a lobby wants the same build, so taking
+    /// one is a decision for the user rather than a side effect of checking
+    /// for mod updates. `None` when there is nothing to say — up to date, not
+    /// installed at all (the loader card already says so), or a loader
+    /// Modifile cannot install.
+    pub async fn loader_update(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+    ) -> Result<Option<LoaderUpdate>> {
+        use crate::loader::LoaderState;
+
+        let def = self.loader_def(pack, profile)?;
+        if def.kind == crate::pack::LoaderKind::Installer {
+            return Ok(None);
+        }
+        let states = self.loader_states(pack, profile);
+        let present = states.iter().any(|(_, _, _, state)| {
+            matches!(
+                state,
+                LoaderState::Installed { .. }
+                    | LoaderState::OtherVersion { .. }
+                    | LoaderState::WrongVersion { .. }
+            )
+        });
+        if !present {
+            return Ok(None);
+        }
+
+        let newest = self
+            .loader_versions(pack, profile)
+            .await?
+            .into_iter()
+            .find(|v| !v.prerelease && v.asset.is_some())
+            .map(|v| v.tag);
+        let Some(newest) = newest else {
+            return Ok(None);
+        };
+        let installed = self.installed_loader_version(pack, profile);
+        let held = profile.loader_version.clone();
+        let current = held.as_ref().or(installed.as_ref());
+        if current == Some(&newest) {
+            return Ok(None);
+        }
+        Ok(Some(LoaderUpdate {
+            name: def.name.clone(),
+            installed,
+            newest,
+            held,
+        }))
+    }
+
+    /// Every build of this profile's mod loader, for choosing one.
+    ///
+    /// The loader's counterpart to [`Engine::versions`], and shaped the same
+    /// so one picker serves both.
+    pub async fn loader_versions(
+        &self,
+        pack: &CompiledPack,
+        profile: &Profile,
+    ) -> Result<Vec<VersionOption>> {
+        let def = self.loader_def(pack, profile)?;
+        match def.kind {
+            crate::pack::LoaderKind::FabricMeta => {
+                let game_version = profile.game_version.as_deref().ok_or_else(|| {
+                    Error::other(
+                        "set the game version first — this loader is built for one".to_string(),
+                    )
+                })?;
+                let builds = crate::loader::meta_loader_versions(
+                    self.modrinth.http(),
+                    &def.meta,
+                    &def.name,
+                    game_version,
+                )
+                .await?;
+                Ok(builds
+                    .into_iter()
+                    .map(|(version, stable)| VersionOption {
+                        asset: Some(format!("{} {version} for {game_version}", def.name)),
+                        tag: version.clone(),
+                        name: version,
+                        published_at: String::new(),
+                        prerelease: !stable,
+                        size: 0,
+                    })
+                    .collect())
+            }
+            crate::pack::LoaderKind::Archive => {
+                let root = self
+                    .targets(pack, profile)
+                    .into_iter()
+                    .find_map(|(target, root)| root.filter(|_| def.applies_to(&target.id)));
+                let platform = root
+                    .as_deref()
+                    .and_then(crate::loader::detect_game_platform)
+                    .unwrap_or_else(crate::loader::GamePlatform::host);
+                let releases = self.loader_releases(pack, def, None).await?;
+                let matchers = asset_matchers(&def.assets_for(platform));
+                Ok(releases
+                    .iter()
+                    .map(|release| {
+                        let asset = release.assets.iter().find(|a| {
+                            let name = a.name.to_ascii_lowercase();
+                            matchers.iter().any(|m| m.is_match(&name))
+                        });
+                        VersionOption {
+                            tag: release.tag.clone(),
+                            name: release.name.clone(),
+                            published_at: release.published_at.clone(),
+                            prerelease: release.prerelease,
+                            asset: asset.map(|a| a.name.clone()),
+                            size: asset.map(|a| a.size).unwrap_or(0),
+                        }
+                    })
+                    .collect())
+            }
+            crate::pack::LoaderKind::Installer => Err(Error::other(format!(
+                "{} is installed by its own installer, so Modifile cannot choose its version \
+                 — pick one on {}",
+                def.name, def.page
+            ))),
+        }
+    }
+
+    /// The loader this profile uses, from its pack.
+    fn loader_def<'p>(
+        &self,
+        pack: &'p CompiledPack,
+        profile: &Profile,
+    ) -> Result<&'p crate::pack::LoaderDef> {
+        match profile.loader.as_deref() {
+            Some(id) => pack.loader(id).ok_or_else(|| {
+                Error::NotFound(format!("loader `{id}` in the {} pack", pack.pack.game.name))
+            }),
+            None if pack.pack.loaders.len() == 1 => Ok(&pack.pack.loaders[0]),
+            None => Err(Error::other(format!(
+                "`{}` has no mod loader set yet",
+                profile.name
+            ))),
+        }
+    }
+
+    /// Releases of an archive loader, from wherever its pack says it is
+    /// published. A pin is passed through so a held release older than the
+    /// newest page is still found.
+    async fn loader_releases(
+        &self,
+        pack: &CompiledPack,
+        def: &crate::pack::LoaderDef,
+        pin: Option<&str>,
+    ) -> Result<Vec<Release>> {
+        let source: ModId = def.source.parse()?;
+        let (releases, _) = self
+            .fetch(
+                &source,
+                &crate::source::modrinth::VersionFilter::default(),
+                pack,
+                pin,
+                None,
+            )
+            .await?;
+        Ok(releases)
     }
 
     /// Install the profile's mod loader into the game.
     ///
     /// The step people otherwise do by hand before Modifile is any use: go to
     /// the loader's site, download an installer, run it, pick a version.
+    ///
+    /// Installs the build the profile holds the loader at, or the newest one
+    /// when it holds none.
     pub async fn install_loader(
         &self,
         pack: &CompiledPack,
         profile: &Profile,
         root: &std::path::Path,
     ) -> Result<String> {
-        let def = match profile.loader.as_deref() {
-            Some(id) => pack.loader(id).ok_or_else(|| {
-                Error::NotFound(format!("loader `{id}` in the {} pack", pack.pack.game.name))
-            })?,
-            None if pack.pack.loaders.len() == 1 => &pack.pack.loaders[0],
-            None => {
-                return Err(Error::other(format!(
-                    "`{}` has no mod loader set yet",
-                    profile.name
-                )))
-            }
-        };
+        let def = self.loader_def(pack, profile)?;
+        let pin = profile.loader_version.as_deref();
 
         match def.kind {
             crate::pack::LoaderKind::FabricMeta => {
@@ -3451,6 +3677,7 @@ impl Engine {
                     &def.name,
                     root,
                     game_version,
+                    pin,
                 )
                 .await
             }
@@ -3458,7 +3685,6 @@ impl Engine {
             // what makes a Unity game read its plugins folder at all — without
             // it, mods install perfectly and the game ignores them.
             crate::pack::LoaderKind::Archive => {
-                let source: ModId = def.source.parse()?;
                 // The game's own files decide, not ours: a Windows build under
                 // Proton needs the Windows loader, and a Linux server needs the
                 // Linux one even when driven from a Windows desktop.
@@ -3474,25 +3700,17 @@ impl Engine {
                     )));
                 }
 
-                let (releases, _) = self
-                    .fetch(
-                        &source,
-                        &crate::source::modrinth::VersionFilter::default(),
-                        pack,
-                        None,
-                        None,
-                    )
-                    .await?;
+                let releases = self.loader_releases(pack, def, pin).await?;
+                let matchers = asset_matchers(&patterns);
 
-                let matchers: Vec<globset::GlobMatcher> = patterns
-                    .iter()
-                    .filter_map(|p| globset::Glob::new(&p.to_ascii_lowercase()).ok())
-                    .map(|g| g.compile_matcher())
-                    .collect();
-
+                // A held release is taken as named, prerelease or not — it
+                // was chosen. Otherwise the newest stable one.
                 let (release, asset) = releases
                     .iter()
-                    .filter(|r| !r.prerelease)
+                    .filter(|r| match pin {
+                        Some(pin) => r.tag == pin,
+                        None => !r.prerelease,
+                    })
                     .find_map(|r| {
                         r.assets
                             .iter()
@@ -3503,12 +3721,20 @@ impl Engine {
                             .map(|a| (r, a))
                     })
                     .ok_or_else(|| {
-                        Error::NotFound(format!(
-                            "a {} build of {} in {}",
-                            platform.label(),
-                            def.name,
-                            def.source
-                        ))
+                        Error::NotFound(match pin {
+                            Some(pin) => format!(
+                                "a {} build of {} {pin} in {}",
+                                platform.label(),
+                                def.name,
+                                def.source
+                            ),
+                            None => format!(
+                                "a {} build of {} in {}",
+                                platform.label(),
+                                def.name,
+                                def.source
+                            ),
+                        })
                     })?;
 
                 let tmp = self
@@ -3531,37 +3757,54 @@ impl Engine {
                     .map(PathBuf::from)
                     .collect();
 
-                // An instanced profile gets its own loader, in its own folder.
-                // That is the whole mechanism: BepInEx works out where it
-                // lives from where its preloader was loaded from, so a loader
-                // inside the instance takes plugins and configs with it.
+                // The game folder always gets the loader. Activate deploys
+                // there, and a game started from Steam or a shortcut runs
+                // whatever BepInEx sits beside it. Installing it only into the
+                // instance left the folder with a doorstop pointing at a
+                // preloader that was not there: every mod activated, the game
+                // ran vanilla, and only Play worked.
+                let game_dest = def.install_dir(root);
+                std::fs::create_dir_all(&game_dest).ok();
+                let written = crate::store::extract_over(&tmp, &game_dest, &preserve);
+
+                // An instanced profile also gets its own copy, for Play.
+                // BepInEx works out where it lives from where its preloader
+                // was loaded from, so a loader inside the instance takes
+                // plugins and configs with it.
                 let instance = self.instance_for(pack, profile);
-                let dest = match &instance {
-                    Some(dir) => def.install_dir(dir),
-                    None => def.install_dir(root),
+                let instanced = match (&instance, &written) {
+                    (Some(dir), Ok(_)) => {
+                        let dest = def.install_dir(dir);
+                        std::fs::create_dir_all(&dest).ok();
+                        Some(crate::store::extract_over(&tmp, &dest, &preserve))
+                    }
+                    _ => None,
                 };
-                std::fs::create_dir_all(&dest).ok();
-                let written = crate::store::extract_over(&tmp, &dest, &preserve);
                 let _ = std::fs::remove_file(&tmp);
                 let written = written?;
+                // Written down now, because an archive cannot be asked later
+                // which release it came from.
+                crate::loader::write_stamp(&game_dest, &def.id, &release.tag)?;
+                if let Some(result) = instanced {
+                    result?;
+                    if let Some(dir) = &instance {
+                        crate::loader::write_stamp(&def.install_dir(dir), &def.id, &release.tag)?;
+                    }
+                }
 
-                // The injector is the exception and has to sit beside the
-                // executable — the game loads it on startup and will not look
-                // anywhere else. It does nothing unless Modifile launches the
-                // game with redirection switched on, so the install stays
-                // vanilla when started any other way.
-                let mut planted = 0;
+                // The injector only works beside the executable, and the game
+                // folder already has it, so the instance's copy is dropped.
                 if let (Some(dir), Some(rules)) = (&instance, pack.instancing()) {
-                    planted = plant_injector(pack, dir, root, rules)?;
+                    plant_injector(pack, dir, root, rules)?;
                 }
 
                 Ok(format!(
                     "{} for {} ({written} files{})",
                     release.tag,
                     platform.label(),
-                    match planted {
-                        0 => String::new(),
-                        n => format!(", {n} into the game folder"),
+                    match instance {
+                        Some(_) => ", plus a copy in the profile's own folder for Play",
+                        None => "",
                     }
                 ))
             }
@@ -3834,6 +4077,15 @@ fn override_prefixes(plan: &crate::modpack::PackPlan) -> Vec<String> {
         .collect()
 }
 
+/// A loader's asset patterns, compiled for matching release file names.
+fn asset_matchers(patterns: &[String]) -> Vec<globset::GlobMatcher> {
+    patterns
+        .iter()
+        .filter_map(|p| globset::Glob::new(&p.to_ascii_lowercase()).ok())
+        .map(|g| g.compile_matcher())
+        .collect()
+}
+
 fn under_any(rel: &str, prefixes: &[String]) -> bool {
     let lowered = rel.to_ascii_lowercase();
     prefixes.iter().any(|p| lowered.starts_with(p.as_str()))
@@ -3843,10 +4095,9 @@ fn under_any(rel: &str, prefixes: &[String]) -> bool {
 ///
 /// The one thing an instanced profile cannot keep to itself. A doorstop shim
 /// is a DLL the game loads by name at startup, so it has to be beside the
-/// executable; everything it then loads comes from the instance.
-///
-/// It is inert on its own. Started from Steam or a shortcut, the game finds a
-/// doorstop that has not been told to do anything and runs vanilla.
+/// executable; with Play's arguments, everything it then loads comes from the
+/// instance. Started from Steam or a shortcut, it loads the game folder's own
+/// BepInEx instead.
 fn plant_injector(
     pack: &CompiledPack,
     instance: &Path,

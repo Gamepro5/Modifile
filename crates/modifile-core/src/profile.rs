@@ -74,6 +74,13 @@ pub struct Profile {
     /// For games with competing mod loaders, e.g. `fabric`, `forge`, `neoforge`.
     #[serde(default)]
     pub loader: Option<String>,
+    /// Hold the mod loader at an exact release, the way `ModEntry::pin` holds
+    /// a mod. `None` takes the newest build whenever it is installed.
+    ///
+    /// A release tag for an archive loader (`v5.4.23.2`), a loader version
+    /// for Fabric and Quilt (`0.16.10`).
+    #[serde(default)]
+    pub loader_version: Option<String>,
     #[serde(default)]
     pub mods: Vec<ModEntry>,
     /// Obsolete, and read only so an older profile still loads.
@@ -150,6 +157,7 @@ impl Profile {
             roots: BTreeMap::new(),
             game_version: None,
             loader: None,
+            loader_version: None,
             mods: Vec::new(),
             revert_on_exit: false,
         }

@@ -48,6 +48,11 @@ pub struct Bundle {
     pub game_version: Option<String>,
     #[serde(default)]
     pub loader: Option<String>,
+    /// The loader build the exporter was running. Mods are pinned so everyone
+    /// runs the same builds; a loader left to "newest" gives two players two
+    /// different BepInEx releases the moment one ships between installs.
+    #[serde(default)]
+    pub loader_version: Option<String>,
     pub mods: Vec<BundleMod>,
     /// target id -> relative path -> file contents.
     #[serde(default)]
@@ -195,6 +200,9 @@ impl Bundle {
             targets: profile.targets.clone(),
             game_version: profile.game_version.clone(),
             loader: profile.loader.clone(),
+            // An explicit hold here; the engine fills in the installed build
+            // when there is none, as it can see the game and this cannot.
+            loader_version: profile.loader_version.clone(),
             mods: profile
                 .mods
                 .iter()
@@ -228,6 +236,12 @@ impl Bundle {
         // mods refuse to load together.
         profile.game_version = self.game_version.clone();
         profile.loader = self.loader.clone();
+        // Held like the mods are: same pack, same loader build.
+        profile.loader_version = if pin_versions {
+            self.loader_version.clone()
+        } else {
+            None
+        };
         profile.mods = self
             .mods
             .iter()
@@ -368,6 +382,7 @@ mod tests {
             targets: vec!["client".into()],
             game_version: None,
             loader: None,
+            loader_version: None,
             mods: Vec::new(),
             configs,
             exported_by: String::new(),
@@ -404,7 +419,8 @@ mod tests {
             description: String::new(),
             targets: vec!["server".into()],
             game_version: Some("0.217.46".into()),
-            loader: None,
+            loader: Some("bepinex".into()),
+            loader_version: Some("v5.4.23.2".into()),
             mods: vec![BundleMod {
                 id: ModId::github("Grantapher", "ValheimPlus"),
                 enabled: true,
@@ -419,11 +435,15 @@ mod tests {
 
         let pinned = bundle.to_profile("mine", true);
         assert_eq!(pinned.mods[0].pin.as_deref(), Some("0.9.9.15"));
+        // The loader is held with the mods, or two players end up on two
+        // different BepInEx builds.
+        assert_eq!(pinned.loader_version.as_deref(), Some("v5.4.23.2"));
         assert_eq!(pinned.game, "valheim");
         assert_eq!(pinned.name, "mine");
 
         let latest = bundle.to_profile("mine", false);
         assert!(latest.mods[0].pin.is_none());
+        assert!(latest.loader_version.is_none());
     }
 
 }

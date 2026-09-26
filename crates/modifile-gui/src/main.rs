@@ -73,12 +73,13 @@ fn main() -> eframe::Result<()> {
 /// Background threads report terminal states here; progress goes to the log.
 enum Msg {
     Error(String),
-    /// An update finished, with what actually changed.
-    Synced(Vec<SyncOutcome>),
+    /// An update finished, with what actually changed, and a newer loader
+    /// build if there is one.
+    Synced(Vec<SyncOutcome>, Option<Box<modifile_core::engine::LoaderUpdate>>),
     /// A search finished.
     Found(Vec<modifile_core::source::SearchHit>),
     /// One mod's release list arrived, for the version picker.
-    Versions(ModId, Vec<VersionOption>),
+    Versions(PickFor, Vec<VersionOption>),
     /// A repair finished its checksum, re-download and cleanup pass; what is
     /// left is an ordinary install of the files that are now missing.
     Repaired,
@@ -232,12 +233,32 @@ struct ModRow {
     prerelease: bool,
 }
 
-/// The version picker's state: one mod, and what its source publishes.
+/// What the version picker is choosing a version of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickFor {
+    Mod(ModId),
+    /// The profile's mod loader, by display name. Held the same way a mod is,
+    /// because two players on different loader builds is as much a mismatch
+    /// as two on different mod builds.
+    Loader(String),
+}
+
+impl PickFor {
+    fn display(&self) -> String {
+        match self {
+            PickFor::Mod(id) => id.display(),
+            PickFor::Loader(name) => name.clone(),
+        }
+    }
+}
+
+/// The version picker's state: one mod or the loader, and what its source
+/// publishes.
 ///
 /// Fetched on open rather than kept around, because a release list is exactly
 /// the kind of thing that is stale by the time you look at it.
 struct Picker {
-    id: ModId,
+    id: PickFor,
     /// The version this mod is held at, if any, so the list can mark it.
     pinned: Option<String>,
     /// What the profile is actually running right now.
@@ -406,6 +427,11 @@ struct App {
     storage: Option<modifile_core::storage::StorageReport>,
     /// What the last update actually changed.
     last_sync: Vec<SyncOutcome>,
+    /// A newer loader build the last update found. Shown with the results and
+    /// never installed without the confirmation below.
+    loader_update: Option<modifile_core::engine::LoaderUpdate>,
+    /// The "update the loader?" confirmation is open.
+    confirm_loader_update: bool,
 
     add_input: String,
     token_input: String,
@@ -533,6 +559,8 @@ impl App {
             pending_force_undeploy: false,
             storage: None,
             last_sync: Vec::new(),
+            loader_update: None,
+            confirm_loader_update: false,
             add_input: String::new(),
             token_input: token.unwrap_or_default(),
             // Load the saved key like the GitHub token does. Leaving it blank
@@ -741,6 +769,7 @@ impl App {
         self.config_files.clear();
         self.scans.clear();
         self.last_sync.clear();
+        self.loader_update = None;
         self.leftovers = 0;
         self.lock = Lock::default();
     }
@@ -778,6 +807,7 @@ impl App {
         self.scans.clear();
         if switching_profile {
             self.last_sync.clear();
+            self.loader_update = None;
             self.leftovers = 0;
             // Results are for one game's index; they mean nothing for another.
             self.search_results.clear();
@@ -1161,12 +1191,39 @@ impl App {
                 if let Ok(mut list) = manual.lock() {
                     outcomes.append(&mut list);
                 }
-                Ok::<_, modifile_core::Error>(outcomes)
+
+                // The loader is checked too, and only reported: updating it is
+                // offered in the results, behind a confirmation. A failed
+                // check is a log line, not a failed update.
+                let loader = if update {
+                    match engine.loader_update(pack, &profile).await {
+                        Ok(found) => {
+                            if let Some(found) = &found {
+                                push(format!(
+                                    "{} {} is available (you have {})",
+                                    found.name,
+                                    found.newest,
+                                    found.held.as_deref().or(found.installed.as_deref()).unwrap_or(
+                                        modifile_core::loader::UNKNOWN_VERSION
+                                    )
+                                ));
+                            }
+                            found
+                        }
+                        Err(e) => {
+                            push(format!("could not check the mod loader for updates: {e}"));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok::<_, modifile_core::Error>((outcomes, loader))
             });
 
             match result {
-                Ok(outcomes) => {
-                    let _ = tx.send(Msg::Synced(outcomes));
+                Ok((outcomes, loader)) => {
+                    let _ = tx.send(Msg::Synced(outcomes, loader.map(Box::new)));
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(e.to_string()));
@@ -2290,7 +2347,7 @@ impl App {
         };
         let entry = profile.find(id);
         self.picker = Some(Picker {
-            id: id.clone(),
+            id: PickFor::Mod(id.clone()),
             pinned: entry.and_then(|e| e.pin.clone()),
             current: self
                 .lock
@@ -2301,14 +2358,53 @@ impl App {
             loading: true,
         });
 
+        self.fetch_picker_versions(profile, PickFor::Mod(id.clone()));
+    }
+
+    /// Open the version picker for the profile's mod loader.
+    fn open_loader_picker(&mut self) {
+        use modifile_core::loader::LoaderState;
+
+        let Some(profile) = self.current_profile() else {
+            return;
+        };
+        let Some((def, state, _)) = &self.loader_state else {
+            return;
+        };
+        let current = match state {
+            LoaderState::Installed { version }
+            | LoaderState::WrongVersion { version }
+            | LoaderState::OtherVersion {
+                installed: version, ..
+            } => version.clone(),
+            _ => "—".into(),
+        };
+        let id = PickFor::Loader(def.name.clone());
+        self.picker = Some(Picker {
+            id: id.clone(),
+            pinned: profile.loader_version.clone(),
+            current,
+            versions: Vec::new(),
+            loading: true,
+        });
+        self.fetch_picker_versions(profile, id);
+    }
+
+    /// Ask the source for the picker's list, off the UI thread.
+    fn fetch_picker_versions(&mut self, profile: Profile, id: PickFor) {
         let paths = self.paths.clone();
         let tx = self.tx.clone();
-        let id = id.clone();
         let handle = self.runtime.handle().clone();
         std::thread::spawn(move || {
             let result = handle.block_on(async {
                 let engine = Engine::open(paths.clone(), load_token(&paths))?;
-                engine.versions(&profile, &id).await
+                match &id {
+                    PickFor::Mod(mod_id) => engine.versions(&profile, mod_id).await,
+                    PickFor::Loader(_) => {
+                        let pack = engine.pack_for(&profile)?;
+                        engine.loader_versions(pack, &profile).await
+                    }
+                }
             });
             match result {
                 Ok(versions) => {
@@ -2390,6 +2486,7 @@ impl App {
                 self.lock = Lock::default();
                 self.rows.clear();
                 self.last_sync.clear();
+                self.loader_update = None;
                 self.show_delete = false;
                 self.delete_input.clear();
                 self.reload_profiles();
@@ -2838,9 +2935,10 @@ impl eframe::App for App {
                     self.busy = false;
                     self.log_line(format!("error: {e}"));
                 }
-                Msg::Synced(outcomes) => {
+                Msg::Synced(outcomes, loader) => {
                     self.busy = false;
                     self.last_sync = outcomes;
+                    self.loader_update = loader.map(|l| *l);
                     self.refresh();
                 }
                 Msg::Done => {
@@ -2985,6 +3083,10 @@ impl eframe::App for App {
         if self.show_loader_install {
             let ctx = ui.ctx().clone();
             self.loader_window(&ctx);
+        }
+        if self.confirm_loader_update {
+            let ctx = ui.ctx().clone();
+            self.loader_update_window(&ctx);
         }
         if self.show_modpack_link {
             let ctx = ui.ctx().clone();
@@ -3633,6 +3735,7 @@ impl App {
             || (rules.needs_game_version && profile.game_version.is_none());
         let mut set_loader: Option<String> = None;
         let mut commit_version = false;
+        let mut open_loader_picker = false;
 
         ui.label(
             egui::RichText::new(if rules.applies() {
@@ -3726,6 +3829,13 @@ impl App {
                                 format!("{} {version} is installed — wrong game version", def.name),
                                 theme::WARN,
                             ),
+                            LoaderState::OtherVersion { installed, wanted } => (
+                                format!(
+                                    "{} {installed} is installed — this profile holds {wanted}",
+                                    def.name
+                                ),
+                                theme::WARN,
+                            ),
                             LoaderState::NotInstalled => {
                                 (format!("{} is not installed", def.name), theme::WARN)
                             }
@@ -3735,6 +3845,15 @@ impl App {
                             ),
                         };
                         ui.label(egui::RichText::new(text).color(colour));
+                        if let (Some(held), LoaderState::Installed { .. }) =
+                            (&profile.loader_version, state)
+                        {
+                            ui.label(
+                                egui::RichText::new(format!("held at {held}"))
+                                    .small()
+                                    .color(theme::MUTED),
+                            );
+                        }
 
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -3744,14 +3863,36 @@ impl App {
                                 }
                                 LoaderState::Installed { .. } => {
                                     if ui
+                                        .small_button("Version…")
+                                        .on_hover_text(
+                                            "Choose which build of the loader this profile \
+                                             runs, or follow the newest",
+                                        )
+                                        .clicked()
+                                    {
+                                        open_loader_picker = true;
+                                    }
+                                    if ui
                                         .small_button("Reinstall")
-                                        .on_hover_text("Fetch the newest build of the loader")
+                                        .on_hover_text(match &profile.loader_version {
+                                            Some(held) => format!("Fetch {held} again"),
+                                            None => {
+                                                "Fetch the newest build of the loader".to_string()
+                                            }
+                                        })
                                         .clicked()
                                     {
                                         self.show_loader_install = true;
                                     }
                                 }
                                 _ => {
+                                    if ui
+                                        .small_button("Version…")
+                                        .on_hover_text("Choose which build to install")
+                                        .clicked()
+                                    {
+                                        open_loader_picker = true;
+                                    }
                                     if ui
                                         .button(format!("Install {}", def.name))
                                         .on_hover_text(
@@ -3774,6 +3915,9 @@ impl App {
         if std::mem::take(&mut self.pending_install_loader) {
             let ctx = ui.ctx().clone();
             self.do_install_loader(&ctx);
+        }
+        if open_loader_picker {
+            self.open_loader_picker();
         }
         if let Some(loader) = set_loader {
             self.set_profile_versions(Some(loader), None);
@@ -3864,14 +4008,29 @@ impl App {
         self.refresh();
     }
 
+    /// Hold the loader at one build, or `None` to follow the newest.
+    fn set_loader_version(&mut self, version: Option<String>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let path = self.paths.profile_file(&name);
+        if let Ok(mut profile) = Profile::load(&path) {
+            profile.loader_version = version;
+            let _ = profile.save(&path);
+        }
+        self.refresh();
+    }
+
     /// The result of the last update, as a table.
     ///
     /// "What changed" is the whole reason to press the button, and reading it
     /// out of a scrolling log is no way to find out.
     fn last_update_section(&mut self, ui: &mut egui::Ui) {
-        if self.last_sync.is_empty() {
+        if self.last_sync.is_empty() && self.loader_update.is_none() {
             return;
         }
+        let mut review_loader = false;
+        let mut pick_loader = false;
         let updated = self.count_kind(OutcomeKind::Updated);
         let new = self.count_kind(OutcomeKind::New);
         let failed = self.count_kind(OutcomeKind::Failed);
@@ -3959,6 +4118,54 @@ impl App {
                 }
                 ui.add_space(4.0);
 
+                // The loader gets a row of its own, and a button rather than
+                // an update. Everything else here was already downloaded;
+                // this one waits for a yes.
+                if let Some(found) = &self.loader_update {
+                    let have = found
+                        .held
+                        .as_deref()
+                        .or(found.installed.as_deref())
+                        .unwrap_or(modifile_core::loader::UNKNOWN_VERSION);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&found.name).strong());
+                        ui.label(
+                            egui::RichText::new("mod loader").small().color(theme::MUTED),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if found.held.is_some() {
+                                if ui
+                                    .small_button("Version…")
+                                    .on_hover_text(
+                                        "This profile holds the loader at a chosen build. \
+                                         Choose another, or follow the newest.",
+                                    )
+                                    .clicked()
+                                {
+                                    pick_loader = true;
+                                }
+                            } else if ui
+                                .small_button("Update…")
+                                .on_hover_text("Review the loader update before installing it")
+                                .clicked()
+                            {
+                                review_loader = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{have} → {}{}",
+                                    found.newest,
+                                    if found.held.is_some() { "  (held)" } else { "" }
+                                ))
+                                .monospace()
+                                .small()
+                                .color(theme::WARN),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+
                 // Changes first — the unchanged ones are noise here.
                 let mut rows: Vec<&SyncOutcome> = self.last_sync.iter().collect();
                 rows.sort_by_key(|o| match o.kind {
@@ -4020,8 +4227,97 @@ impl App {
             let ctx = ui.ctx().clone();
             self.unpin_all(&ctx);
         }
+        if review_loader {
+            self.confirm_loader_update = true;
+        }
+        if pick_loader {
+            self.open_loader_picker();
+        }
         if dismiss {
             self.last_sync.clear();
+            self.loader_update = None;
+        }
+    }
+
+    /// Confirm a loader update before it happens.
+    ///
+    /// Mod updates download on Check for updates; the loader does not, because
+    /// it is what every mod runs on and everyone in a lobby wants the same
+    /// build. Taking one is a choice, so it is asked for.
+    fn loader_update_window(&mut self, ctx: &egui::Context) {
+        let Some(found) = self.loader_update.clone() else {
+            self.confirm_loader_update = false;
+            return;
+        };
+        let have = found
+            .installed
+            .clone()
+            .unwrap_or_else(|| modifile_core::loader::UNKNOWN_VERSION.to_string());
+        let mut open = true;
+        let mut update = false;
+        let mut cancel = false;
+
+        egui::Window::new(format!("Update {}?", found.name))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{have}  →  {}", found.newest))
+                        .monospace()
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} is what every mod in this profile runs on. Everyone you play \
+                         with should be on the same build — if you update, export the \
+                         profile again so they get it too.",
+                        found.name
+                    ))
+                    .color(theme::MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "This replaces the loader in the game folder. Config files you \
+                         have edited are kept.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(format!("Update to {}", found.newest))
+                                .fill(theme::ACCENT_DIM),
+                        )
+                        .clicked()
+                    {
+                        update = true;
+                    }
+                    if ui.button("Not now").clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        if update {
+            self.confirm_loader_update = false;
+            if self.busy {
+                self.log_line("Update the loader when the current job finishes.");
+                return;
+            }
+            // The profile holds no build (a held loader is never offered
+            // here), so installing takes the newest.
+            self.loader_update = None;
+            self.do_install_loader(ctx);
+        } else if cancel || !open {
+            self.confirm_loader_update = false;
         }
     }
 
@@ -6650,8 +6946,23 @@ impl App {
                 });
             });
 
-        if let Some(pin) = chosen {
-            self.edit_entry(&id, |entry| entry.pin = pin.clone());
+        if let (Some(pin), PickFor::Loader(name)) = (&chosen, &id) {
+            self.set_loader_version(pin.clone());
+            // Whatever the last check offered has just been answered.
+            self.loader_update = None;
+            match pin {
+                Some(tag) => self.log_line(format!("{name} held at {tag}.")),
+                None => self.log_line(format!("{name} will take the newest release.")),
+            }
+            // Picking a version is asking for it, same as for a mod.
+            if self.busy {
+                self.log_line("Press Install on the loader when the current job finishes.");
+            } else {
+                self.do_install_loader(ctx);
+            }
+            self.picker = None;
+        } else if let (Some(pin), PickFor::Mod(id)) = (chosen, &id) {
+            self.edit_entry(id, |entry| entry.pin = pin.clone());
             // Picking a version is asking for it, so go and get it — and, for
             // an active profile, put it in the game. Only a specific version
             // is a plain download; "take the newest" has to ask for updates.
@@ -6739,6 +7050,16 @@ impl App {
                                         egui::RichText::new(format!("{version} — wrong version"))
                                             .small()
                                             .color(theme::WARN),
+                                    );
+                                }
+                                LoaderState::OtherVersion { installed, wanted } => {
+                                    anything_to_do = true;
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{installed} — profile holds {wanted}"
+                                        ))
+                                        .small()
+                                        .color(theme::WARN),
                                     );
                                 }
                                 LoaderState::NotInstalled => {

@@ -23,8 +23,9 @@ page = "https://github.com/BepInEx/BepInEx/releases"
 windows_assets = ["bepinex_win_x64_*.zip", "bepinex_x64_*.zip"]
 linux_assets = ["bepinex_linux_x64_*.zip", "bepinex_unix_x64_*.zip"]
 macos_assets = ["bepinex_macos_x64_*.zip", "bepinex_unix_x64_*.zip"]
-# Any one of these means it is already laid over the game.
-markers = ["BepInEx/core/BepInEx.dll", "winhttp.dll", "run_bepinex.sh", "doorstop_config.ini"]
+# Only BepInEx itself means it is laid over the game. The doorstop shim is
+# left behind on its own by a Play-only install, and loads nothing.
+markers = ["BepInEx/core/BepInEx.dll"]
 
 # Valheim can be pointed at a mod folder that is not its own, so Play gives
 # each profile a real instance and never modifies the game directory. See the
