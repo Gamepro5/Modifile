@@ -93,6 +93,29 @@ if ($doWindows) {
     Say "Packaging $name.zip"
     Compress-Archive -Path $stage -DestinationPath $zip
     Remove-Item -Recurse -Force $stage
+
+    # The installer (Start menu, Settings -> Apps, PATH) when NSIS is around.
+    # Optional: the zip is a complete release on its own, and the workflow
+    # builds the installer regardless.
+    if (-not $CliOnly) {
+        $makensis = Get-Command makensis -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+        if (-not $makensis) {
+            $makensis = @(
+                "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+                "$env:ProgramFiles\NSIS\makensis.exe",
+                "$env:LOCALAPPDATA\tauri\NSIS\makensis.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
+        if ($makensis) {
+            $setup = Join-Path $OutDir "$name-setup.exe"
+            Say "Building $name-setup.exe"
+            # Quoted: bare, PowerShell splits -DVERSION=1.2.3 at the first dot.
+            & $makensis -V2 "-DVERSION=$version" "-DOUTFILE=$setup" (Join-Path $root 'installer\modifile.nsi')
+            if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+        } else {
+            Warn "NSIS not found, so no installer this time. Install it with 'winget install NSIS.NSIS'."
+        }
+    }
 }
 
 # ------------------------------------------------------ Linux, through WSL ---

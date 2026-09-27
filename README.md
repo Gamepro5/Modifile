@@ -29,11 +29,23 @@ Two binaries, no runtime dependencies:
 
 ## Download
 
-Prebuilt archives for Windows and Linux are on the
-[releases page](https://github.com/Gamepro5/modifile/releases). Each one holds
-both binaries and depends on nothing else — unpack it and run. The Linux build
-is made on Ubuntu 22.04, so glibc 2.35 or newer is enough. Verify a download
+Prebuilt releases for Windows and Linux are on the
+[releases page](https://github.com/Gamepro5/modifile/releases):
+
+| file | for |
+|---|---|
+| `…-x86_64-windows-setup.exe` | Windows — installs Modifile for your user (no admin prompt), adds it to the Start menu and Windows search, puts `modifile` on your PATH, and registers it under **Settings → Apps** so it can be uninstalled like anything else |
+| `…-x86_64-windows.zip` | Windows, portable — unpack anywhere and run |
+| `…-x86_64-linux.tar.gz` | Linux — unpack and run |
+
+The archives hold both binaries and depend on nothing else. The Linux build is
+made on Ubuntu 22.04, so glibc 2.35 or newer is enough. Verify a download
 against `SHA256SUMS.txt` if you like.
+
+Installed or unzipped, Modifile updates itself the same way (see
+[Modifile updates itself](#modifile-updates-itself)). Uninstalling removes the program, its
+shortcuts and its PATH entry, and nothing else: your profiles, downloads and
+settings in `%APPDATA%\modifile` stay, as do mods already deployed into games.
 
 Or build it yourself; see [Building](#building).
 

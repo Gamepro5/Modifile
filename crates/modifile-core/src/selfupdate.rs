@@ -377,6 +377,57 @@ fn swap(new_path: &Path, target: &Path) -> Result<bool> {
     Ok(std::fs::remove_file(&parked).is_err())
 }
 
+/// Keep Settings → Apps honest after an update.
+///
+/// The Windows installer registers Modifile under the current user's Uninstall
+/// key along with the version it installed. An update replaces the binaries in
+/// place without going through the installer, so without this the entry would
+/// show the first version installed for ever.
+///
+/// Only touched when that entry points at `dir`: a loose unzipped copy
+/// somewhere else has no business rewriting an installed one's record. Goes
+/// through `reg.exe` rather than a registry crate — two calls, once per update,
+/// are not worth a dependency. Silent on any failure; this is bookkeeping.
+#[cfg(windows)]
+pub fn record_installed_version(dir: &Path, version: &str) {
+    use std::os::windows::process::CommandExt;
+    // Otherwise every call flashes a console window over the GUI.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Modifile";
+
+    let reg = |args: &[&str]| {
+        std::process::Command::new("reg.exe")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+    };
+
+    // "    InstallLocation    REG_SZ    C:\Users\...\Modifile"
+    let Some(out) = reg(&["query", KEY, "/v", "InstallLocation"]) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(location) = text
+        .lines()
+        .find_map(|line| line.split_once("REG_SZ").map(|(_, v)| v.trim().trim_matches('"')))
+    else {
+        return;
+    };
+    let same = match (std::fs::canonicalize(location), std::fs::canonicalize(dir)) {
+        (Ok(a), Ok(b)) => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
+        _ => false,
+    };
+    if same {
+        reg(&["add", KEY, "/v", "DisplayVersion", "/t", "REG_SZ", "/d", version, "/f"]);
+    }
+}
+
+/// Nothing to record: only the Windows installer registers anything.
+#[cfg(not(windows))]
+pub fn record_installed_version(_dir: &Path, _version: &str) {}
+
 /// Delete binaries parked aside by a previous update.
 ///
 /// Called at startup. Silent: a leftover that cannot be removed yet is not

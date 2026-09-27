@@ -2433,6 +2433,9 @@ impl Engine {
         let report = crate::selfupdate::apply(&archive, &dir);
         // The archive is large and has done its job either way.
         let _ = std::fs::remove_file(&archive);
+        if report.is_ok() {
+            crate::selfupdate::record_installed_version(&dir, &available.version);
+        }
         report
     }
 

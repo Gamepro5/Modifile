@@ -230,6 +230,45 @@ jobs:
           rm -rf "${name}"
           ls -l
 
+      # The zip is for people who want a portable copy and for self-update,
+      # which replaces binaries in place from it. The installer is for everyone
+      # else: it puts Modifile in the Start menu (and so in Windows search),
+      # registers an uninstaller under Settings -> Apps, and adds the CLI to
+      # PATH. It installs per-user into a folder the user can write to, so
+      # self-update keeps working on an installed copy exactly as on an
+      # unzipped one.
+      #
+      # Its name has no .zip/.tar.gz on the end, so self-update never mistakes
+      # it for the archive it should download.
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          version=$(echo "${tag#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
+
+          # NSIS ships on some runner images and not others; install it when
+          # it is missing rather than depending on which image this lands on.
+          makensis=$(command -v makensis || true)
+          for candidate in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do
+            [ -z "$makensis" ] && [ -x "$candidate" ] && makensis="$candidate"
+          done
+          if [ -z "$makensis" ]; then
+            choco install nsis -y --no-progress
+            makensis="/c/Program Files (x86)/NSIS/makensis.exe"
+          fi
+          "$makensis" -VERSION
+
+          # -D rather than /D: Git Bash rewrites arguments that start with a
+          # slash into Windows paths. makensis runs from the script's own
+          # folder, so the output path is relative to installer/.
+          "$makensis" -V2 \
+            "-DVERSION=$version" \
+            "-DOUTFILE=..\\dist\\modifile-${tag}-x86_64-windows-setup.exe" \
+            installer/modifile.nsi
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
