@@ -58,6 +58,16 @@ pub enum Error {
     )]
     RemoteUnverifiable { target: String, path: String },
 
+    /// The saved game folder is gone — the game was moved, uninstalled, or
+    /// lives on a drive that is not mounted. Deploying anyway would rebuild
+    /// the whole tree from scratch in the old location, which at best litters
+    /// a dead path and under Program Files fails with "access denied".
+    #[error(
+        "{target}'s folder no longer exists ({path}). If the game moved, set its new \
+         location, then try again."
+    )]
+    RootMissing { target: String, path: String },
+
     #[error("{0}")]
     Other(String),
 

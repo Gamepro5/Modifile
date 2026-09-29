@@ -1395,6 +1395,12 @@ impl Engine {
         options: DeployOptions,
     ) -> Result<DeployReport> {
         let profile_name = profile.name.as_str();
+        if !plan.root.is_dir() {
+            return Err(Error::RootMissing {
+                target: target.name.clone(),
+                path: plan.root.display().to_string(),
+            });
+        }
         Self::require_closed(pack, target, &plan.root, options)?;
         let previous = self.manifest(&plan.game, &plan.target)?;
         let state_dirs = pack.state_dirs(target, &plan.root);
