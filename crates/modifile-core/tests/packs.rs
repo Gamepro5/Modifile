@@ -29,6 +29,14 @@ fn every_bundled_pack_loads() {
 
 // --- World of Warcraft ----------------------------------------------------
 
+/// Every bundled WoW game, in bundling order.
+const WOW_PACKS: [&str; 4] = [
+    "wow.toml",
+    "wow-classic-era.toml",
+    "wow-classic.toml",
+    "wow-forever.toml",
+];
+
 #[test]
 fn wow_retail_refuses_classic_builds() {
     let wow = pack("wow.toml");
@@ -47,6 +55,39 @@ fn wow_classic_era_prefers_its_own_flavor() {
 
     let chosen = era.select_asset(&assets, classic).expect("classic asset");
     assert_eq!(assets[chosen], "WeakAuras-5.20.1-classic.zip");
+}
+
+#[test]
+fn wow_forever_prefers_its_own_flavor() {
+    let forever = pack("wow-forever.toml");
+    let client = forever.target("client").unwrap();
+    let assets = names(&[
+        "BigWigs-v427.9-classic.zip",
+        "BigWigs-v427.9-forever.zip",
+        "BigWigs-v427.9-mists.zip",
+        "BigWigs-v427.9.zip",
+    ]);
+
+    let chosen = forever.select_asset(&assets, client).expect("forever asset");
+    assert_eq!(assets[chosen], "BigWigs-v427.9-forever.zip");
+
+    // An addon with one multi-TOC zip for every flavor still installs.
+    let single = names(&["Questie-11.0.0-classic.zip", "Questie-11.0.0.zip"]);
+    let chosen = forever.select_asset(&single, client).expect("unsuffixed zip");
+    assert_eq!(single[chosen], "Questie-11.0.0.zip");
+}
+
+#[test]
+fn other_wow_games_refuse_forever_builds() {
+    // `-forever.zip` sorts before the unsuffixed retail zip, so without the
+    // reject, Retail would pick the Forever build of any addon that ships one.
+    let assets = names(&["BigWigs-v427.9-forever.zip", "BigWigs-v427.9.zip"]);
+    for name in ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"] {
+        let p = pack(name);
+        let client = p.target("client").unwrap();
+        let chosen = p.select_asset(&assets, client).expect("an asset");
+        assert_eq!(assets[chosen], "BigWigs-v427.9.zip", "{name}");
+    }
 }
 
 #[test]
@@ -91,19 +132,20 @@ fn wow_ignores_root_level_readmes() {
 
 #[test]
 fn wow_flavors_are_separate_games() {
-    // Retail, Classic Era and progression Classic target different APIs, and an
-    // addon built for one will not run on another. Modelling them as targets of
-    // one game let a single profile install the same addon list into all three.
-    let ids: Vec<&str> = ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"]
+    // Retail, Classic Era, progression Classic and Forever target different
+    // APIs, and an addon built for one will not run on another. Modelling them
+    // as targets of one game let a single profile install the same addon list
+    // into all of them.
+    let ids: Vec<&str> = WOW_PACKS
         .iter()
         .map(|n| {
             let p = pack(n);
             Box::leak(p.pack.game.id.clone().into_boxed_str()) as &str
         })
         .collect();
-    assert_eq!(ids, vec!["wow", "wow-classic-era", "wow-classic"]);
+    assert_eq!(ids, vec!["wow", "wow-classic-era", "wow-classic", "wow-forever"]);
 
-    for name in ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"] {
+    for name in WOW_PACKS {
         let p = pack(name);
         assert_eq!(
             p.pack.targets.len(),
@@ -117,7 +159,7 @@ fn wow_flavors_are_separate_games() {
 fn wow_allows_changes_while_the_game_runs() {
     // Addons are Lua read at load time, so blocking mid-session is nuisance
     // rather than safety. Valheim is the opposite: its plugins are mapped DLLs.
-    for name in ["wow.toml", "wow-classic-era.toml", "wow-classic.toml"] {
+    for name in WOW_PACKS {
         assert!(
             pack(name).pack.running.allow_changes,
             "{name} should allow mod changes while running"
@@ -578,7 +620,7 @@ fn games_that_can_be_instanced_say_so() {
             "{name} should declare how it can be instanced"
         );
     }
-    for name in ["wow.toml", "wow-classic.toml", "wow-classic-era.toml"] {
+    for name in WOW_PACKS {
         assert!(
             pack(name).instancing().is_none(),
             "{name} reads addons from one fixed place and must not claim otherwise"

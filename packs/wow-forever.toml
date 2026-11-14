@@ -1,0 +1,67 @@
+schema = 1
+
+[game]
+id = "wow-forever"
+name = "WoW Forever"
+description = """
+World of Warcraft: Forever, the permanent vanilla-setting game Blizzard runs
+alongside Retail and Classic. It is a separate game in Modifile, not a flavor of
+one, because its addons target their own API (interface 16xxx) and builds for
+Retail or Classic will not run on it."""
+maintainers = ["bundled"]
+
+# Addons are plain Lua read at load time — nothing holds the files open, and
+# /reload picks up changes. So unlike a BepInEx game, mods can be installed
+# while WoW is running.
+[running]
+allow_changes = true
+note = "WoW is running. Type /reload in game to pick up the change."
+
+[search]
+github_topics = ["wow-addon", "wowaddon", "world-of-warcraft", "wow-forever"]
+github_terms = ["wow", "forever", "addon"]
+
+# CurseForge addresses projects by number; this is how a slug from a URL
+# gets resolved to one.
+curseforge_game_id = 1
+
+[paths]
+addons = "Interface/AddOns"
+wtf = "WTF"
+
+[assets]
+# The BigWigs packager names Forever builds `<Name>-<version>-forever.zip`. Its
+# per-addon TOC for Forever is `_Camelot.toc`, which lives inside the zip and
+# needs nothing from here.
+prefer = ["*-{flavor}.zip", "*-{flavor}-*.zip", "*_{flavor}.zip"]
+accept = ["*.zip"]
+reject = ["*nolib*", "*sources*", "*-src*", "*.pdb", "*.asc", "*.sig", "*debug*"]
+unpack = ["*.zip"]
+
+[[install]]
+match = "*/**"
+into = "addons"
+
+[[targets]]
+id = "client"
+name = "Forever"
+kind = "client"
+flavor = "forever"
+# Blizzard ships the same Wow.exe in `_forever_` as in `_retail_`. WowF.exe is
+# accepted in case a build is ever named after the product code (`wowf`).
+markers = ["Wow.exe", "WowF.exe", "World of Warcraft.app"]
+# Process matching is scoped to the chosen folder, so sharing Wow.exe with a
+# running Retail client does not make this one look busy.
+processes = ["Wow.exe", "WowF.exe"]
+launch = ["Wow.exe", "WowF.exe", "World of Warcraft.app"]
+# Every other flavor's build. Forever shares the modern client family with
+# Retail, but its interface number does not, so mainline builds are out too.
+asset_reject = [
+  "*-mainline*", "*-classic*", "*-vanilla*", "*-bcc*", "*-tbc*",
+  "*-wrath*", "*-wotlk*", "*-cata*", "*-mop*", "*-mists*",
+]
+candidates = [
+  "${ProgramFiles(x86)}/World of Warcraft/_forever_",
+  "${ProgramFiles}/World of Warcraft/_forever_",
+  "${HOME}/Games/world-of-warcraft/drive_c/Program Files (x86)/World of Warcraft/_forever_",
+]

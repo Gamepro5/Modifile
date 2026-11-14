@@ -49,7 +49,7 @@ flavor = "mists"
 markers = ["WowClassic.exe"]
 processes = ["WowClassic.exe"]
 launch = ["WowClassic.exe"]
-asset_reject = ["*-mainline*", "*-vanilla*"]
+asset_reject = ["*-mainline*", "*-vanilla*", "*-forever*"]
 candidates = [
   "${ProgramFiles(x86)}/World of Warcraft/_classic_",
   "${ProgramFiles}/World of Warcraft/_classic_",

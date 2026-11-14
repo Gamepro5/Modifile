@@ -7,9 +7,9 @@ description = """
 Addons are folders of Lua under Interface/AddOns. Because the shipped artifact
 is the source, every addon installed here reaches the `readable source` rung —
 you can open any file and read exactly what will run.
-Retail, Classic Era and progression Classic are separate games in Modifile, not
-flavors of one, because their addons are not interchangeable: they target
-different APIs and an addon built for one will not run on another."""
+Retail, Classic Era, progression Classic and Forever are separate games in
+Modifile, not flavors of one, because their addons are not interchangeable: they
+target different APIs and an addon built for one will not run on another."""
 maintainers = ["bundled"]
 # WoW is not on Steam, so there is no app id to derive art from. This is the
 # game's own icon, on a content-addressed URL — the path is a hash of the
@@ -75,7 +75,7 @@ launch = ["Wow.exe", "World of Warcraft.app"]
 # Refuse every other flavor's build.
 asset_reject = [
   "*-classic*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",
-  "*-cata*", "*-mop*", "*-mists*", "*-vanilla*",
+  "*-cata*", "*-mop*", "*-mists*", "*-vanilla*", "*-forever*",
 ]
 candidates = [
   "${ProgramFiles(x86)}/World of Warcraft/_retail_",

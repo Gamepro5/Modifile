@@ -49,7 +49,7 @@ launch = ["WowClassic.exe"]
 # Everything that is not vanilla.
 asset_reject = [
   "*-mainline*", "*-bcc*", "*-tbc*", "*-wrath*", "*-wotlk*",
-  "*-cata*", "*-mop*", "*-mists*",
+  "*-cata*", "*-mop*", "*-mists*", "*-forever*",
 ]
 candidates = [
   "${ProgramFiles(x86)}/World of Warcraft/_classic_era_",

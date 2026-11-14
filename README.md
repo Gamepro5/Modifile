@@ -234,7 +234,8 @@ it has to start with a digit or a `v`.
 
 ## Supported games
 
-Bundled packs: **World of Warcraft** (retail, Classic Era, progression Classic),
+Bundled packs: **World of Warcraft** (retail, Classic Era, progression Classic,
+Forever),
 **Valheim** (client + dedicated server), **Minecraft** (client + dedicated
 server), **R.E.P.O.** Adding a game means writing a TOML file, not recompiling.
 

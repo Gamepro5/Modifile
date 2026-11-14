@@ -58,6 +58,10 @@ pub const BUNDLED_PACKS: &[(&str, &str)] = &[
         "wow-classic.toml",
         include_str!("../../../packs/wow-classic.toml"),
     ),
+    (
+        "wow-forever.toml",
+        include_str!("../../../packs/wow-forever.toml"),
+    ),
     ("valheim.toml", include_str!("../../../packs/valheim.toml")),
     ("repo.toml", include_str!("../../../packs/repo.toml")),
     ("minecraft.toml", include_str!("../../../packs/minecraft.toml")),
