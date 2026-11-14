@@ -303,11 +303,27 @@ impl GitHub {
 
     /// Whether a repository publishes release assets at all — the difference
     /// between "found it" and "can install it".
-    pub async fn has_releases(&self, id: &ModId) -> bool {
-        self.releases(id)
-            .await
-            .map(|r| r.iter().any(|rel| !rel.assets.is_empty()))
-            .unwrap_or(false)
+    ///
+    /// `None` means the repository itself is gone. GitHub's search index lags
+    /// deletions and renames by a long way, so search keeps returning repos
+    /// that 404 — `Auctionator/Auctionator` did — and those are not "a mod with
+    /// nothing to download", they are not a mod at all.
+    ///
+    /// A failed lookup is an error, not `false`. Folding the two together
+    /// marked every result "not downloadable" the moment a search ran GitHub's
+    /// anonymous rate limit dry — a claim about the mod that was really a fact
+    /// about our request budget.
+    pub async fn has_releases(&self, id: &ModId) -> Result<Option<bool>> {
+        // Same URL as `releases`, so the two share a cache entry.
+        let url = format!(
+            "{API}/repos/{}/{}/releases?per_page={RELEASE_WINDOW}",
+            id.owner, id.repo
+        );
+        let Some(mut wire) = self.http.get_json::<Vec<WireRelease>>(&url).await? else {
+            return Ok(None);
+        };
+        self.confirm_empty_assets(id, &mut wire).await;
+        Ok(Some(wire.iter().any(|r| !r.draft && !r.assets.is_empty())))
     }
 
     pub async fn repo(&self, id: &ModId) -> Result<Option<RepoInfo>> {

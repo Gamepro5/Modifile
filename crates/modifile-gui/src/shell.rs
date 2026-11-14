@@ -906,6 +906,7 @@ impl App {
         // process list, which is far too expensive to do once per card per
         // frame.
         let running = self.game_info(game).and_then(|g| g.running.clone());
+        let live_note = self.game_info(game).and_then(|g| g.live_note.clone());
 
         for entry in &entries {
             // Last frame's hover state; see `card_frame_hovered`.
@@ -963,11 +964,19 @@ impl App {
                                 // "in game" used to mean the first and was
                                 // read as the second.
                                 if let Some(found) = &running {
-                                    theme::badge(ui, "game open", theme::WARN)
-                                        .on_hover_text(format!(
-                                            "{found}. Mods cannot be changed until it \
-                                             closes."
-                                        ));
+                                    match &live_note {
+                                        Some(note) => {
+                                            theme::badge(ui, "game open", theme::MUTED)
+                                                .on_hover_text(format!("{found}. {note}"));
+                                        }
+                                        None => {
+                                            theme::badge(ui, "game open", theme::WARN)
+                                                .on_hover_text(format!(
+                                                    "{found}. Mods cannot be changed until \
+                                                     it closes."
+                                                ));
+                                        }
+                                    }
                                 }
                                 if entry.active {
                                     theme::badge(ui, "mods installed", theme::GOOD)

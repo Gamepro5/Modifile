@@ -3876,10 +3876,22 @@ impl Engine {
 
             // "Found it" and "can install it" are different answers, and the
             // second is the one that matters.
+            // A lookup that fails leaves the answer unknown (`None`) rather
+            // than "not installable"; once the rate limit is spent, the rest
+            // are left unchecked instead of each spending a doomed request.
+            // A repository that 404s is a stale search-index entry and is
+            // dropped: there is nothing behind it to show.
             if check_installable {
+                let mut gone = Vec::new();
                 for hit in found.iter_mut() {
-                    hit.installable = Some(self.github.has_releases(&hit.id).await);
+                    match self.github.has_releases(&hit.id).await {
+                        Ok(Some(has)) => hit.installable = Some(has),
+                        Ok(None) => gone.push(hit.id.clone()),
+                        Err(Error::RateLimited { .. }) => break,
+                        Err(_) => {}
+                    }
                 }
+                found.retain(|hit| !gone.contains(&hit.id));
             }
             hits.extend(found);
         }

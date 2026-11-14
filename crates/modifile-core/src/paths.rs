@@ -159,6 +159,12 @@ impl Paths {
         self.home.join("no-artwork")
     }
 
+    /// The window's text size, as a plain number (`1.25` is 125%). Absent
+    /// means 100%, so the default leaves no file behind.
+    pub fn text_scale_file(&self) -> PathBuf {
+        self.home.join("text-scale")
+    }
+
     pub fn http_cache(&self) -> PathBuf {
         self.cache.join("http")
     }

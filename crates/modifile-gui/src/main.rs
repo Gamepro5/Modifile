@@ -65,7 +65,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            let mut app = App::new();
+            if let Some(scale) = load_text_scale(&app.paths) {
+                cc.egui_ctx.set_zoom_factor(scale);
+                app.saved_text_scale = scale;
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -306,10 +311,61 @@ struct TargetRow {
     /// True when the path came from the user rather than autodetection.
     remembered: bool,
     deployed: Option<(String, usize, Option<LinkMode>)>,
-    /// Set while the game is running; mod changes are refused until it closes.
+    /// Set while the game is running. Whether that refuses mod changes is
+    /// `live_note`'s business, not this field's.
     running: Option<String>,
+    /// The pack allows changes mid-session (WoW: addons are Lua read at load
+    /// time). Holds what to tell the user instead of refusing.
+    live_note: Option<String>,
     /// A folder on another machine, whose processes we cannot see.
     remote: bool,
+}
+
+impl TargetRow {
+    /// Running in a way that refuses mod changes — the engine's rule, so the
+    /// buttons agree with what pressing them would do.
+    fn blocking(&self) -> Option<&String> {
+        self.running.as_ref().filter(|_| self.live_note.is_none())
+    }
+}
+
+/// Text size bounds. Below 75% text stops being readable; above 200% the
+/// sidebar and a profile page no longer fit side by side on a laptop screen.
+const TEXT_SCALE_MIN: f32 = 0.75;
+const TEXT_SCALE_MAX: f32 = 2.0;
+
+/// The saved text size, if one was saved. A hand-edited file holding nonsense
+/// is ignored rather than trusted.
+fn load_text_scale(paths: &modifile_core::Paths) -> Option<f32> {
+    std::fs::read_to_string(paths.text_scale_file())
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|s| s.is_finite())
+        .map(|s| s.clamp(TEXT_SCALE_MIN, TEXT_SCALE_MAX))
+}
+
+/// 100% removes the file, so the default leaves nothing on disk.
+fn save_text_scale(paths: &modifile_core::Paths, scale: f32) {
+    let file = paths.text_scale_file();
+    if (scale - 1.0).abs() < 0.001 {
+        let _ = std::fs::remove_file(&file);
+    } else {
+        let _ = modifile_core::paths::write_atomic(&file, format!("{scale:.2}\n").as_bytes());
+    }
+}
+
+/// What to say when a game that allows live changes is open.
+fn live_note(pack: &modifile_core::CompiledPack) -> Option<String> {
+    let rules = &pack.pack.running;
+    rules.allow_changes.then(|| {
+        if rules.note.trim().is_empty() {
+            "Mods can be changed while it runs.".to_string()
+        } else {
+            rules.note.trim().to_string()
+        }
+    })
 }
 
 /// A profile as the sidebar needs it: which game it belongs to, and whether its
@@ -335,6 +391,8 @@ struct GameInfo {
     launch_how: Option<String>,
     /// The game is running right now, and why we think so.
     running: Option<String>,
+    /// Set when the pack allows mod changes while the game runs.
+    live_note: Option<String>,
     /// This game can be pointed at a profile's own directory, so Play exists
     /// for it. When false there is no Play button, and the page says why.
     instanced: bool,
@@ -378,6 +436,13 @@ struct App {
     store_bytes: u64,
     /// Bytes of cached artwork on disk, for Settings. Same reasoning.
     art_bytes: u64,
+    /// The text size last written to disk. Compared against the live zoom
+    /// each frame, so Ctrl +/− and the Settings slider are saved the same way.
+    saved_text_scale: f32,
+    /// What the Settings slider shows. Separate from the live zoom so that
+    /// dragging does not rescale the slider out from under the pointer; the
+    /// new size is applied when the drag ends.
+    text_scale: f32,
     /// The selected profile, identified by game and name — because two games
     /// may each have a `main` and the name alone no longer says which.
     selected: Option<ProfileId>,
@@ -537,6 +602,8 @@ impl App {
             games: Vec::new(),
             store_bytes: 0,
             art_bytes: 0,
+            saved_text_scale: 1.0,
+            text_scale: 1.0,
             selected: None,
             game: None,
             art,
@@ -738,6 +805,7 @@ impl App {
                 targets,
                 launch_how,
                 running,
+                live_note: live_note(pack),
                 instanced: pack.instancing().is_some(),
                 has_modpacks: rules.modrinth
                     || rules.curseforge_modpack_class_id.is_some()
@@ -876,6 +944,7 @@ impl App {
                         remembered,
                         deployed,
                         running,
+                        live_note: live_note(pack),
                         remote,
                     });
                 }
@@ -2929,6 +2998,13 @@ fn reveal(path: &Path) {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Persist the text size whenever it changes, however it changed.
+        let zoom = ui.ctx().zoom_factor();
+        if (zoom - self.saved_text_scale).abs() > 0.001 {
+            save_text_scale(&self.paths, zoom);
+            self.saved_text_scale = zoom;
+        }
+
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Error(e) => {
@@ -3206,6 +3282,9 @@ impl App {
                             .targets
                             .iter()
                             .find_map(|t| t.running.clone());
+                        // Play still refuses a running game; activating only
+                        // when the pack says changes mid-session are unsafe.
+                        let blocking = self.targets.iter().find_map(|t| t.blocking().cloned());
 
                         let active = self
                             .selected
@@ -3251,7 +3330,7 @@ impl App {
                         if active {
                             if ui
                                 .add_enabled(
-                                    ready && running.is_none(),
+                                    ready && blocking.is_none(),
                                     egui::Button::new("Deactivate").fill(theme::ACCENT_DIM),
                                 )
                                 .on_hover_text(
@@ -3259,7 +3338,7 @@ impl App {
                                      Nothing is lost — your settings are saved into the profile \
                                      and you can activate it again any time.",
                                 )
-                                .on_disabled_hover_text(match &running {
+                                .on_disabled_hover_text(match &blocking {
                                     Some(found) => format!("The game is running ({found})."),
                                     None => String::new(),
                                 })
@@ -3269,14 +3348,14 @@ impl App {
                             }
                         } else if ui
                             .add_enabled(
-                                ready && has_lock && running.is_none(),
+                                ready && has_lock && blocking.is_none(),
                                 egui::Button::new("Activate").fill(theme::ACCENT_DIM),
                             )
                             .on_hover_text(
                                 "Put these mods into the game folder. You still start the game \
                                  yourself afterwards — Modifile is not a launcher.",
                             )
-                            .on_disabled_hover_text(match &running {
+                            .on_disabled_hover_text(match &blocking {
                                 Some(found) => format!(
                                     "The game is running ({found}).\nClose it before changing mods."
                                 ),
@@ -5325,13 +5404,18 @@ impl App {
                         );
                     }
                     if let Some(found) = &row.running {
-                        ui.label(
-                            egui::RichText::new(format!(
+                        let text = match &row.live_note {
+                            Some(note) => format!("running now ({found}) — {note}"),
+                            None => format!(
                                 "running now ({found}) — close the game to change mods"
-                            ))
-                            .small()
-                            .color(theme::WARN),
-                        );
+                            ),
+                        };
+                        let colour = if row.live_note.is_some() {
+                            theme::MUTED
+                        } else {
+                            theme::WARN
+                        };
+                        ui.label(egui::RichText::new(text).small().color(colour));
                     }
                     if row.remote {
                         ui.horizontal(|ui| {
@@ -5447,10 +5531,7 @@ impl App {
                                         .small()
                                         .color(theme::WARN),
                                 )
-                                .on_hover_text(
-                                    "The author has switched off third-party downloads, so \
-                                     no tool but CurseForge's own can fetch it.",
-                                );
+                                .on_hover_text(browse::not_installable_reason(&hit.id.kind));
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -6165,6 +6246,61 @@ impl App {
         }
     }
 
+    /// Text size. Implemented as egui's zoom factor rather than by resizing
+    /// fonts: much of the window is laid out in fixed sizes (icons, tiles,
+    /// cards, explicit font sizes), and growing only the text would spill it
+    /// out of those boxes. Zoom scales text and layout together.
+    fn text_size_settings(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // Follow the live value (Ctrl +/− changes it too), except mid-drag.
+        if ctx.dragged_id().is_none() {
+            self.text_scale = ctx.zoom_factor();
+        }
+
+        theme::card_frame().show(ui, |ui| {
+            ui.label(egui::RichText::new("Text size").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Scales the whole window — text, buttons and spacing together, so \
+                     nothing overlaps at large sizes. Ctrl + and Ctrl − do the same, and \
+                     Ctrl 0 resets it.",
+                )
+                .color(theme::MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let slider = ui.add(
+                    egui::Slider::new(&mut self.text_scale, TEXT_SCALE_MIN..=TEXT_SCALE_MAX)
+                        .step_by(0.05)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|s| {
+                            s.trim()
+                                .trim_end_matches('%')
+                                .trim()
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| v / 100.0)
+                        }),
+                );
+                // Applied on release, or at once for a click or typed value.
+                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                    ctx.set_zoom_factor(self.text_scale);
+                }
+                if ui
+                    .add_enabled(
+                        (self.text_scale - 1.0).abs() > 0.001,
+                        egui::Button::new("Reset"),
+                    )
+                    .clicked()
+                {
+                    self.text_scale = 1.0;
+                    ctx.set_zoom_factor(1.0);
+                }
+            });
+        });
+    }
+
     /// The one switch for the only thing here that touches the network purely
     /// to look nice.
     fn artwork_settings(&mut self, ui: &mut egui::Ui) {
@@ -6241,6 +6377,9 @@ impl App {
         ui.add_space(12.0);
 
         self.update_settings(ui);
+        ui.add_space(10.0);
+
+        self.text_size_settings(ui);
         ui.add_space(10.0);
 
         self.artwork_settings(ui);
@@ -6708,7 +6847,7 @@ impl App {
         };
         let name = id.name.clone();
         let active = self.is_active(&name);
-        let running = self.targets.iter().find_map(|t| t.running.clone());
+        let running = self.targets.iter().find_map(|t| t.blocking().cloned());
         let mut open = self.show_delete;
         let mut confirm = false;
 

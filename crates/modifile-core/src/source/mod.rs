@@ -403,6 +403,7 @@ pub struct SearchHit {
     /// repository for a mod you only know from a storefront page.
     pub source_url: Option<String>,
     /// `Some(false)` means we checked and it publishes nothing installable.
+    /// `None` means nobody could say — never treat it as a no.
     pub installable: Option<bool>,
     /// A small square image for the project. Every index publishes one; none
     /// of them published it into this struct until there was a UI that could

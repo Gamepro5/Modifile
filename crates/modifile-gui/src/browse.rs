@@ -9,6 +9,24 @@ use eframe::egui;
 
 use crate::{art, theme, App, View};
 
+/// Why a search result cannot be added, in terms of where it came from.
+///
+/// One sentence used to cover every source and blamed CurseForge's download
+/// switch even for a GitHub repository that simply has no releases yet.
+pub(crate) fn not_installable_reason(kind: &modifile_core::source::SourceKind) -> &'static str {
+    use modifile_core::source::SourceKind;
+    match kind {
+        SourceKind::CurseForge => {
+            "The author has switched off third-party downloads, so no tool but \
+             CurseForge's own can fetch it."
+        }
+        _ => {
+            "This repository publishes no release with files attached, so there is \
+             nothing to download. Its source may still be worth reading."
+        }
+    }
+}
+
 impl App {
     /// The search box and its results, for mods or for modpacks.
     pub(crate) fn browse_tab(&mut self, ui: &mut egui::Ui, game: &str, packs: bool) {
@@ -200,10 +218,7 @@ impl App {
                                             .small()
                                             .color(theme::WARN),
                                     )
-                                    .on_hover_text(
-                                        "This project's author has disabled third-party \
-                                         downloads.",
-                                    );
+                                    .on_hover_text(not_installable_reason(&hit.id.kind));
                                 }
                             });
 
